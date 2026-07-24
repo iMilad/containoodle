@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="sidebar.css">
+</head>
+<body>
+  <div id="sidebar">
+    <header>
+      <div class="brand" title="Orbiting Turnip — isolated AWS console sessions in Firefox">
+        <img class="brand-icon" src="../icons/icon.svg" alt="">
+        <span>Orbiting Turnip</span>
+        <span class="brand-version" id="brand-version"></span>
+      </div>
+    </header>
+
+    <div id="portal-toolbar" hidden>
+      <button
+        type="button"
+        id="open-portal-btn"
+        aria-describedby="portal-toolbar-hint"
+      >↗ AWS Portal</button>
+      <span id="portal-toolbar-hint" hidden>Set the portal URL in Options first.</span>
+    </div>
+
+    <div id="notification" hidden></div>
+
+    <div id="account-list"></div>
+
+    <div id="loading-state" class="visible">
+      <div class="spinner"></div>
+      <div>Loading…</div>
+    </div>
+
+    <footer>
+      <div id="status">
+        <span id="status-dot" class="dot offline"></span>
+        <span id="status-text">Connecting…</span>
+      </div>
+      <div class="footer-buttons">
+        <button id="options-btn" title="Orbiting Turnip options">⚙</button>
+        <button id="refresh-btn" title="Refresh">↻</button>
+      </div>
+    </footer>
+  </div>
+
+  <script type="module" src="sidebar.js"></script>
+</body>
+</html>

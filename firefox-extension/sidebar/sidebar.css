@@ -1,0 +1,752 @@
+/* ═══════════════════════════════════════════════════════════════════
+   Orbiting Turnip Sidebar — Dark Theme
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  --bg-primary:    #0a0e17;
+  --bg-secondary:  #111827;
+  --bg-item:       #161f33;
+  --bg-item-hover: #1c2844;
+  --bg-tab-hover:  #182035;
+
+  --text-primary:   #f0f4fc;
+  --text-secondary: #8b96b0;
+  --text-muted:     #4a5568;
+
+  --accent:        #6366f1;
+  --accent-glow:   rgba(99, 102, 241, 0.3);
+  --accent-light:  #818cf8;
+
+  --aws-orange:     #ff9900;
+  --aws-orange-dim: rgba(255, 153, 0, 0.15);
+
+  --success: #34d399;
+  --error:   #f87171;
+
+  --env-dev:  #34d399;
+  --env-qa:   #fbbf24;
+  --env-prod: #f87171;
+  --env-test: #6b7280;
+
+  --border:      rgba(255, 255, 255, 0.06);
+  --border-hover: rgba(99, 102, 241, 0.3);
+
+  --radius-sm: 6px;
+
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+  --mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --transition: 150ms ease;
+}
+
+/* ── Reset ────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font);
+  font-size: 13px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Sidebar layout ───────────────────────────────────────────── */
+#sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ── Header ───────────────────────────────────────────────────── */
+header {
+  padding: 12px 10px 8px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.brand {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.brand-icon {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  filter: drop-shadow(0 0 6px var(--accent-glow));
+}
+
+.brand-version {
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--text-muted);
+  letter-spacing: 0.03em;
+}
+
+/* ── Portal launcher ──────────────────────────────────────────── */
+#portal-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+
+#portal-toolbar[hidden],
+#portal-toolbar-hint[hidden] {
+  display: none;
+}
+
+#open-portal-btn {
+  flex-shrink: 0;
+  padding: 4px 9px;
+  border: 1px solid rgba(255, 153, 0, 0.35);
+  border-radius: var(--radius-sm);
+  background: var(--aws-orange-dim);
+  color: var(--aws-orange);
+  font-family: var(--font);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color var(--transition), border-color var(--transition), background var(--transition);
+}
+
+#open-portal-btn:hover:not(:disabled) {
+  color: #ffb84d;
+  border-color: var(--aws-orange);
+  background: rgba(255, 153, 0, 0.22);
+}
+
+#open-portal-btn:disabled {
+  color: var(--text-muted);
+  border-color: var(--border);
+  background: transparent;
+  cursor: not-allowed;
+}
+
+#open-portal-btn.loading {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+#portal-toolbar-hint {
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 9px;
+  line-height: 1.25;
+}
+
+/* ── Section search inputs ─────────────────────────────────────── */
+.section-search {
+  padding: 4px 8px 6px;
+}
+
+.section-search-input {
+  width: 100%;
+  padding: 5px 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 11px;
+  outline: none;
+  transition: border-color var(--transition);
+}
+
+.section-search-input::placeholder { color: var(--text-muted); }
+
+.section-search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+.inline-empty {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 12px 8px;
+}
+
+/* ── Notification bar ─────────────────────────────────────────── */
+#notification {
+  padding: 6px 10px;
+  font-size: 11px;
+  text-align: center;
+  flex-shrink: 0;
+  animation: fade-in 200ms ease;
+}
+
+#notification.error   { background: rgba(248, 113, 113, 0.12); color: var(--error); }
+#notification.success { background: rgba(52, 211, 153, 0.12); color: var(--success); }
+#notification.info    { background: rgba(99, 102, 241, 0.12); color: var(--accent-light); }
+
+#notification.clickable {
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+/* ── Account list ─────────────────────────────────────────────── */
+#account-list {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-item) transparent;
+}
+
+/* ── Sections ─────────────────────────────────────────────────── */
+.section {
+  margin-bottom: 4px;
+}
+
+.section.section-active {
+  background: linear-gradient(180deg, rgba(255, 153, 0, 0.06) 0%, rgba(255, 153, 0, 0) 100%);
+  border-top: 1px solid rgba(255, 153, 0, 0.18);
+  border-bottom: 1px solid rgba(255, 153, 0, 0.18);
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+}
+
+.section.section-all {
+  margin-top: 4px;
+}
+
+.section.section-pinned {
+  margin: 4px 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-pinned .section-header {
+  color: var(--aws-orange);
+}
+
+/* ── Section headers ──────────────────────────────────────────── */
+.section-header {
+  padding: 8px 12px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  transition: color var(--transition);
+}
+
+.section-active .section-header {
+  color: var(--aws-orange);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  padding-top: 10px;
+}
+
+.section-active .section-header::before {
+  content: "●";
+  font-size: 8px;
+  color: var(--aws-orange);
+  filter: drop-shadow(0 0 4px rgba(255, 153, 0, 0.6));
+  margin-right: 2px;
+}
+
+.section-header:hover {
+  color: var(--text-secondary);
+}
+
+.section-active .section-header:hover {
+  color: #ffb84d;
+}
+
+.section-chevron {
+  font-size: 7px;
+  transition: transform 150ms ease;
+  display: inline-block;
+}
+
+.section-chevron.open {
+  transform: rotate(90deg);
+}
+
+/* ── Account item ─────────────────────────────────────────────── */
+.account-item {
+  margin: 2px 6px;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition);
+}
+
+.account-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition);
+}
+
+.account-header:hover {
+  background: var(--bg-item-hover);
+}
+
+.account-item.active .account-header {
+  background: var(--bg-item);
+}
+
+.account-item.active {
+  border-left: 2px solid var(--aws-orange);
+  margin-left: 4px;
+}
+
+/* ── Environment highlighting (dev / qa / prod) ───────────────── */
+/* Placed after .account-item.active so the env color wins the left edge */
+.account-item.env-dev {
+  margin-left: 4px;
+  border-left: 3px solid var(--env-dev);
+  background: linear-gradient(90deg, rgba(52, 211, 153, 0.06), transparent 55%);
+}
+
+.account-item.env-qa {
+  margin-left: 4px;
+  border-left: 3px solid var(--env-qa);
+  background: linear-gradient(90deg, rgba(251, 191, 36, 0.06), transparent 55%);
+}
+
+.account-item.env-prod {
+  margin-left: 4px;
+  border-left: 3px solid var(--env-prod);
+  background: linear-gradient(90deg, rgba(248, 113, 113, 0.08), transparent 55%);
+}
+
+.account-item.env-test {
+  margin-left: 4px;
+  border-left: 3px solid var(--env-test);
+  background: linear-gradient(90deg, rgba(107, 114, 128, 0.06), transparent 55%);
+}
+
+/* Active rows: the header bg is opaque, so layer the tint into it */
+.account-item.env-dev.active  .account-header { background: linear-gradient(90deg, rgba(52, 211, 153, 0.10), var(--bg-item) 60%); }
+.account-item.env-qa.active   .account-header { background: linear-gradient(90deg, rgba(251, 191, 36, 0.10), var(--bg-item) 60%); }
+.account-item.env-prod.active .account-header { background: linear-gradient(90deg, rgba(248, 113, 113, 0.12), var(--bg-item) 60%); }
+.account-item.env-test.active .account-header { background: linear-gradient(90deg, rgba(107, 114, 128, 0.10), var(--bg-item) 60%); }
+
+/* AWS orange dot */
+.aws-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--aws-orange);
+  box-shadow: 0 0 6px rgba(255, 153, 0, 0.3);
+  flex-shrink: 0;
+}
+
+.account-item.active .aws-dot {
+  box-shadow: 0 0 8px rgba(255, 153, 0, 0.6);
+}
+
+/* Env dot colors — after the active rule so the env glow wins there too */
+.account-item.env-dev  .aws-dot { background: var(--env-dev);  box-shadow: 0 0 6px rgba(52, 211, 153, 0.6); }
+.account-item.env-qa   .aws-dot { background: var(--env-qa);   box-shadow: 0 0 6px rgba(251, 191, 36, 0.6); }
+.account-item.env-prod .aws-dot { background: var(--env-prod); box-shadow: 0 0 6px rgba(248, 113, 113, 0.6); }
+.account-item.env-test .aws-dot { background: var(--env-test); box-shadow: 0 0 6px rgba(107, 114, 128, 0.6); }
+
+.account-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.account-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.account-name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* Environment badge — the colored "light" (dot) plus its category label */
+.env-badge {
+  flex-shrink: 0;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.5;
+  padding: 0 5px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.env-badge-dev  { color: var(--env-dev);  background: rgba(52, 211, 153, 0.14); }
+.env-badge-qa   { color: var(--env-qa);   background: rgba(251, 191, 36, 0.16); }
+.env-badge-prod { color: var(--env-prod); background: rgba(248, 113, 113, 0.16); }
+.env-badge-test { color: var(--env-test); background: rgba(107, 114, 128, 0.20); }
+
+.account-id {
+  font-size: 10px;
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  letter-spacing: 0.02em;
+}
+
+/* Role chip — pinned role (static) or remembered pick (clickable) */
+.role-chip {
+  margin-left: 6px;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  cursor: pointer;
+  transition: color var(--transition), border-color var(--transition);
+}
+
+.role-chip:hover {
+  color: var(--accent-light);
+  border-color: var(--accent);
+}
+
+.role-chip.pinned {
+  cursor: default;
+}
+
+.role-chip.pinned:hover {
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+
+.role-chip.pinned.changeable {
+  cursor: pointer;
+}
+
+.role-chip.pinned.changeable:hover {
+  color: var(--accent-light);
+  border-color: var(--accent);
+}
+
+/* Mode-specific account pin. Always visible on pinnable active rows. */
+.pin-btn {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color var(--transition), border-color var(--transition), background var(--transition);
+}
+
+.pin-btn:hover {
+  color: var(--aws-orange);
+  border-color: var(--aws-orange);
+}
+
+.pin-btn.is-pinned {
+  color: var(--aws-orange);
+  border-color: rgba(255, 153, 0, 0.35);
+  background: var(--aws-orange-dim);
+}
+
+.pin-btn:disabled {
+  opacity: 0.45;
+  cursor: wait;
+}
+
+/* Inline role picker (multi-role accounts, first launch) */
+.role-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 8px 8px 24px;
+}
+
+.role-option {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: color var(--transition), border-color var(--transition);
+}
+
+.role-option:hover {
+  color: var(--accent-light);
+  border-color: var(--accent);
+}
+
+.role-option.dismiss:hover {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+/* Tab count badge */
+.tab-count {
+  background: var(--aws-orange-dim);
+  color: var(--aws-orange);
+  font-size: 10px;
+  font-weight: 600;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  flex-shrink: 0;
+}
+
+/* Launch button */
+.launch-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 10px;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity var(--transition), color var(--transition), border-color var(--transition);
+  flex-shrink: 0;
+}
+
+.account-header:hover .launch-btn {
+  opacity: 1;
+}
+
+.launch-btn:hover {
+  color: var(--accent-light);
+  border-color: var(--accent);
+}
+
+.launch-btn.loading {
+  opacity: 1;
+  animation: spin 0.7s linear infinite;
+  pointer-events: none;
+}
+
+/* Close-all button */
+.close-all-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 2px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity var(--transition), color var(--transition);
+  flex-shrink: 0;
+}
+
+.account-header:hover .close-all-btn {
+  opacity: 1;
+}
+
+.close-all-btn:hover {
+  color: var(--error);
+}
+
+/* ── Tab list (nested under active account) ───────────────────── */
+.tab-list {
+  padding: 0 4px 4px 20px;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-secondary);
+  transition: background var(--transition), color var(--transition);
+}
+
+.tab-item:hover {
+  background: var(--bg-tab-hover);
+  color: var(--text-primary);
+}
+
+.tab-item.is-active {
+  color: #fff;
+  background: linear-gradient(90deg, var(--accent) 0%, #4f46e5 100%);
+  border-left: 3px solid #c7d2fe;
+  padding-left: 5px;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.45);
+}
+
+.tab-item.is-active:hover {
+  background: linear-gradient(90deg, #4f46e5 0%, #4338ca 100%);
+  color: #fff;
+}
+
+.tab-item.is-active .tab-title {
+  color: #fff;
+}
+
+.tab-item.is-active .tab-close {
+  color: rgba(255, 255, 255, 0.8);
+  opacity: 1;
+}
+
+.tab-item.is-active .tab-close:hover {
+  color: #fff;
+}
+
+.tab-favicon {
+  width: 14px;
+  height: 14px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  object-fit: contain;
+}
+
+.tab-favicon-placeholder {
+  font-size: 12px;
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+}
+
+.tab-title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity var(--transition), color var(--transition);
+  flex-shrink: 0;
+}
+
+.tab-item:hover .tab-close { opacity: 1; }
+.tab-close:hover { color: var(--error); }
+
+/* ── Loading state ────────────────────────────────────────────── */
+#loading-state {
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  gap: 4px;
+  padding: 2rem;
+  display: none;
+}
+
+#loading-state.visible {
+  display: flex;
+}
+
+.spinner {
+  width: 24px;
+  height: 24px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+/* ── Footer ───────────────────────────────────────────────────── */
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.dot.online  { background: var(--success); box-shadow: 0 0 6px rgba(52, 211, 153, 0.5); }
+.dot.offline { background: var(--error);   box-shadow: 0 0 6px rgba(248, 113, 113, 0.3); }
+
+.footer-buttons {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#refresh-btn,
+#options-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 14px;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color var(--transition), border-color var(--transition);
+}
+
+#refresh-btn:hover,
+#options-btn:hover {
+  color: var(--accent-light);
+  border-color: var(--accent);
+}
+
+#refresh-btn.spinning {
+  animation: spin 0.6s linear;
+}
+
+/* ── Animations ───────────────────────────────────────────────── */
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }

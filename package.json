@@ -1,0 +1,21 @@
+{
+  "name": "orbiting-turnip",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Orbiting Turnip keeps AWS console sessions separated in Firefox containers. See README.md.",
+  "scripts": {
+    "test": "npm run test:js && npm run test:python",
+    "test:js": "node --test tests/*.test.js",
+    "test:python": "python3 -m unittest discover -s tests -p 'test_*.py'",
+    "lint:ext": "web-ext lint --source-dir=firefox-extension --self-hosted",
+    "build:ext": "node scripts/build-xpi.mjs",
+    "check": "npm test && npm run lint:ext && npm run build:ext"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "web-ext": "10.5.0"
+  }
+}

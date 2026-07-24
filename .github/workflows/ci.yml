@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install locked build tools
+        run: npm ci --ignore-scripts
+
+      - name: Confirm no runtime dependency advisories
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Python syntax check
+        run: python3 -m py_compile server.py
+
+      - name: JavaScript syntax check
+        run: |
+          set -euo pipefail
+          git ls-files -z '*.js' | while IFS= read -r -d '' f; do
+            echo "checking $f"
+            node --check "$f"
+          done
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Validate extension manifest
+        run: |
+          node -e "const m=require('./firefox-extension/manifest.json'); \
+            if(!m.name||!m.version){console.error('manifest missing name/version');process.exit(1);} \
+            console.log('manifest ok:', m.name, 'v'+m.version)"
+
+      - name: Lint extension (web-ext)
+        run: npm run lint:ext
+
+      - name: Build and verify reproducible XPI
+        run: npm run build:ext

@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "Orbiting Turnip",
+  "version": "1.0.0",
+  "description": "Keep AWS console sessions separated in Firefox containers and organize their tabs by account.",
+  "icons": {
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  },
+  "permissions": [
+    "storage",
+    "contextualIdentities",
+    "cookies",
+    "scripting",
+    "tabs",
+    "tabGroups"
+  ],
+  "optional_host_permissions": [
+    "https://*.awsapps.com/*",
+    "https://*.amazonaws.com/*",
+    "https://*.amazon.com/*"
+  ],
+  "sidebar_action": {
+    "default_title": "Orbiting Turnip",
+    "default_panel": "sidebar/sidebar.html",
+    "default_icon": "icons/icon.svg",
+    "open_at_install": true
+  },
+  "options_ui": {
+    "page": "options/options.html"
+  },
+  "background": {
+    "scripts": ["background.js"],
+    "type": "module"
+  },
+  "commands": {
+    "_execute_sidebar_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+A",
+        "mac": "MacCtrl+Shift+A"
+      },
+      "description": "Toggle Orbiting Turnip sidebar"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "{7da5f34e-08f0-4e4e-be7f-7b9b66ab7f60}",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "authenticationInfo",
+          "browsingActivity",
+          "personallyIdentifyingInfo",
+          "websiteActivity",
+          "websiteContent"
+        ]
+      }
+    }
+  }
+}

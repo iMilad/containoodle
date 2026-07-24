@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+node_modules/
+artifacts/
+.DS_Store
+*.xpi
+.claude/
+*.zip
+/docs/
+/info/
