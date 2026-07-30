@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="firefox-extension/icons/icon.svg" width="96" height="96" alt="Containoodle logo">
+<img src="branding/containoodle-logo.png" width="160" height="160" alt="Containoodle logo">
 
 # Containoodle
 
