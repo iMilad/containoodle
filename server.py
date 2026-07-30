@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Orbiting Turnip — local developer tool for federated SSO console access.
+Containoodle — local developer tool for federated SSO console access.
 
-Generates AWS federated sign-in URLs for the Orbiting Turnip extension.
+Generates AWS federated sign-in URLs for the Containoodle extension.
 Binds to 127.0.0.1 only. Never logs session URLs to disk.
 """
 
@@ -18,7 +18,7 @@ from pathlib import Path
 
 PORT = int(os.environ.get("PORT", 8421))
 HOST = "127.0.0.1"
-DEFAULT_ROLE = os.environ.get("ORBITING_TURNIP_DEFAULT_ROLE", "AdministratorAccess")
+DEFAULT_ROLE = os.environ.get("CONTAINOODLE_DEFAULT_ROLE", "AdministratorAccess")
 DEFAULT_REGION = "eu-west-1"
 ACCOUNTS_FILE = Path.home() / ".aws" / "accounts.json"
 SSO_CACHE_DIR = Path.home() / ".aws" / "sso" / "cache"
@@ -169,8 +169,8 @@ def _build_container_url(container_name: str, signin_url: str) -> str:
 # ─── HTTP server ──────────────────────────────────────────────────────────────
 
 
-class OrbitingTurnipHandler(http.server.BaseHTTPRequestHandler):
-    """Request handler for Orbiting Turnip."""
+class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
+    """Request handler for Containoodle."""
 
     # Suppress default stderr access log and strip query params (for security)
     def log_request(self, code='-', size='-'):
@@ -302,7 +302,7 @@ class OrbitingTurnipHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "Account not found in accounts.json"}, 404)
                 return
             # Explicit role (e.g. the sidebar's discovered/remembered pick)
-            # overrides accounts.json / ORBITING_TURNIP_DEFAULT_ROLE
+            # overrides accounts.json / CONTAINOODLE_DEFAULT_ROLE
             role_param = qs.get("role", [None])[0]
             role = role_param or meta.get("role", DEFAULT_ROLE)
             region = meta.get("region", DEFAULT_REGION)
@@ -340,9 +340,9 @@ def main():
         print(f"⚠  {ACCOUNTS_FILE} not found — create it first.")
         sys.exit(1)
 
-    server = http.server.HTTPServer((HOST, PORT), OrbitingTurnipHandler)
+    server = http.server.HTTPServer((HOST, PORT), ContainoodleHandler)
     print(f"╔══════════════════════════════════════════╗")
-    print(f"║        Orbiting Turnip — ready            ║")
+    print(f"║        Containoodle — ready            ║")
     print(f"║             http://{HOST}:{PORT}        ║")
     print(f"╚══════════════════════════════════════════╝")
     try:

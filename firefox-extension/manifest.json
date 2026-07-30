@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Orbiting Turnip",
+  "name": "Containoodle",
   "version": "1.0.0",
   "description": "Keep AWS console sessions separated in Firefox containers and organize their tabs by account.",
   "icons": {
@@ -21,7 +21,7 @@
     "https://*.amazon.com/*"
   ],
   "sidebar_action": {
-    "default_title": "Orbiting Turnip",
+    "default_title": "Containoodle",
     "default_panel": "sidebar/sidebar.html",
     "default_icon": "icons/icon.svg",
     "open_at_install": true
@@ -39,13 +39,13 @@
         "default": "Alt+Shift+A",
         "mac": "MacCtrl+Shift+A"
       },
-      "description": "Toggle Orbiting Turnip sidebar"
+      "description": "Toggle Containoodle sidebar"
     }
   },
   "browser_specific_settings": {
     "gecko": {
       "id": "{7da5f34e-08f0-4e4e-be7f-7b9b66ab7f60}",
-      "strict_min_version": "140.0",
+      "strict_min_version": "142.0",
       "data_collection_permissions": {
         "required": [
           "authenticationInfo",

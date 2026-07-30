@@ -66,8 +66,8 @@ if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
 }
 
 const artifacts = join(root, "artifacts");
-const output = join(artifacts, `orbiting-turnip-${manifest.version}.xpi`);
-const staging = await mkdtemp(join(tmpdir(), "orbiting-turnip-xpi-"));
+const output = join(artifacts, `containoodle-${manifest.version}.xpi`);
+const staging = await mkdtemp(join(tmpdir(), "containoodle-xpi-"));
 const fixedTime = new Date("1980-01-01T00:00:00.000Z");
 
 try {

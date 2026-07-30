@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
-   Orbiting Turnip — shared AWS account-field validation.
+   Containoodle — shared AWS account-field validation.
 
    Pure, no browser APIs. The field regexes mirror server.py. The
    document parser remains a backend-schema utility for tests/tooling;

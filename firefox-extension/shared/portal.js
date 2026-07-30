@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
-   Orbiting Turnip — AWS access portal URL helpers.
+   Containoodle — AWS access portal URL helpers.
 
    Pure, no browser APIs. ES module shared by the background script,
    the options page and Node unit tests.

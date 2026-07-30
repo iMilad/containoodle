@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
-   Orbiting Turnip — Background (event page)
+   Containoodle — Background (event page)
 
    Owns launching in both modes so tab-grouping and container logic
    live in one place:
@@ -116,13 +116,25 @@ async function getStoredAccounts(config) {
    origin/path the user granted. It catches the user gesture before the
    portal can open an ordinary console tab; tabs events remain a fallback
    for portal implementations that do not expose a normal link. */
-const PORTAL_INTERCEPTOR_ID = "orbiting-turnip-portal-clicks";
+const PORTAL_INTERCEPTOR_ID = "containoodle-portal-clicks";
 
 async function syncPortalInterceptorOnce() {
   const config = await getConfig();
-  const registered = await browser.scripting.getRegisteredContentScripts({
-    ids: [PORTAL_INTERCEPTOR_ID],
-  });
+  const allRegistered = await browser.scripting.getRegisteredContentScripts();
+  const portalRegistrations = allRegistered.filter(
+    (script) =>
+      Array.isArray(script.js) &&
+      script.js.includes("portal-interceptor.js")
+  );
+  const staleIds = portalRegistrations
+    .filter((script) => script.id !== PORTAL_INTERCEPTOR_ID)
+    .map((script) => script.id);
+  if (staleIds.length > 0) {
+    await browser.scripting.unregisterContentScripts({ ids: staleIds });
+  }
+  const registered = portalRegistrations.filter(
+    (script) => script.id === PORTAL_INTERCEPTOR_ID
+  );
   let shouldRegister = false;
   if (
     config.mode === "portal" &&
@@ -217,7 +229,7 @@ function serializeContainerMutation(operation) {
 function isPlaceholderContainerName(name, accountId) {
   const escapedId = String(accountId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(
-    `^(?:Orbiting Turnip|AWS) ${escapedId}(?: \\(\\d+\\)| · Orbiting Turnip(?: \\(\\d+\\))?)?$`
+    `^(?:Containoodle|AWS) ${escapedId}(?: \\(\\d+\\)| · Containoodle(?: \\(\\d+\\))?)?$`
   ).test(String(name || ""));
 }
 
@@ -227,7 +239,7 @@ async function availableOwnedContainerName(name, mappedStoreId = null) {
     return name;
   }
 
-  const base = `${name} · Orbiting Turnip`;
+  const base = `${name} · Containoodle`;
   let candidate = base;
   let suffix = 2;
   while (
@@ -573,7 +585,7 @@ async function portalRegion(config) {
   const data = await fetchJson(whoAmIUrl(config.portalStartUrl), { credentials: "include" });
   const region = data.region || data.awsRegion || (data.instance && data.instance.region);
   if (!region || !REGION_RE.test(region)) {
-    throw new Error("Could not detect the SSO region — set it in Orbiting Turnip options");
+    throw new Error("Could not detect the SSO region — set it in Containoodle options");
   }
   await browser.storage.local.set({ portalRegionCache: region });
   return region;
@@ -584,7 +596,7 @@ async function portalRegion(config) {
 async function portalDiscoverRoles(config, account) {
   if (!(await browser.permissions.contains({ origins: PORTAL_API_ORIGINS }))) {
     const err = new Error(
-      "Role choices are not allowed — enable them in Orbiting Turnip options"
+      "Role choices are not allowed — enable them in Containoodle options"
     );
     err.needsOptions = true;
     throw err;
@@ -1075,7 +1087,7 @@ async function launch(accountId, explicitRole, options = {}) {
       try {
         if (!(await modeIsCurrent())) return cancelled();
         // role may be null — the server then resolves it from
-        // accounts.json / ORBITING_TURNIP_DEFAULT_ROLE as before.
+        // accounts.json / CONTAINOODLE_DEFAULT_ROLE as before.
         url = await backendSigninUrl(config.backendUrl, account, role);
       } catch (err) {
         if (err instanceof TypeError) {
@@ -1281,7 +1293,7 @@ async function seedKnownGroupTitles() {
       }
     }
   } catch {
-    // The first Orbiting Turnip update for an unknown group seeds it defensively.
+    // The first Containoodle update for an unknown group seeds it defensively.
   }
 }
 

@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
-   Orbiting Turnip — environment classification from an AWS account name.
+   Containoodle — environment classification from an AWS account name.
 
    Pure, no AWS calls. ES module shared by the sidebar, the background
    script (tab-group / container colors) and Node unit tests.

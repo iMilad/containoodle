@@ -3,17 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Orbiting Turnip settings</title>
+  <title>Containoodle settings</title>
   <link rel="stylesheet" href="options.css">
 </head>
 <body>
   <main>
-    <h1>Orbiting Turnip settings</h1>
+    <h1>Containoodle settings</h1>
 
     <section id="connection-method" aria-labelledby="connection-method-heading">
       <h2 id="connection-method-heading">Connection method</h2>
       <fieldset class="mode-options">
-        <legend class="visually-hidden">Choose how Orbiting Turnip opens AWS console sessions</legend>
+        <legend class="visually-hidden">Choose how Containoodle opens AWS console sessions</legend>
         <label class="radio" for="mode-backend">
           <input
             type="radio"
@@ -37,7 +37,7 @@
           >
           <span>
             <strong>AWS access portal</strong>
-            <small>Choose an account and role in the portal; Orbiting Turnip moves that console launch into its isolated container.</small>
+            <small>Choose an account and role in the portal; Containoodle moves that console launch into its isolated container.</small>
           </span>
         </label>
       </fieldset>
@@ -50,7 +50,7 @@
       aria-labelledby="backend-heading"
     >
       <h2 id="backend-heading">Local AWS CLI helper</h2>
-      <p class="section-intro">Orbiting Turnip gets accounts and sign-in URLs from the helper running on this computer.</p>
+      <p class="section-intro">Containoodle gets accounts and sign-in URLs from the helper running on this computer.</p>
 
       <div class="field">
         <label class="field-label" for="backend-url">Helper URL</label>
@@ -83,7 +83,7 @@
           <small>Optional: faster repeated backend launches</small>
         </summary>
         <div class="details-body">
-          <p class="hint">When enabled, Orbiting Turnip can check whether this account's container is already signed in and reuse that session instead of starting another sign-in. It also suppresses the AWS cookie banner in new containers.</p>
+          <p class="hint">When enabled, Containoodle can check whether this account's container is already signed in and reuse that session instead of starting another sign-in. It also suppresses the AWS cookie banner in new containers.</p>
           <p class="hint">This is only a convenience for local-helper mode. Normal backend launches still work without it. Firefox will ask for permission to read AWS console cookies; revoking access stops future checks but does not delete cookies already managed by Firefox.</p>
           <div class="actions">
             <button type="button" id="console-grant">Allow session reuse</button>
@@ -128,7 +128,7 @@
           </div>
         </div>
         <p class="status" id="portal-status" role="status" aria-live="polite">Checking portal access…</p>
-        <p class="hint">Orbiting Turnip needs permission for this portal and a signed-in portal session before it can hand off a launch.</p>
+        <p class="hint">Containoodle needs permission for this portal and a signed-in portal session before it can hand off a launch.</p>
       </div>
 
       <details class="settings-details" id="portal-sidebar-settings">
@@ -137,7 +137,7 @@
           <small>Keep portal accounts as direct-launch shortcuts</small>
         </summary>
         <div class="details-body">
-          <p class="hint">Open an account from the AWS access portal, then choose ☆ on its active row in the Orbiting Turnip sidebar. It changes to ★ and keeps the account as a direct-launch shortcut after its tabs are closed. Choosing ★ again removes only the shortcut.</p>
+          <p class="hint">Open an account from the AWS access portal, then choose ☆ on its active row in the Containoodle sidebar. It changes to ★ and keeps the account as a direct-launch shortcut after its tabs are closed. Choosing ★ again removes only the shortcut.</p>
           <p class="hint">Pinned accounts belong only to portal mode. Backend accounts continue to come only from the local helper.</p>
 
           <div class="readiness-card" aria-labelledby="portal-pins-heading">
@@ -147,7 +147,7 @@
 
           <div class="permission-block" aria-labelledby="role-discovery-heading">
             <h3 id="role-discovery-heading">Role choices for pinned accounts</h3>
-            <p class="hint">Allow this only if you want Orbiting Turnip to ask the AWS access portal which roles you can choose when launching or changing a pinned shortcut. Pinning and normal portal clicks work without it.</p>
+            <p class="hint">Allow this only if you want Containoodle to ask the AWS access portal which roles you can choose when launching or changing a pinned shortcut. Pinning and normal portal clicks work without it.</p>
             <div class="actions">
               <button type="button" id="role-discovery-grant">Allow role choices</button>
               <button type="button" id="role-discovery-revoke">Revoke</button>
@@ -184,15 +184,15 @@
       <details class="settings-details" id="portal-privacy">
         <summary>How portal access is used</summary>
         <div class="details-body">
-          <p class="hint">Orbiting Turnip copies your portal session cookie into the selected account container and verifies the copy before navigation. Optional sidebar role discovery sends that value directly to the AWS portal API. The value is never stored in extension storage or logged.</p>
-          <p class="hint">On the configured portal page, Orbiting Turnip reads the URL and displayed account name belonging to the console shortcut you click. It does not read forms, credentials, or the rest of the account list. Configuration stays in this Firefox profile.</p>
+          <p class="hint">Containoodle copies your portal session cookie into the selected account container and verifies the copy before navigation. Optional sidebar role discovery sends that value directly to the AWS portal API. The value is never stored in extension storage or logged.</p>
+          <p class="hint">On the configured portal page, Containoodle reads the URL and displayed account name belonging to the console shortcut you click. It does not read forms, credentials, or the rest of the account list. Configuration stays in this Firefox profile.</p>
         </div>
       </details>
     </section>
 
     <section id="group-naming" aria-labelledby="group-naming-heading">
       <h2 id="group-naming-heading">Tab group names</h2>
-      <p class="section-intro">By default, Orbiting Turnip uses the original account name. Optionally transform automatic group titles with a JavaScript regular expression.</p>
+      <p class="section-intro">By default, Containoodle uses the original account name. Optionally transform automatic group titles with a JavaScript regular expression.</p>
       <div class="form-grid">
         <div class="field">
           <label class="field-label" for="group-name-pattern">Name regex</label>
@@ -224,7 +224,7 @@
         <button type="button" id="group-name-reset">Reset existing titles to automatic</button>
       </div>
       <p class="status" id="group-name-status" role="status" aria-live="polite"></p>
-      <p class="hint">Saving changes future automatic updates. Resetting removes existing Orbiting Turnip group-title overrides and recalculates those titles from the account names and the saved rule. Container names, sidebar labels, and environment colours are unchanged.</p>
+      <p class="hint">Saving changes future automatic updates. Resetting removes existing Containoodle group-title overrides and recalculates those titles from the account names and the saved rule. Container names, sidebar labels, and environment colours are unchanged.</p>
     </section>
   </main>
 

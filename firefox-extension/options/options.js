@@ -1,4 +1,4 @@
-/* Orbiting Turnip Options
+/* Containoodle Options
  *
  * The selected connection mode owns the visible setup panel. Portal mode never
  * probes the local helper; backend mode never probes the AWS portal. Portal
@@ -192,7 +192,7 @@ function renderRoleDiscoveryStatus(granted) {
   setStatus(
     "role-discovery-status",
     granted
-      ? "Allowed — Orbiting Turnip can load role choices for pinned accounts"
+      ? "Allowed — Containoodle can load role choices for pinned accounts"
       : "Not allowed — pinning and normal portal clicks still work",
     granted || undefined
   );

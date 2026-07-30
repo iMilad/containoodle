@@ -372,7 +372,7 @@ test("portal sidebar uses captured names and pins without reading backend accoun
     },
     containers: [{
       cookieStoreId: storeId,
-      name: `Orbiting Turnip ${accountId}`,
+      name: `Containoodle ${accountId}`,
       color: "red",
     }],
     tabs: [{

@@ -1,4 +1,4 @@
-/* Orbiting Turnip portal click interceptor.
+/* Containoodle portal click interceptor.
 
    Registered dynamically at document_start only for the configured AWS
    access-portal page after the user grants that host. It observes plain
@@ -8,8 +8,8 @@
    exact portal URL again before launching anything. */
 
 (() => {
-  if (globalThis.__orbitingTurnipPortalInterceptorLoaded) return;
-  globalThis.__orbitingTurnipPortalInterceptorLoaded = true;
+  if (globalThis.__containoodlePortalInterceptorLoaded) return;
+  globalThis.__containoodlePortalInterceptorLoaded = true;
 
   let enabled = false;
   let activeHandoff = null;

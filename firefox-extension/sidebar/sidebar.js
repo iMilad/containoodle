@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
-   Orbiting Turnip Sidebar — Main Logic
+   Containoodle Sidebar — Main Logic
 
    Every AWS account runs in its own container. Tracks Firefox container tabs,
    enriches with AWS
@@ -48,7 +48,7 @@ let portalRoles = {};
 let portalAccountOriginalNames = {};
 // Backend pins are IDs only; account names and roles stay backend-owned.
 let backendPinnedAccountIds = new Set();
-// Explicit Orbiting Turnip ownership; display names are labels, not identity.
+// Explicit Containoodle ownership; display names are labels, not identity.
 let accountContainers = {};
 let containerAccounts = {};
 // accountId → roles list currently offered as an inline picker
@@ -223,7 +223,7 @@ function updateStatus() {
   } else {
     statusText.textContent = usingCache
       ? `Offline · ${accounts.length} cached`
-      : "Orbiting Turnip offline";
+      : "Containoodle offline";
   }
 }
 
@@ -236,7 +236,7 @@ function updatePortalToolbar() {
   openPortalBtn.disabled = !configured;
   openPortalBtn.title = configured
     ? "Focus the AWS Access Portal tab, or open it"
-    : "Set the AWS Access Portal URL in Orbiting Turnip Options first";
+    : "Set the AWS Access Portal URL in Containoodle Options first";
   openPortalBtn.setAttribute("aria-disabled", String(!configured));
   portalToolbarHint.hidden = configured;
 }

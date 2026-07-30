@@ -1,9 +1,18 @@
 {
-  "name": "orbiting-turnip",
+  "name": "containoodle",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Orbiting Turnip keeps AWS console sessions separated in Firefox containers. See README.md.",
+  "description": "Containoodle keeps AWS console sessions separated in Firefox containers. See README.md.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iMilad/containoodle.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iMilad/containoodle/issues"
+  },
+  "homepage": "https://github.com/iMilad/containoodle#readme",
   "scripts": {
     "test": "npm run test:js && npm run test:python",
     "test:js": "node --test tests/*.test.js",

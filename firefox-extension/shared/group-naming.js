@@ -1,4 +1,4 @@
-/* Orbiting Turnip tab-group display naming.
+/* Containoodle tab-group display naming.
  *
  * The account's original name remains the source of truth for container
  * identity, sidebar labels, and environment colours. This helper changes only

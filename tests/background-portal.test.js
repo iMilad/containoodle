@@ -402,16 +402,20 @@ function makeBrowser() {
       async update() {},
     },
     scripting: {
-      async getRegisteredContentScripts() {
+      async getRegisteredContentScripts({ ids } = {}) {
         if (registrationReadGate) {
           const gate = registrationReadGate;
           registrationReadGate = null;
           await gate.promise;
         }
-        return registeredScripts;
+        return ids
+          ? registeredScripts.filter((script) => ids.includes(script.id))
+          : registeredScripts;
       },
-      async unregisterContentScripts() {
-        registeredScripts = [];
+      async unregisterContentScripts({ ids } = {}) {
+        registeredScripts = ids
+          ? registeredScripts.filter((script) => !ids.includes(script.id))
+          : [];
       },
       async registerContentScripts(scripts) {
         registeredScripts = scripts;
@@ -466,6 +470,9 @@ function makeBrowser() {
     },
     getRegisteredScripts() {
       return registeredScripts;
+    },
+    setRegisteredScripts(scripts) {
+      registeredScripts = scripts;
     },
     pauseNextRegistrationRead() {
       let release;
@@ -1172,7 +1179,7 @@ test("backend session reuse never overrides an explicit role choice", async () =
       async json() {
         return {
           ok: true,
-          containerUrl: `ext+container:name=Orbiting%20Turnip&url=${encodeURIComponent(signinUrl)}`,
+          containerUrl: `ext+container:name=Containoodle&url=${encodeURIComponent(signinUrl)}`,
         };
       },
     };
@@ -1242,7 +1249,7 @@ test("a mode switch during backend work cancels the old-mode tab creation", asyn
     async json() {
       return {
         ok: true,
-        containerUrl: `ext+container:name=Orbiting%20Turnip&url=${
+        containerUrl: `ext+container:name=Containoodle&url=${
           encodeURIComponent(BACKEND_SIGNIN_URL)
         }`,
       };
@@ -1337,7 +1344,7 @@ test("a proven mapped placeholder is reconciled without adopting a same-name con
   fixture.storageData.portalPinnedAccounts = [];
   fixture.identities.push(
     {
-      name: `Orbiting Turnip ${ACCOUNT_ID}`,
+      name: `Containoodle ${ACCOUNT_ID}`,
       cookieStoreId: "firefox-container-owned",
       color: "red",
       icon: "briefcase",
@@ -1359,7 +1366,7 @@ test("a proven mapped placeholder is reconciled without adopting a same-name con
   );
   assert.strictEqual(fixture.identities.length, 2, "no replacement container is created");
   assert.deepStrictEqual(fixture.identities[0], {
-    name: "corp-dev-data · Orbiting Turnip",
+    name: "corp-dev-data · Containoodle",
     cookieStoreId: "firefox-container-owned",
     color: "green",
     icon: "briefcase",
@@ -1367,7 +1374,7 @@ test("a proven mapped placeholder is reconciled without adopting a same-name con
   assert.deepStrictEqual(fixture.identityUpdates, [{
     storeId: "firefox-container-owned",
     color: "green",
-    name: "corp-dev-data · Orbiting Turnip",
+    name: "corp-dev-data · Containoodle",
   }]);
   assert.strictEqual(
     fixture.createdTabs[0].cookieStoreId,
@@ -1466,7 +1473,7 @@ test("portal click handoff uses no backend and opens the exact shortcut in a con
     `&role_name=ReadOnlyAccess&destination=${encodeURIComponent(destination)}`;
 
   // A user-created same-name container must never be adopted for this AWS
-  // account; Orbiting Turnip owns containers through an explicit account-id mapping.
+  // account; Containoodle owns containers through an explicit account-id mapping.
   fixture.identities.push({
     name: "portal-prod-data",
     cookieStoreId: "firefox-container-manual",
@@ -1519,7 +1526,7 @@ test("portal click handoff uses no backend and opens the exact shortcut in a con
     {
       ok: false,
       needsOptions: true,
-      error: "Role choices are not allowed — enable them in Orbiting Turnip options",
+      error: "Role choices are not allowed — enable them in Containoodle options",
     }
   );
   // Core portal handoff needs only the exact portal origin. The broad role
@@ -1534,7 +1541,7 @@ test("portal click handoff uses no backend and opens the exact shortcut in a con
   assert.strictEqual(fixture.createdTabs[0].url, shortcut);
   assert.strictEqual(fixture.createdTabs[0].cookieStoreId, "firefox-container-1");
   assert.strictEqual(fixture.createdTabs[0].windowId, SOURCE_TAB.windowId);
-  assert.strictEqual(fixture.identities[1].name, "portal-prod-data · Orbiting Turnip");
+  assert.strictEqual(fixture.identities[1].name, "portal-prod-data · Containoodle");
   assert.strictEqual(
     fixture.storageData[`accountContainer/${ACCOUNT_ID}`],
     "firefox-container-1"
@@ -1785,6 +1792,22 @@ test("portal click handoff uses no backend and opens the exact shortcut in a con
   await new Promise((resolve) => setTimeout(resolve, 0));
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepStrictEqual(fixture.getRegisteredScripts()[0].matches, [START, `${START}/`]);
+});
+
+test("startup replaces an older portal interceptor registration without duplicate handling", async () => {
+  const fixture = makeBrowser();
+  fixture.setRegisteredScripts([{
+    id: "previous-brand-portal-clicks",
+    js: ["portal-interceptor.js"],
+    matches: [START, `${START}/`],
+    runAt: "document_start",
+    persistAcrossSessions: true,
+  }]);
+
+  await loadBackground(fixture);
+  await waitFor(() => fixture.getRegisteredScripts().length === 1);
+
+  assert.strictEqual(fixture.getRegisteredScripts()[0].id, "containoodle-portal-clicks");
 });
 
 test("tab-event fallback reuses a captured portal name for an unpinned account", async () => {

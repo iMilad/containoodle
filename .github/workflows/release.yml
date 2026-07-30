@@ -36,7 +36,7 @@ jobs:
             echo "::error::Tag v$tag_ver does not match manifest.json version $manifest_ver"
             exit 1
           fi
-          echo "Releasing Orbiting Turnip v$tag_ver"
+          echo "Releasing Containoodle v$tag_ver"
 
       - name: Test and lint release source
         run: |
@@ -68,19 +68,19 @@ jobs:
             --api-key="$AMO_JWT_ISSUER" \
             --api-secret="$AMO_JWT_SECRET" \
             --artifacts-dir=signed
-          mv signed/*.xpi "artifacts/orbiting-turnip-${TAG}-signed.xpi"
-          echo "Signed: artifacts/orbiting-turnip-${TAG}-signed.xpi"
+          mv signed/*.xpi "artifacts/containoodle-${TAG}-signed.xpi"
+          echo "Signed: artifacts/containoodle-${TAG}-signed.xpi"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: Orbiting Turnip v${{ steps.version.outputs.tag }}
+          name: Containoodle v${{ steps.version.outputs.tag }}
           files: artifacts/*.xpi
           fail_on_unmatched_files: true
           generate_release_notes: true
           body: |
-            ### Orbiting Turnip v${{ steps.version.outputs.tag }}
+            ### Containoodle v${{ steps.version.outputs.tag }}
 
-            Prefer `orbiting-turnip-…-signed.xpi` when present — it installs permanently on regular Firefox.
-            The unsigned `orbiting-turnip-….xpi` needs `about:debugging` (temporary) or a Developer/Nightly
+            Prefer `containoodle-…-signed.xpi` when present — it installs permanently on regular Firefox.
+            The unsigned `containoodle-….xpi` needs `about:debugging` (temporary) or a Developer/Nightly
             build with `xpinstall.signatures.required = false`.

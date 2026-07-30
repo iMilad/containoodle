@@ -1,18 +1,18 @@
 <div align="center">
 
-<img src="firefox-extension/icons/icon.svg" width="96" height="96" alt="Orbiting Turnip logo">
+<img src="firefox-extension/icons/icon.svg" width="96" height="96" alt="Containoodle logo">
 
-# Orbiting Turnip
+# Containoodle
 
 **AWS console sessions, neatly separated.**
 
-One click from the Orbiting Turnip sidebar or your AWS Access Portal opens each AWS account in
+One click from the Containoodle sidebar or your AWS Access Portal opens each AWS account in
 its own named Firefox container and tab group, colour-coded by environment.
 AWS console sessions stay separated by container; portal mode intentionally
 copies the portal authentication cookie required to establish the selected
 account's console session.
 
-![Firefox](https://img.shields.io/badge/Firefox-MV3%20%C2%B7%20%E2%89%A5140-orange)
+![Firefox](https://img.shields.io/badge/Firefox-MV3%20%C2%B7%20%E2%89%A5142-orange)
 ![Python](https://img.shields.io/badge/python-3.10%2B%20stdlib-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -23,23 +23,23 @@ account's console session.
 ## The problem
 
 AWS offers [opt-in multi-session support](https://docs.aws.amazon.com/awsconsolehelpdocs/latest/gsg/multisession.html)
-for up to five identities in one browser. Orbiting Turnip is aimed at workflows that need
+for up to five identities in one browser. Containoodle is aimed at workflows that need
 more durable organisation across many accounts:
 
 - **Sessions need structure.** Native multi-session does not create persistent, named Firefox containers or account-specific tab groups.
 - **The SSO dance.** Portal → find account → pick role → open, or fall back to a local federation path when the portal is unreachable.
 - **"Wait, am I in _prod_?"** A wall of identical console tabs is how the wrong-account change happens.
 
-## What Orbiting Turnip does
+## What Containoodle does
 
-Orbiting Turnip puts every AWS account in a dedicated [Firefox container](https://support.mozilla.org/kb/containers)
+Containoodle puts every AWS account in a dedicated [Firefox container](https://support.mozilla.org/kb/containers)
 so AWS console sessions do not overwrite one another. Use your local AWS CLI SSO
-session when the Access Portal is unavailable, or let Orbiting Turnip hand launches from
+session when the Access Portal is unavailable, or let Containoodle hand launches from
 the reachable portal into the right container.
 
 | Capability | Behaviour |
 |---|---|
-| 🎯 **One click in** | Backend mode launches from the Orbiting Turnip sidebar; portal mode lets you choose the account and role in the AWS Access Portal as usual. A sidebar button focuses or opens the configured portal. Either way, the console lands in the account's container. |
+| 🎯 **One click in** | Backend mode launches from the Containoodle sidebar; portal mode lets you choose the account and role in the AWS Access Portal as usual. A sidebar button focuses or opens the configured portal. Either way, the console lands in the account's container. |
 | 🔀 **Two exclusive modes** | **Backend** uses local `server.py` and your AWS CLI SSO token. **Portal** uses the reachable AWS Access Portal with no backend or AWS CLI. Only one mode is active; account lists and remembered roles never cross between them. |
 | 🎭 **The right role** | Portal handoffs use the exact role you clicked. Portal shortcuts use only their saved portal role or optional portal role discovery. Backend launches use only backend account/role data and leave final fallback resolution to the helper. |
 | 🗂️ **Separated by design** | Each account gets one named container. AWS console cookies stay container-scoped; portal mode copies the scoped SSO authentication cookie needed to bootstrap the selected session. |
@@ -47,9 +47,10 @@ the reachable portal into the right container.
 | 🚦 **Environment colours** | The account name decides the colour: **`dev` green · `qa` yellow · `prod` red · `test`/`eval` grey**. Anything unrecognised is treated as **prod (red)** — better a false alarm than a silent prod. |
 | 👁️ **Never lose the active tab** | The tab you're on is a solid indigo bar and the sidebar scrolls it into view. |
 | 🔌 **Live sidebar** | Containers and tabs are grouped per account and update as you open/close tabs. |
-| 🔒 **Local helper** | The optional backend binds to `127.0.0.1`, generates URLs from your local SSO cache, and has no hosted Orbiting Turnip service or telemetry. Its session-generation calls go to AWS. |
+| 🔒 **Local helper** | The optional backend binds to `127.0.0.1`, generates URLs from your local SSO cache, and has no hosted Containoodle service or telemetry. Its session-generation calls go to AWS. |
 
-> **Why "Orbiting Turnip"?** No serious reason. It is memorable, unrelated, and the turnip gets a tiny orbit in the icon.
+> **Why "Containoodle"?** It contains sessions, it sounds like a noodle, and naming
+> meetings are overrated.
 
 ## How it works
 
@@ -70,7 +71,7 @@ the reachable portal into the right container.
 
 The helper itself stays on `127.0.0.1`; the extension rejects non-loopback helper
 addresses. AWS CLI SSO/STS requests and the AWS
-federation request still go to AWS; Orbiting Turnip has no hosted backend or telemetry
+federation request still go to AWS; Containoodle has no hosted backend or telemetry
 service.
 
 **Portal mode** (no backend, no AWS CLI — anywhere your access portal is reachable):
@@ -79,24 +80,24 @@ service.
 ┌─────────────────────────────┐
 │  AWS Access Portal          │   1. sign in in a normal Firefox tab
 │  • choose account + role    │   2. click the account/role as usual
-└──────────────┬──────────────┘   3. Orbiting Turnip recognizes the portal console shortcut
+└──────────────┬──────────────┘   3. Containoodle recognizes the portal console shortcut
                ▼                  4. the launch is handed into that account's container
 ┌─────────────────────────────┐   5. the sidebar tracks the tab and tab group
-│  Orbiting Turnip container  │
+│  Containoodle container  │
 └─────────────────────────────┘
 ```
 
 Configure the portal start URL (`https://d-xxxxxxxxxx.awsapps.com/start`) in the
 extension's options page and grant access. A normal portal click captures the
 displayed account name associated with the role you selected. If that context is
-unavailable, Orbiting Turnip uses an existing portal pin or a previously captured portal name
+unavailable, Containoodle uses an existing portal pin or a previously captured portal name
 for that account, then finally falls back to `AWS <account-id>`. A successful portal
 handoff saves the captured portal name for later sidebar labels, environment colours,
 container repair, and automatic tab-group naming.
 
 The portal URL is saved in extension-local `browser.storage.local`. Firefox also
 persists the exact-origin permission and content-script registration in this Firefox
-profile. The URL is never baked into the source or sent to an Orbiting Turnip service.
+profile. The URL is never baked into the source or sent to a Containoodle service.
 
 The options page shows only the active connection method. The **Portal readiness**
 card uses the same cookie-scope checks as the launch path to report whether the exact
@@ -114,8 +115,8 @@ portal permission and a usable signed-in session are present.
 
 Portal role choices and backend session reuse have separate **Allow** and
 **Revoke** controls inside their respective mode panels. Saving a different portal
-URL requests its exact origin and, after a successful change, removes Orbiting Turnip's
-previous exact-origin grant. Revoking a host permission stops future Orbiting Turnip access
+URL requests its exact origin and, after a successful change, removes Containoodle's
+previous exact-origin grant. Revoking a host permission stops future Containoodle access
 to that host but does not delete cookies Firefox already owns.
 
 Backend mode keeps `~/.aws/accounts.json` as the source of truth and offers an
@@ -127,7 +128,7 @@ The **Tab group names** settings can optionally apply a JavaScript regex pattern
 replacement to automatic group titles. A disabled or non-matching rule, or an empty
 result, keeps the original account name. A manually renamed group always takes
 precedence. Backtracking-prone constructs are rejected so a naming preference cannot
-freeze the extension. **Reset existing titles to automatic** removes stored Orbiting Turnip
+freeze the extension. **Reset existing titles to automatic** removes stored Containoodle
 title overrides and recalculates current groups from the original account names and
 the saved rule.
 
@@ -137,15 +138,15 @@ clicked rather than silently reusing a possibly different live role.
 
 ## Install the extension
 
-Orbiting Turnip requires **Firefox 140 or newer** because it uses Firefox tab groups and
+Containoodle requires **Firefox 142 or newer** because it uses Firefox tab groups and
 Firefox's built-in data-consent disclosure. Download the appropriate asset from the
 [latest release](../../releases/latest):
 
-- Prefer `orbiting-turnip-<version>-signed.xpi` when it is present; it installs permanently on regular Firefox.
-- The unsigned `orbiting-turnip-<version>.xpi` can be loaded temporarily through `about:debugging` → **This Firefox** → **Load Temporary Add-on**. It is removed when Firefox restarts.
+- Prefer `containoodle-<version>-signed.xpi` when it is present; it installs permanently on regular Firefox.
+- The unsigned `containoodle-<version>.xpi` can be loaded temporarily through `about:debugging` → **This Firefox** → **Load Temporary Add-on**. It is removed when Firefox restarts.
 - For permanent unsigned installation, use Firefox Developer Edition or Nightly, set `xpinstall.signatures.required` to `false`, and install the XPI.
 
-Open the sidebar with **View → Sidebar → Orbiting Turnip**, `Alt+Shift+A`, or
+Open the sidebar with **View → Sidebar → Containoodle**, `Alt+Shift+A`, or
 `Ctrl+Shift+A` on macOS. The installed version appears in the header; the ⚙ button
 opens the options page.
 
@@ -166,17 +167,17 @@ roles, and launch data still come exclusively from the helper.
 
 ### Portal quick start
 
-1. Open Orbiting Turnip options and select **AWS access portal**.
+1. Open Containoodle options and select **AWS access portal**.
 2. Enter the exact start URL, for example `https://d-xxxxxxxxxx.awsapps.com/start`, then choose **Grant access & save**.
 3. Use **AWS Portal** at the top of the sidebar to open the configured portal or
    focus its existing normal Firefox tab.
 4. Sign in to that portal in the normal, non-container Firefox tab.
 5. Confirm that **Portal readiness** reports portal access and a signed-in session.
-6. Choose an account and role in the AWS portal normally. Orbiting Turnip hands that launch into the matching container and tab group.
+6. Choose an account and role in the AWS portal normally. Containoodle hands that launch into the matching container and tab group.
 7. Optional: in the sidebar, choose ☆ on the active account row to keep it as a direct-launch shortcut. Choose ★ later to unpin it; active tabs and the account container remain untouched.
 
 Normal portal clicks and pinning need no broad AWS API permission. Allow **Role
-choices for pinned accounts** only if you want Orbiting Turnip to load or change a pin's
+choices for pinned accounts** only if you want Containoodle to load or change a pin's
 available roles. Backend session reuse does not apply in portal mode.
 
 ### Backend quick start
@@ -187,8 +188,8 @@ Python standard library; no third-party Python packages are required.
 1. Clone the public repository:
 
    ```bash
-   git clone <repository-url> orbiting-turnip
-   cd orbiting-turnip
+   git clone <repository-url> containoodle
+   cd containoodle
    ```
 
 2. Before starting the helper, create `~/.aws/accounts.json`:
@@ -221,20 +222,20 @@ Python standard library; no third-party Python packages are required.
 
    ```bash
    python3 server.py
-   # Orbiting Turnip is now available at http://127.0.0.1:8421
+   # Containoodle is now available at http://127.0.0.1:8421
    ```
 
-5. In Orbiting Turnip options select **Local AWS CLI helper**, keep or change the helper URL,
+5. In Containoodle options select **Local AWS CLI helper**, keep or change the helper URL,
    then choose **Save & test**.
 
 Use ☆ beside any backend account to keep it in **Pinned accounts**. The star is
 only a sidebar preference: the helper remains the source of its name, role, region,
 and launch data. Unpinned inactive accounts remain under **Other accounts**.
 
-For backend sidebar launches, Orbiting Turnip checks an explicit backend choice, the account's
+For backend sidebar launches, Containoodle checks an explicit backend choice, the account's
 configured role, a backend-only remembered choice, and live backend discovery. If the
 extension sends no role, the helper uses the account's configured role or
-`ORBITING_TURNIP_DEFAULT_ROLE` (`AdministratorAccess` by default). A configured or selected
+`CONTAINOODLE_DEFAULT_ROLE` (`AdministratorAccess` by default). A configured or selected
 role must match a permission set you actually have; otherwise AWS CLI
 `get-role-credentials` rejects the launch.
 
@@ -247,24 +248,24 @@ and an explicit role choice always bypasses reuse so the selected role wins.
 
 - **The helper exits immediately:** create a valid `~/.aws/accounts.json` before running `server.py`.
 - **The helper reports an expired or wrong SSO session:** run `aws sso login` again; with several cached identities, log in to the intended profile last.
-- **The helper reports that the token expires within five minutes:** run `aws sso login` again. Orbiting Turnip never moves or deletes the AWS CLI cache to refresh it.
-- **AWS CLI rejects a backend role:** select a permission set available to that account, or correct the role in `~/.aws/accounts.json` / `ORBITING_TURNIP_DEFAULT_ROLE`.
+- **The helper reports that the token expires within five minutes:** run `aws sso login` again. Containoodle never moves or deletes the AWS CLI cache to refresh it.
+- **AWS CLI rejects a backend role:** select a permission set available to that account, or correct the role in `~/.aws/accounts.json` / `CONTAINOODLE_DEFAULT_ROLE`.
 - **A pinned portal shortcut has the wrong role:** allow portal role choices, then click the role chip on that pin and select the intended role.
 - **Portal readiness says sign-in is required:** sign in at the exact saved portal URL in a normal Firefox tab, then refresh readiness.
 - **The portal opens an ordinary tab or the container asks for login:** verify portal mode, the exact-origin grant, and the signed-in session; then reload the portal page and retry.
-- **A tab-group regex does not affect an older group:** use **Reset existing titles to automatic**. This intentionally removes stored manual Orbiting Turnip group-title overrides before recalculating them.
+- **A tab-group regex does not affect an older group:** use **Reset existing titles to automatic**. This intentionally removes stored manual Containoodle group-title overrides before recalculating them.
 - **An unsigned XPI disappears after restart:** temporary add-ons are expected to do that. Use a signed asset when present, or Developer Edition/Nightly for permanent unsigned installation.
 
 ## Security notes
 
-- The backend binds to `127.0.0.1` and has no authentication. For account and session endpoints, requests carrying an `Origin` header are accepted from Orbiting Turnip extension origins; requests without `Origin` are deliberately available to command-line clients. Any local process that can reach the port can call it, so run it only on a trusted workstation and never expose or forward the port.
-- The helper builds session sign-in URLs in memory. It does not write them to Orbiting Turnip files or include query strings in its access log; Firefox may retain navigated URLs according to its own history and session policies.
+- The backend binds to `127.0.0.1` and has no authentication. For account and session endpoints, requests carrying an `Origin` header are accepted from Containoodle extension origins; requests without `Origin` are deliberately available to command-line clients. Any local process that can reach the port can call it, so run it only on a trusted workstation and never expose or forward the port.
+- The helper builds session sign-in URLs in memory. It does not write them to Containoodle files or include query strings in its access log; Firefox may retain navigated URLs according to its own history and session policies.
 - No real account IDs, credentials, or internal account names are baked into the project. Runtime account metadata comes from `~/.aws`, the clicked AWS Access Portal page, or extension-local storage. Synthetic account IDs remain in examples and tests.
 - Container ownership is stored by AWS account ID and Firefox cookie-store ID. A pre-existing Firefox container with the same display name is not reused, so labels cannot merge two account sessions.
-- Host permissions are **opt-in at runtime and independently revocable**: core portal setup asks only for the exact configured portal origin. Portal API access is optional and used only for role choices on portal pins. AWS console-cookie access is optional and used only for backend session reuse/banner suppression. Orbiting Turnip has no hosted backend and sends no analytics or telemetry to an Orbiting Turnip service.
-- Orbiting Turnip's complete data handling, retention, and deletion terms are in the [privacy policy](PRIVACY.md). Firefox's install prompt discloses the data categories the extension handles even though none of that data is sent to the developer.
+- Host permissions are **opt-in at runtime and independently revocable**: core portal setup asks only for the exact configured portal origin. Portal API access is optional and used only for role choices on portal pins. AWS console-cookie access is optional and used only for backend session reuse/banner suppression. Containoodle has no hosted backend and sends no analytics or telemetry to a Containoodle service.
+- Containoodle's complete data handling, retention, and deletion terms are in the [privacy policy](PRIVACY.md). Firefox's install prompt discloses the data categories the extension handles even though none of that data is sent to the developer.
 - In portal mode, a document-start handler on the exact configured portal reads the validated shortcut URL and the displayed account name associated with the role you click. It does not read forms, credentials, or the rest of the account list. A bounded tab-URL fallback may remove a proven portal-created child tab or return the source tab to the portal only after a successful handoff; redirected or unrelated tabs are left alone.
-- **Portal mode trade-off, deliberately accepted:** the `x-amz-sso_authn` cookie can mint console sessions for every account your SSO user is entitled to. Orbiting Turnip copies its Firefox domain/path/isolation scope into each launched account's container and verifies the copy before navigation; Firefox may retain it until its original expiry. Optional sidebar role discovery also sends its value as a bearer token directly to the regional AWS portal API. Orbiting Turnip never writes the value to extension storage or logs.
+- **Portal mode trade-off, deliberately accepted:** the `x-amz-sso_authn` cookie can mint console sessions for every account your SSO user is entitled to. Containoodle copies its Firefox domain/path/isolation scope into each launched account's container and verifies the copy before navigation; Firefox may retain it until its original expiry. Optional sidebar role discovery also sends its value as a bearer token directly to the regional AWS portal API. Containoodle never writes the value to extension storage or logs.
 - Every release includes an unsigned XPI. When AMO signing secrets are configured, the release workflow also publishes a `-signed.xpi`; use that asset on regular Firefox when present.
 
 ## Development
@@ -291,4 +292,4 @@ version everywhere:
 
 ## License
 
-[MIT](LICENSE) © Orbiting Turnip contributors
+[MIT](LICENSE) © Containoodle contributors
