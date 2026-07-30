@@ -23,7 +23,8 @@ if (!/^\d+\.\d+\.\d+$/.test(manifest.version)) {
 
 const expectedFiles = [
   "background.js",
-  "icons/icon.svg",
+  "icons/icon-48.png",
+  "icons/icon-96.png",
   "manifest.json",
   "options/options.css",
   "options/options.html",
