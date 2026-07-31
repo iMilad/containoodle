@@ -47,29 +47,26 @@ jobs:
       - name: Build and verify reproducible XPI
         run: npm run build:ext
 
-      # Runs only once the AMO_JWT_ISSUER / AMO_JWT_SECRET repo secrets
-      # exist (Developer Hub → Manage API Keys). Signs on the unlisted
-      # (self-distribution) channel; the signed XPI installs on regular
-      # Firefox with no about:config changes.
-      - name: Sign XPI with AMO (skipped until secrets are configured)
+      # Submit the same tagged version to the existing public AMO listing.
+      # AMO performs validation and review; listed releases are installed
+      # and updated through addons.mozilla.org rather than a GitHub XPI.
+      - name: Submit listed version to AMO
         env:
-          TAG: ${{ steps.version.outputs.tag }}
           AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
           AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
         run: |
           set -euo pipefail
           if [[ -z "$AMO_JWT_ISSUER" || -z "$AMO_JWT_SECRET" ]]; then
-            echo "AMO signing secrets are not configured; unsigned artifact only."
-            exit 0
+            echo "::error::AMO signing secrets are required for an automated listed release."
+            exit 1
           fi
           ./node_modules/.bin/web-ext sign \
             --source-dir=firefox-extension \
-            --channel=unlisted \
+            --channel=listed \
+            --approval-timeout=0 \
+            --no-input \
             --api-key="$AMO_JWT_ISSUER" \
-            --api-secret="$AMO_JWT_SECRET" \
-            --artifacts-dir=signed
-          mv signed/*.xpi "artifacts/containoodle-${TAG}-signed.xpi"
-          echo "Signed: artifacts/containoodle-${TAG}-signed.xpi"
+            --api-secret="$AMO_JWT_SECRET"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
@@ -81,6 +78,10 @@ jobs:
           body: |
             ### Containoodle v${{ steps.version.outputs.tag }}
 
-            Prefer `containoodle-…-signed.xpi` when present — it installs permanently on regular Firefox.
-            The unsigned `containoodle-….xpi` needs `about:debugging` (temporary) or a Developer/Nightly
-            build with `xpinstall.signatures.required = false`.
+            This version was submitted automatically to the public
+            [Firefox Add-ons listing](https://addons.mozilla.org/firefox/addon/containoodle/).
+            Mozilla review status is managed on AMO.
+
+            The attached unsigned XPI is for temporary testing through `about:debugging`,
+            or permanent testing on Developer Edition/Nightly with
+            `xpinstall.signatures.required = false`.
