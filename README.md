@@ -4,21 +4,56 @@
 
 # Containoodle
 
-**AWS console sessions, neatly separated.**
+**Two ways in. One organised Firefox.**
 
-One click from the Containoodle sidebar or your AWS Access Portal opens each AWS account in
-its own named Firefox container and tab group, colour-coded by environment.
-AWS console sessions stay separated by container; portal mode intentionally
-copies the portal authentication cookie required to establish the selected
-account's console session.
+Containoodle keeps AWS console sessions from colliding by opening each account in
+its own named Firefox container and tab group. See at a glance whether you are in
+dev, test, or prod, and launch through either your AWS Access Portal or an existing
+local AWS CLI SSO session.
 
 ![Firefox](https://img.shields.io/badge/Firefox-MV3%20%C2%B7%20%E2%89%A5142-orange)
 ![Python](https://img.shields.io/badge/python-3.10%2B%20stdlib-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+[Install](#install-the-extension) · [Set up](#set-up-a-connection) · [Privacy](PRIVACY.md)
+
 </div>
 
 ---
+
+![Containoodle organising AWS accounts into isolated Firefox containers and tab groups](branding/screenshots/containoodle-overview.png)
+
+<div align="center"><sub>All screenshots use fictional demo account names and IDs.</sub></div>
+
+## Two ways to connect
+
+Choose the path that fits your environment. Both lead to the same result: isolated
+AWS sessions, named containers, environment colours, and account-specific tab groups.
+
+| | AWS Access Portal | Local AWS CLI helper |
+|---|---|---|
+| **Best when** | Your Access Portal is reachable. | Your Access Portal is unavailable or VPN-blocked. |
+| **Local component** | None. | `server.py` on `127.0.0.1:8421`. |
+| **AWS CLI** | Not required. | AWS CLI v2 with a valid `aws sso login` session. |
+| **How you launch** | Choose an account and role in the portal as usual. | Launch with one click from the Containoodle sidebar. |
+| **Shortcuts** | Pin active portal accounts; role discovery is optional. | Load accounts from `~/.aws/accounts.json` and pin frequent ones. |
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>AWS Access Portal</strong><br><br>
+      <a href="branding/screenshots/access-portal-settings.png">
+        <img src="branding/screenshots/access-portal-settings.png" alt="Containoodle configured to use an AWS Access Portal">
+      </a>
+    </td>
+    <td width="50%" valign="top">
+      <strong>Local AWS CLI helper</strong><br><br>
+      <a href="branding/screenshots/local-helper-settings.png">
+        <img src="branding/screenshots/local-helper-settings.png" alt="Containoodle configured to use the local AWS CLI helper">
+      </a>
+    </td>
+  </tr>
+</table>
 
 ## The problem
 
@@ -39,8 +74,8 @@ the reachable portal into the right container.
 
 | Capability | Behaviour |
 |---|---|
-| 🎯 **One click in** | Backend mode launches from the Containoodle sidebar; portal mode lets you choose the account and role in the AWS Access Portal as usual. A sidebar button focuses or opens the configured portal. Either way, the console lands in the account's container. |
-| 🔀 **Two exclusive modes** | **Backend** uses local `server.py` and your AWS CLI SSO token. **Portal** uses the reachable AWS Access Portal with no backend or AWS CLI. Only one mode is active; account lists and remembered roles never cross between them. |
+| 🎯 **One click in** | Local helper mode launches from the Containoodle sidebar; portal mode lets you choose the account and role in the AWS Access Portal as usual. A sidebar button focuses or opens the configured portal. Either way, the console lands in the account's container. |
+| 🔀 **Two exclusive modes** | **Local helper** uses `server.py` and your AWS CLI SSO token. **Portal** uses the reachable AWS Access Portal with no helper or AWS CLI. Only one mode is active; account lists and remembered roles never cross between them. |
 | 🎭 **The right role** | Portal handoffs use the exact role you clicked. Portal shortcuts use only their saved portal role or optional portal role discovery. Backend launches use only backend account/role data and leave final fallback resolution to the helper. |
 | 🗂️ **Separated by design** | Each account gets one named container. AWS console cookies stay container-scoped; portal mode copies the scoped SSO authentication cookie needed to bootstrap the selected session. |
 | 📑 **Tab groups** | Every account's tabs land in their own Firefox tab group, colour-matched to the environment. Portal handoffs keep the displayed account name when it can be captured; an optional regex pattern and replacement can shorten automatic group titles. Manual titles always win. |
@@ -54,7 +89,7 @@ the reachable portal into the right container.
 
 ## How it works
 
-**Backend mode** (default — for machines where the access portal is VPN-blocked):
+**Local helper mode** (default — for machines where the access portal is VPN-blocked):
 
 ```
 ┌─────────────────────────────┐          ┌──────────────────────────────┐
@@ -69,7 +104,7 @@ the reachable portal into the right container.
                                           AWS federation endpoint → signed console URL
 ```
 
-The helper itself stays on `127.0.0.1`; the extension rejects non-loopback helper
+The helper stays on `127.0.0.1`; the extension rejects non-loopback helper
 addresses. AWS CLI SSO/STS requests and the AWS
 federation request still go to AWS; Containoodle has no hosted backend or telemetry
 service.
@@ -94,6 +129,10 @@ unavailable, Containoodle uses an existing portal pin or a previously captured p
 for that account, then finally falls back to `AWS <account-id>`. A successful portal
 handoff saves the captured portal name for later sidebar labels, environment colours,
 container repair, and automatic tab-group naming.
+
+![Portal mode handing an AWS console launch into its isolated Containoodle container](branding/screenshots/access-portal-handoff.png)
+
+<div align="center"><sub>A portal launch handed into its account-specific container and tab group.</sub></div>
 
 The portal URL is saved in extension-local `browser.storage.local`. Firefox also
 persists the exact-origin permission and content-script registration in this Firefox
@@ -150,15 +189,7 @@ Open the sidebar with **View → Sidebar → Containoodle**, `Alt+Shift+A`, or
 `Ctrl+Shift+A` on macOS. The installed version appears in the header; the ⚙ button
 opens the options page.
 
-## Choose a connection mode
-
-| | AWS Access Portal | Local AWS CLI helper |
-|---|---|---|
-| Best when | The Access Portal is reachable. | The Access Portal is unavailable or VPN-blocked. |
-| Local backend | Not required. | `server.py` on `127.0.0.1:8421`. |
-| AWS CLI | Not required. | AWS CLI v2 and a valid `aws sso login` session. |
-| Portal-click handoff | Yes. | No. |
-| Direct sidebar launch | Pin an active portal account with ☆/★; role discovery is optional. | Uses `~/.aws/accounts.json`; ☆/★ keeps frequent accounts in a separate pinned section. |
+## Set up a connection
 
 Switching modes does not merge account lists or remembered roles. Portal launches
 never use backend cache/session-reuse logic, and backend launches never use portal
@@ -180,9 +211,9 @@ Normal portal clicks and pinning need no broad AWS API permission. Allow **Role
 choices for pinned accounts** only if you want Containoodle to load or change a pin's
 available roles. Backend session reuse does not apply in portal mode.
 
-### Backend quick start
+### Local helper quick start
 
-Backend mode requires Python 3.10 or newer and AWS CLI v2. The helper uses only the
+Local helper mode requires Python 3.10 or newer and AWS CLI v2. The helper uses only the
 Python standard library; no third-party Python packages are required.
 
 1. Clone the public repository:
@@ -257,6 +288,18 @@ and an explicit role choice always bypasses reuse so the selected role wins.
 - **An unsigned XPI disappears after restart:** temporary add-ons are expected to do that. Use a signed asset when present, or Developer Edition/Nightly for permanent unsigned installation.
 
 ## Security notes
+
+Firefox's data disclosure describes the categories the extension handles locally;
+it does not mean the developer receives that data. Containoodle has no telemetry or
+hosted service. See the [privacy policy](PRIVACY.md) for the complete details.
+
+<details>
+  <summary><strong>Firefox permissions and data disclosure</strong></summary>
+  <br>
+  <a href="branding/screenshots/permissions-and-data.png">
+    <img src="branding/screenshots/permissions-and-data.png" alt="Firefox permissions and data disclosure for Containoodle">
+  </a>
+</details>
 
 - The backend binds to `127.0.0.1` and has no authentication. For account and session endpoints, requests carrying an `Origin` header are accepted from Containoodle extension origins; requests without `Origin` are deliberately available to command-line clients. Any local process that can reach the port can call it, so run it only on a trusted workstation and never expose or forward the port.
 - The helper builds session sign-in URLs in memory. It does not write them to Containoodle files or include query strings in its access log; Firefox may retain navigated URLs according to its own history and session policies.
