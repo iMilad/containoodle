@@ -178,11 +178,13 @@ clicked rather than silently reusing a possibly different live role.
 ## Install the extension
 
 Containoodle requires **Firefox 142 or newer** because it uses Firefox tab groups and
-Firefox's built-in data-consent disclosure. Download the appropriate asset from the
-[latest release](../../releases/latest):
+Firefox's built-in data-consent disclosure.
 
-- Prefer `containoodle-<version>-signed.xpi` when it is present; it installs permanently on regular Firefox.
-- The unsigned `containoodle-<version>.xpi` can be loaded temporarily through `about:debugging` → **This Firefox** → **Load Temporary Add-on**. It is removed when Firefox restarts.
+- For regular Firefox, install the reviewed version from
+  [Firefox Add-ons](https://addons.mozilla.org/firefox/addon/containoodle/).
+- Every [GitHub release](../../releases/latest) also includes an unsigned
+  `containoodle-<version>.xpi` for testing. Load it temporarily through
+  `about:debugging` → **This Firefox** → **Load Temporary Add-on**. It is removed when Firefox restarts.
 - For permanent unsigned installation, use Firefox Developer Edition or Nightly, set `xpinstall.signatures.required` to `false`, and install the XPI.
 
 Open the sidebar with **View → Sidebar → Containoodle**, `Alt+Shift+A`, or
@@ -285,7 +287,7 @@ and an explicit role choice always bypasses reuse so the selected role wins.
 - **Portal readiness says sign-in is required:** sign in at the exact saved portal URL in a normal Firefox tab, then refresh readiness.
 - **The portal opens an ordinary tab or the container asks for login:** verify portal mode, the exact-origin grant, and the signed-in session; then reload the portal page and retry.
 - **A tab-group regex does not affect an older group:** use **Reset existing titles to automatic**. This intentionally removes stored manual Containoodle group-title overrides before recalculating them.
-- **An unsigned XPI disappears after restart:** temporary add-ons are expected to do that. Use a signed asset when present, or Developer Edition/Nightly for permanent unsigned installation.
+- **An unsigned XPI disappears after restart:** temporary add-ons are expected to do that. Use the Firefox Add-ons version on regular Firefox, or Developer Edition/Nightly for permanent unsigned testing.
 
 ## Security notes
 
@@ -309,7 +311,7 @@ hosted service. See the [privacy policy](PRIVACY.md) for the complete details.
 - Containoodle's complete data handling, retention, and deletion terms are in the [privacy policy](PRIVACY.md). Firefox's install prompt discloses the data categories the extension handles even though none of that data is sent to the developer.
 - In portal mode, a document-start handler on the exact configured portal reads the validated shortcut URL and the displayed account name associated with the role you click. It does not read forms, credentials, or the rest of the account list. A bounded tab-URL fallback may remove a proven portal-created child tab or return the source tab to the portal only after a successful handoff; redirected or unrelated tabs are left alone.
 - **Portal mode trade-off, deliberately accepted:** the `x-amz-sso_authn` cookie can mint console sessions for every account your SSO user is entitled to. Containoodle copies its Firefox domain/path/isolation scope into each launched account's container and verifies the copy before navigation; Firefox may retain it until its original expiry. Optional sidebar role discovery also sends its value as a bearer token directly to the regional AWS portal API. Containoodle never writes the value to extension storage or logs.
-- Every release includes an unsigned XPI. When AMO signing secrets are configured, the release workflow also publishes a `-signed.xpi`; use that asset on regular Firefox when present.
+- Every release includes an unsigned GitHub XPI for testing and submits the same version to the public Firefox Add-ons listing for Mozilla review.
 
 ## Development
 
@@ -322,7 +324,7 @@ npm run check
 ```
 
 - **CI** (`.github/workflows/ci.yml`) runs these checks, validates the manifest, runs `web-ext lint`, and smoke-builds an XPI on every push or pull request to `main`.
-- **Releases** (`.github/workflows/release.yml`) build a versioned unsigned XPI—and a signed XPI when signing secrets are configured—when a pushed `v*` tag matches `manifest.json`.
+- **Releases** (`.github/workflows/release.yml`) test and build a versioned unsigned GitHub XPI, submit that version to the listed AMO channel, and create the GitHub Release when a pushed `v*` tag matches `manifest.json`.
 
 Before tagging, update the version in `firefox-extension/manifest.json` and
 `package.json`, then commit those changes. Replace `X.Y.Z` below with the same

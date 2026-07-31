@@ -1,7 +1,7 @@
 {
   "name": "containoodle",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "description": "Containoodle keeps AWS console sessions separated in Firefox containers. See README.md.",
   "license": "MIT",
