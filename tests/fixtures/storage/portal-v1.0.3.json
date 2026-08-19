@@ -1,0 +1,61 @@
+{
+  "config": {
+    "mode": "portal",
+    "backendUrl": "http://127.0.0.1:8421",
+    "portalStartUrl": "https://d-0000000000.awsapps.com/start",
+    "ssoRegion": "eu-west-1",
+    "groupNamePattern": "^corp-(?:dev|qa|prod)-(.+)$",
+    "groupNameReplacement": "$1"
+  },
+  "portalPinnedAccounts": [
+    {
+      "accountId": "123456789012",
+      "accountName": "portal-prod-shared",
+      "role": "ReadOnlyAccess"
+    },
+    {
+      "accountId": "210987654321",
+      "accountName": "corp-qa-portal-only",
+      "role": "AuditAccess"
+    }
+  ],
+  "portalAccountOriginalName/123456789012": "portal-prod-shared",
+  "portalAccountOriginalName/210987654321": "corp-qa-portal-only",
+  "portalRoleChoice/123456789012": "ReadOnlyAccess",
+  "portalRoleChoice/210987654321": "AuditAccess",
+  "portalRegionCache": "eu-west-1",
+  "accountsCache": [
+    {
+      "accountId": "123456789012",
+      "accountName": "backend-prod-shared",
+      "region": "eu-west-1"
+    },
+    {
+      "accountId": "345678901234",
+      "accountName": "corp-dev-helper-only",
+      "role": "DeveloperAccess",
+      "region": "eu-west-1"
+    }
+  ],
+  "accountsCacheAt": 1767225600000,
+  "accountsCacheSource": "backend",
+  "backendPinnedAccountIds": [
+    "123456789012",
+    "345678901234"
+  ],
+  "backendRoleChoice/123456789012": "BackendOnlyRole",
+  "backendRoleChoice/345678901234": "DeveloperAccess",
+  "accountContainer/123456789012": "firefox-container-1",
+  "containerAccount/firefox-container-1": "123456789012",
+  "accountContainer/210987654321": "firefox-container-2",
+  "containerAccount/firefox-container-2": "210987654321",
+  "accountContainer/345678901234": "firefox-container-3",
+  "containerAccount/firefox-container-3": "345678901234",
+  "tabGroups/123456789012/7": 41,
+  "tabGroups/123456789012/9": 57,
+  "tabGroups/210987654321/7": 42,
+  "tabGroups/345678901234/7": 43,
+  "tabGroupTitle/123456789012": "Payments - manual",
+  "migration/groupTitlesAutomaticV1": true,
+  "roleChoice/123456789012": "LegacySharedRole"
+}
