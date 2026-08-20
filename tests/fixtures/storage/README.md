@@ -36,6 +36,15 @@ identities, open tabs, visible tab groups, or cookies. Record those separately
 in a dedicated test profile. Never add real account data, cookies, access
 tokens, credentials, or generated sign-in URLs to a fixture.
 
-Phase 0 validates these files as JSON and through the production account and
-group-name validators. They are not yet loaded by `npm test`; automating the
-full install/migration assertions belongs to the next implementation phase.
+`npm test` now loads both complete snapshots. A static contract test validates
+their three-account topology, coexistence of distinct mode-owned state,
+symmetric one-to-one container mappings, safe group-name rule, and absence of
+common session or credential markers. Background lifecycle tests then prove
+that importing the current background preserves every value, while
+install/update and startup remove only `tabGroups/*`; repeating either event is
+idempotent and invokes no mocked tab creation, contextual-identity mutation, or
+cookie write/removal.
+
+This remains storage-only automation. Firefox permissions, contextual
+identities, open tabs, visible groups, cookies, a signed same-ID update, and
+real portal/helper behavior still belong to the manual test-profile gates.

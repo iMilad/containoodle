@@ -65,6 +65,13 @@ fixtures; it is not a real-Firefox end-to-end test. The three Python tests cover
 only SSO token-expiry handling. The manual Firefox and non-production AWS gates
 below remain necessary.
 
+Phase 1 adds both complete v1.0.3 storage fixtures to `npm test`. The tests prove
+that importing the background preserves the full migrated snapshot and that
+install/update or startup removes only transient `tabGroups/*` entries,
+including when the lifecycle event is repeated. These are synthetic storage
+and WebExtension-event checks whose mocked browser APIs resolve immediately;
+they are not proof of a same-ID Firefox update or delayed real-browser work.
+
 ## Stored-state compatibility contract
 
 Unless a future change has an explicit, tested migration, an in-place upgrade
@@ -139,11 +146,11 @@ upgrade-only checks are explicitly identified below.
 - [ ] Run `npm test` with Python 3.10 or newer and run `npm run lint:ext`.
 - [ ] Build twice from clean temporary exports and compare the two XPI hashes
   and file lists.
-- [ ] Confirm the portal and backend storage fixtures parse and retain their
-  deliberately conflicting inactive-mode state.
-- [ ] Record that Phase 0 does not yet load the new full-profile fixtures in
-  `npm test`; the automated install/migration test is the next implementation
-  phase.
+- [ ] Confirm `npm test` loads both complete storage fixtures, enforces their
+  distinct three-account, mode-owned topology, and preserves the full state on
+  background import.
+- [ ] Confirm update and startup remove only `tabGroups/*`, preserve every
+  other key, and remain idempotent when repeated.
 - [ ] Treat the Python result only as token-expiry coverage; it is not a helper
   integration result.
 

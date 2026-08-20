@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
 
 const START = "https://d-0000000000.awsapps.com/start";
 const ACCOUNT_ID = "123456789012";
@@ -23,6 +24,18 @@ const SOURCE_TAB = {
   incognito: false,
 };
 
+const STORAGE_FIXTURE_NAMES = [
+  "portal-v1.0.3.json",
+  "backend-v1.0.3.json",
+];
+
+function readStorageFixture(name) {
+  return JSON.parse(readFileSync(
+    new URL(`./fixtures/storage/${name}`, import.meta.url),
+    "utf8",
+  ));
+}
+
 function webExtensionEvent() {
   const listeners = [];
   return {
@@ -33,8 +46,8 @@ function webExtensionEvent() {
   };
 }
 
-function makeBrowser() {
-  const storageData = {
+function makeBrowser(initialStorage = null) {
+  const storageData = initialStorage === null ? {
     config: {
       mode: "portal",
       portalStartUrl: START,
@@ -45,7 +58,7 @@ function makeBrowser() {
     accountsCache: [{ accountId: ACCOUNT_ID, accountName: "backend-prod-data" }],
     accountsCacheSource: "backend",
     portalPinnedAccounts: [{ accountId: ACCOUNT_ID, accountName: "portal-prod-data" }],
-  };
+  } : structuredClone(initialStorage);
   const tabs = new Map([[SOURCE_TAB.id, { ...SOURCE_TAB }]]);
   const createdTabs = [];
   const identities = [];
@@ -539,6 +552,24 @@ async function waitFor(check) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   assert.ok(check(), "timed out waiting for background work");
+}
+
+async function fireBackgroundLifecycle(event, details) {
+  const results = event.listeners.map((listener) => {
+    try {
+      return Promise.resolve(listener(details));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  });
+  const settlements = await Promise.allSettled(results);
+  // Detached listeners use only immediately resolving mocks in this harness.
+  // Cross both timer/check phases so their promise chains settle before the
+  // shared global browser is replaced by the next sequential fixture case.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setImmediate(resolve));
+  const rejection = settlements.find((result) => result.status === "rejected");
+  if (rejection) throw rejection.reason;
 }
 
 test("open portal focuses an exact default-store portal tab", async () => {
@@ -1380,6 +1411,77 @@ test("a proven mapped placeholder is reconciled without adopting a same-name con
     fixture.createdTabs[0].cookieStoreId,
     "firefox-container-owned"
   );
+});
+
+test("v1.0.3 storage fixtures survive install and startup cleanup", async (t) => {
+  const lifecycleCases = [
+    {
+      name: "install",
+      eventName: "runtimeInstalled",
+      details: { reason: "install" },
+    },
+    {
+      name: "update",
+      eventName: "runtimeInstalled",
+      details: { reason: "update", previousVersion: "1.0.3" },
+    },
+    {
+      name: "startup",
+      eventName: "runtimeStartup",
+      details: undefined,
+    },
+  ];
+
+  for (const fixtureName of STORAGE_FIXTURE_NAMES) {
+    for (const lifecycle of lifecycleCases) {
+      await t.test(`${fixtureName}: ${lifecycle.name}`, async (t) => {
+        const previousBrowser = globalThis.browser;
+        const previousFetch = globalThis.fetch;
+        t.after(() => {
+          globalThis.browser = previousBrowser;
+          globalThis.fetch = previousFetch;
+        });
+
+        const before = readStorageFixture(fixtureName);
+        const transientKeys = Object.keys(before).filter(
+          (key) => key.startsWith("tabGroups/"),
+        );
+        assert.ok(transientKeys.length > 0, "fixture must include transient group IDs");
+
+        const expected = structuredClone(before);
+        for (const key of transientKeys) delete expected[key];
+
+        const fixture = makeBrowser(before);
+        await loadBackground(fixture);
+        assert.deepStrictEqual(
+          fixture.storageData,
+          before,
+          "background import must preserve the complete migrated fixture",
+        );
+
+        const event = fixture.events[lifecycle.eventName];
+        assert.ok(event.listeners.length > 0, "background lifecycle listener is missing");
+        await fireBackgroundLifecycle(event, lifecycle.details);
+        assert.deepStrictEqual(
+          fixture.storageData,
+          expected,
+          "lifecycle cleanup must remove only transient group IDs",
+        );
+
+        await fireBackgroundLifecycle(event, lifecycle.details);
+        assert.deepStrictEqual(
+          fixture.storageData,
+          expected,
+          "repeating lifecycle cleanup must be idempotent",
+        );
+        assert.deepStrictEqual(fixture.createdTabs, []);
+        assert.deepStrictEqual(fixture.identities, []);
+        assert.deepStrictEqual(fixture.identityUpdates, []);
+        assert.deepStrictEqual(fixture.cookieWrites, []);
+        assert.deepStrictEqual(fixture.cookieRemovals, []);
+      });
+    }
+  }
 });
 
 test("legacy manual accounts and automatic titles migrate, while reset clears real overrides", async () => {
