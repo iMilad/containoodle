@@ -72,6 +72,15 @@ including when the lifecycle event is repeated. These are synthetic storage
 and WebExtension-event checks whose mocked browser APIs resolve immediately;
 they are not proof of a same-ID Firefox update or delayed real-browser work.
 
+Phase 2 expands the current Python suite from the frozen three-test baseline to
+41 deterministic helper tests. They characterize SSO cache selection and
+expiry, exact AWS CLI contracts and failure handling, federation URL encoding,
+account lookup, CORS/JSON transport, and every HTTP route without starting the
+server. AWS subprocesses, federation requests, home-directory paths, and socket
+I/O remain mocked; this is not a live AWS or helper integration test.
+Valid JSON with a malformed account schema remains a later input-hardening gap,
+not behavior that Phase 2 freezes as acceptable.
+
 ## Stored-state compatibility contract
 
 Unless a future change has an explicit, tested migration, an in-place upgrade
@@ -151,8 +160,8 @@ upgrade-only checks are explicitly identified below.
   background import.
 - [ ] Confirm update and startup remove only `tabGroups/*`, preserve every
   other key, and remain idempotent when repeated.
-- [ ] Treat the Python result only as token-expiry coverage; it is not a helper
-  integration result.
+- [ ] Treat the Phase 2 Python result as mocked helper characterization, not a
+  live AWS, federation-endpoint, or socket-level integration result.
 
 ### In-place upgrade hard gate
 
