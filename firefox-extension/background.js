@@ -26,7 +26,11 @@ import {
 } from "./shared/portal.js";
 import { automaticGroupTitle } from "./shared/group-naming.js";
 import {
+  BACKEND_AUTH_TOKEN_KEY,
   DEFAULT_BACKEND_URL,
+  backendFetch,
+  isBackendAuthenticationError,
+  normalizeBackendToken,
   safeBackendUrl,
   validateBackendSigninUrl,
 } from "./shared/backend.js";
@@ -82,6 +86,28 @@ async function getConfig() {
 async function getBackendAccounts() {
   const { accountsCache } = await browser.storage.local.get("accountsCache");
   return Array.isArray(accountsCache) ? accountsCache : [];
+}
+
+async function getBackendAuthToken() {
+  const stored = await browser.storage.local.get(BACKEND_AUTH_TOKEN_KEY);
+  try {
+    return normalizeBackendToken(stored[BACKEND_AUTH_TOKEN_KEY]);
+  } catch {
+    const err = new Error("Local helper access token is missing or invalid");
+    err.needsOptions = true;
+    throw err;
+  }
+}
+
+function backendAuthRejectedError() {
+  const err = new Error("Local helper access token was rejected");
+  err.needsOptions = true;
+  return err;
+}
+
+function rethrowBackendAuthenticationError(err) {
+  if (isBackendAuthenticationError(err)) throw backendAuthRejectedError();
+  throw err;
 }
 
 async function getPortalPinnedAccounts() {
@@ -264,6 +290,19 @@ async function reconcileMappedContainer(identity, accountId, name, env) {
   }
   if (Object.keys(properties).length === 0) return identity;
   return browser.contextualIdentities.update(identity.cookieStoreId, properties);
+}
+
+/* Read-only lookup used before a backend helper round-trip. A stale or rejected
+   helper credential must not create/repair containers or storage mappings. */
+async function getMappedContainer(accountId) {
+  const mappingKey = `accountContainer/${accountId}`;
+  const { [mappingKey]: mappedStoreId } = await browser.storage.local.get(mappingKey);
+  if (typeof mappedStoreId !== "string") return null;
+  try {
+    return await browser.contextualIdentities.get(mappedStoreId);
+  } catch {
+    return null;
+  }
 }
 
 const findOrCreateContainer = synchronize(async (accountId, name, env, mode) => {
@@ -576,6 +615,19 @@ async function fetchJson(url, opts) {
   return res.json();
 }
 
+async function fetchBackendJson(url, opts) {
+  const token = await getBackendAuthToken();
+  let res;
+  try {
+    res = await backendFetch(url, token, opts);
+  } catch (err) {
+    rethrowBackendAuthenticationError(err);
+  }
+  if (res.status === 401) throw backendAuthRejectedError();
+  if (!res.ok) throw new Error(`HTTP ${res.status} from local helper`);
+  return res.json();
+}
+
 /* SSO region: explicit config wins, then cached detection, then
    the portal's whoAmI endpoint. */
 async function portalRegion(config) {
@@ -632,7 +684,7 @@ async function portalDiscoverRoles(config, account) {
 /* Backend variant — GET /roles (server runs aws sso
    list-account-roles). Old servers 404 here; caller falls back. */
 async function backendDiscoverRoles(config, account) {
-  const data = await fetchJson(
+  const data = await fetchBackendJson(
     `${config.backendUrl}/roles?account=${encodeURIComponent(account.accountId)}`
   );
   if (!data.ok || !Array.isArray(data.roles)) throw new Error(data.error || "Bad /roles response");
@@ -658,7 +710,7 @@ async function rememberRole(config, accountId, role) {
 /* Resolution order: explicit pick → pinned → mode-specific remembered
    pick → discovery (1 role: use it; several: throw chooseRole) → null.
    Backend mode lets the server resolve null; portal mode reports it. */
-async function resolveRole(config, account, explicitRole) {
+async function resolveRole(config, account, explicitRole, options = {}) {
   if (explicitRole) return explicitRole;
   if (account.role) return account.role;
   const key = rememberedRoleKey(config.mode, account.accountId);
@@ -673,7 +725,11 @@ async function resolveRole(config, account, explicitRole) {
     roles = null; // discovery unavailable — fall through to defaults
   }
   if (roles && roles.length === 1) {
-    await rememberRole(config, account.accountId, roles[0]);
+    if (typeof options.onDiscoveredRole === "function") {
+      options.onDiscoveredRole(roles[0]);
+    } else {
+      await rememberRole(config, account.accountId, roles[0]);
+    }
     return roles[0];
   }
   if (roles && roles.length > 1) {
@@ -690,7 +746,15 @@ async function discoverRoles(accountId, expectedMode) {
   if (expectedMode && config.mode !== expectedMode) {
     return { ok: false, error: "Connection mode changed — try again" };
   }
-  const account = await resolveAccount(accountId, config);
+  let account;
+  try {
+    account = await resolveAccount(accountId, config);
+  } catch (err) {
+    if (err && err.needsOptions) {
+      return { ok: false, needsOptions: true, error: err.message };
+    }
+    return { ok: false, error: err.message || "Account lookup failed" };
+  }
   if (!account) {
     return {
       ok: false,
@@ -760,10 +824,23 @@ async function openPortal(expectedMode) {
 
 async function backendSigninUrl(backendUrl, account, role) {
   const roleParam = role ? `&role=${encodeURIComponent(role)}` : "";
-  const res = await fetch(
-    `${backendUrl}/generate-url?account=${encodeURIComponent(account.accountId)}${roleParam}`
-  );
-  const data = await res.json();
+  const token = await getBackendAuthToken();
+  let res;
+  try {
+    res = await backendFetch(
+      `${backendUrl}/generate-url?account=${encodeURIComponent(account.accountId)}${roleParam}`,
+      token
+    );
+  } catch (err) {
+    rethrowBackendAuthenticationError(err);
+  }
+  if (res.status === 401) throw backendAuthRejectedError();
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error(`Backend error (HTTP ${res.status})`);
+  }
   if (!res.ok || !data.ok) throw new Error(data.error || `Backend error (HTTP ${res.status})`);
   const urlParam = data.containerUrl.split("&url=")[1];
   if (!urlParam) throw new Error("Malformed container URL from backend");
@@ -952,10 +1029,18 @@ async function resolveAccount(accountId, config) {
   if (config.mode === "backend") {
     // Cache may not be primed yet — ask the backend directly.
     try {
-      const res = await fetch(`${config.backendUrl}/accounts`);
+      const token = await getBackendAuthToken();
+      let res;
+      try {
+        res = await backendFetch(`${config.backendUrl}/accounts`, token);
+      } catch (err) {
+        rethrowBackendAuthenticationError(err);
+      }
+      if (res.status === 401) throw backendAuthRejectedError();
       const data = await res.json();
       if (Array.isArray(data)) return data.find((a) => a.accountId === accountId);
-    } catch {
+    } catch (err) {
+      if (err && err.needsOptions) throw err;
       return undefined;
     }
   }
@@ -1017,7 +1102,15 @@ async function launch(accountId, explicitRole, options = {}) {
     }
   }
 
-  const account = options.account || await resolveAccount(accountId, config);
+  let account;
+  try {
+    account = options.account || await resolveAccount(accountId, config);
+  } catch (err) {
+    if (err && err.needsOptions) {
+      return { ok: false, needsOptions: true, error: err.message };
+    }
+    return { ok: false, error: err.message || "Account lookup failed" };
+  }
   if (!account) {
     return {
       ok: false,
@@ -1029,67 +1122,56 @@ async function launch(accountId, explicitRole, options = {}) {
 
   if (!(await modeIsCurrent())) return cancelled();
   const env = accountEnv(account.accountName);
-  const container = await findOrCreateContainer(
-    account.accountId,
-    account.accountName,
-    env,
-    config.mode
-  );
-  if (!(await modeIsCurrent())) return cancelled();
-
+  let container;
   let url;
   let resolvedRole = null;
-  // A portal click is an explicit role choice. Never let a possibly
-  // different live session in the container override that handoff.
-  // Portal mode never inspects console cookies: the selected portal role
-  // must always win, including launches from a pinned shortcut.
-  const liveRegion = config.mode === "backend" && !explicitRole
-    ? await liveConsoleRegion(container.cookieStoreId)
-    : null;
-  if (liveRegion) {
-    url = `https://${liveRegion}.console.aws.amazon.com/console/home?region=${liveRegion}`;
-  } else {
-    let role = portalLaunch && portalLaunch.roleName;
-    if (!role) {
+
+  if (config.mode === "backend") {
+    // Reuse may inspect an already-owned container without contacting the
+    // helper. When helper generation is required, authenticate and validate
+    // the sign-in URL before creating/repairing any container state.
+    const mappedContainer = explicitRole
+      ? null
+      : await getMappedContainer(account.accountId);
+    const liveRegion = mappedContainer
+      ? await liveConsoleRegion(mappedContainer.cookieStoreId)
+      : null;
+    if (liveRegion) {
+      if (!(await modeIsCurrent())) return cancelled();
+      container = await findOrCreateContainer(
+        account.accountId,
+        account.accountName,
+        env,
+        config.mode
+      );
+      if (!(await modeIsCurrent())) return cancelled();
+      url = `https://${liveRegion}.console.aws.amazon.com/console/home?region=${liveRegion}`;
+    } else {
+      let role;
+      let discoveredRole = null;
       try {
-        role = await resolveRole(config, account, explicitRole);
+        role = await resolveRole(config, account, explicitRole, {
+          onDiscoveredRole(value) {
+            discoveredRole = value;
+          },
+        });
       } catch (err) {
-        if (err.needsLogin) return { ok: false, needsLogin: true, error: "No portal session" };
+        if (err.needsOptions) {
+          return { ok: false, needsOptions: true, error: err.message };
+        }
         if (err.chooseRole) return { ok: false, chooseRole: err.chooseRole };
         return { ok: false, error: err.message || "Role resolution failed" };
       }
-    }
-    resolvedRole = role;
-
-    if (config.mode === "portal") {
-      if (!role) {
-        return {
-          ok: false,
-          error: `No role for ${account.accountName} — sign in to the portal so roles can be discovered, or choose a role for its pinned shortcut`,
-        };
-      }
-      let hasSession;
-      try {
-        if (!(await modeIsCurrent())) return cancelled();
-        hasSession = await copyPortalCookie(config.portalStartUrl, container.cookieStoreId);
-      } catch {
-        return { ok: false, needsOptions: true, error: "Portal access not granted" };
-      }
-      if (!hasSession) {
-        return { ok: false, needsLogin: true, error: "No portal session" };
-      }
-      // A portal-click handoff keeps the portal's complete shortcut URL,
-      // including an optional destination. Sidebar launches build one.
-      url = portalLaunch
-        ? portalLaunch.url
-        : consoleDeepLink(config.portalStartUrl, account.accountId, role);
-    } else {
+      resolvedRole = role;
       try {
         if (!(await modeIsCurrent())) return cancelled();
         // role may be null — the server then resolves it from
         // accounts.json / CONTAINOODLE_DEFAULT_ROLE as before.
         url = await backendSigninUrl(config.backendUrl, account, role);
       } catch (err) {
+        if (err && err.needsOptions) {
+          return { ok: false, needsOptions: true, error: err.message };
+        }
         if (err instanceof TypeError) {
           // fetch network failure — server not running or wrong URL
           return {
@@ -1100,7 +1182,69 @@ async function launch(accountId, explicitRole, options = {}) {
         }
         return { ok: false, error: err.message || "Backend error" };
       }
+      if (!(await modeIsCurrent())) return cancelled();
+      if (discoveredRole) {
+        try {
+          await rememberRole(config, account.accountId, discoveredRole);
+        } catch (err) {
+          return { ok: false, error: err.message || "Role resolution failed" };
+        }
+        if (!(await modeIsCurrent())) return cancelled();
+      }
+      container = await findOrCreateContainer(
+        account.accountId,
+        account.accountName,
+        env,
+        config.mode
+      );
     }
+  } else {
+    container = await findOrCreateContainer(
+      account.accountId,
+      account.accountName,
+      env,
+      config.mode
+    );
+    if (!(await modeIsCurrent())) return cancelled();
+
+    // A portal click is an explicit role choice. Never let a possibly
+    // different live session in the container override that handoff.
+    let role = portalLaunch && portalLaunch.roleName;
+    if (!role) {
+      try {
+        role = await resolveRole(config, account, explicitRole);
+      } catch (err) {
+        if (err.needsLogin) return { ok: false, needsLogin: true, error: "No portal session" };
+        if (err.needsOptions) {
+          return { ok: false, needsOptions: true, error: err.message };
+        }
+        if (err.chooseRole) return { ok: false, chooseRole: err.chooseRole };
+        return { ok: false, error: err.message || "Role resolution failed" };
+      }
+    }
+    resolvedRole = role;
+
+    if (!role) {
+      return {
+        ok: false,
+        error: `No role for ${account.accountName} — sign in to the portal so roles can be discovered, or choose a role for its pinned shortcut`,
+      };
+    }
+    let hasSession;
+    try {
+      if (!(await modeIsCurrent())) return cancelled();
+      hasSession = await copyPortalCookie(config.portalStartUrl, container.cookieStoreId);
+    } catch {
+      return { ok: false, needsOptions: true, error: "Portal access not granted" };
+    }
+    if (!hasSession) {
+      return { ok: false, needsLogin: true, error: "No portal session" };
+    }
+    // A portal-click handoff keeps the portal's complete shortcut URL,
+    // including an optional destination. Sidebar launches build one.
+    url = portalLaunch
+      ? portalLaunch.url
+      : consoleDeepLink(config.portalStartUrl, account.accountId, role);
   }
 
   if (!(await modeIsCurrent())) return cancelled();

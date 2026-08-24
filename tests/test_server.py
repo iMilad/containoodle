@@ -1,7 +1,10 @@
+import base64
+import hashlib
 import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 import urllib.error
 import urllib.parse
@@ -23,6 +26,21 @@ TEST_ROLE_QUERY = "__CONTAINOODLE_TEST_ROLE_QUERY__"
 TEST_ROLE_DEFAULT = "__CONTAINOODLE_TEST_ROLE_DEFAULT__"
 
 
+def _test_base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+TEST_HELPER_KEY = bytes(range(32))
+TEST_HELPER_TOKEN = _test_base64url(TEST_HELPER_KEY)
+TEST_OTHER_HELPER_TOKEN = _test_base64url(bytes([255]) + TEST_HELPER_KEY[1:])
+TEST_CHALLENGE = _test_base64url(bytes(range(32, 64)))
+TEST_OTHER_CHALLENGE = _test_base64url(bytes(range(64, 96)))
+TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test-origin"
+
+
+_DEFAULT_HEADER = object()
+
+
 _GUARD_DIRECTORY = None
 _GUARD_PATCHERS = []
 
@@ -35,6 +53,7 @@ def setUpModule():
     _GUARD_PATCHERS.extend([
         patch.object(server, "ACCOUNTS_FILE", safe_root / "accounts.json"),
         patch.object(server, "SSO_CACHE_DIR", safe_root / "sso-cache"),
+        patch.object(server, "HELPER_TOKEN", TEST_HELPER_TOKEN),
         patch.object(
             server.subprocess,
             "run",
@@ -79,12 +98,43 @@ class FakeUrlResponse:
 class RecordingHandler(server.ContainoodleHandler):
     """Socket-free recorder for the production request-handler methods."""
 
-    def __init__(self, path="/", origin=None, command="GET"):
+    def __init__(
+        self,
+        path="/",
+        origin=None,
+        command="GET",
+        host=_DEFAULT_HEADER,
+        authenticated=True,
+        authorization=None,
+    ):
         self.path = path
         self.command = command
         self.headers = Message()
+        if host is _DEFAULT_HEADER:
+            host = f"{server.HOST}:{server.PORT}"
+        if host is not None:
+            self.headers["Host"] = host
         if origin is not None:
             self.headers["Origin"] = origin
+        if authorization is not None:
+            self.headers["Authorization"] = authorization
+        if authenticated:
+            canonical_host = host if host is not None else ""
+            canonical_origin = origin if origin is not None else "-"
+            challenge_payload = server._issue_auth_challenge(
+                canonical_host,
+                canonical_origin,
+            )
+            challenge = challenge_payload["challenge"]
+            proof = server._request_proof(
+                challenge,
+                "GET",
+                path,
+                canonical_host,
+                canonical_origin,
+            )
+            self.headers[server._CHALLENGE_HEADER] = challenge
+            self.headers[server._REQUEST_PROOF_HEADER] = proof
         self.wfile = io.BytesIO()
         self.response_status = None
         self.response_headers = []
@@ -117,6 +167,278 @@ class FixedDateTime(datetime):
     @classmethod
     def now(cls, tz=None):
         return cls.current if tz else cls.current.replace(tzinfo=None)
+
+
+class HelperTokenFileTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.token_file = (
+            Path(self.temporary_directory.name)
+            / "containoodle-config"
+            / "helper-token"
+        )
+
+    def test_creates_a_persistent_256_bit_token_with_private_permissions(self):
+        with (
+            patch.object(
+                server.secrets,
+                "token_urlsafe",
+                return_value=TEST_HELPER_TOKEN,
+            ) as generate_token,
+            patch.object(
+                server,
+                "_fsync_directory",
+                wraps=server._fsync_directory,
+            ) as fsync_directory,
+        ):
+            created = server._load_or_create_helper_token(self.token_file)
+            loaded = server._load_or_create_helper_token(self.token_file)
+
+        self.assertEqual(created, TEST_HELPER_TOKEN)
+        self.assertEqual(loaded, TEST_HELPER_TOKEN)
+        generate_token.assert_called_once_with(32)
+        self.assertEqual(fsync_directory.call_count, 2)
+        self.assertEqual(self.token_file.read_text(), f"{TEST_HELPER_TOKEN}\n")
+        if os.name == "posix":
+            self.assertEqual(
+                self.token_file.parent.stat().st_mode & 0o777,
+                0o700,
+            )
+            self.assertEqual(self.token_file.stat().st_mode & 0o777, 0o600)
+
+    def test_rejects_invalid_generated_or_persisted_tokens(self):
+        with (
+            patch.object(server.secrets, "token_urlsafe", return_value="too-short"),
+            self.assertRaisesRegex(RuntimeError, "Helper token is invalid"),
+        ):
+            server._load_or_create_helper_token(self.token_file)
+
+        self.token_file.parent.mkdir(mode=0o700, exist_ok=True)
+        self.token_file.write_text("not-a-valid-helper-token\n")
+        if os.name == "posix":
+            self.token_file.chmod(0o600)
+        with self.assertRaisesRegex(RuntimeError, "Helper token is invalid"):
+            server._load_or_create_helper_token(self.token_file)
+
+    def test_rejects_noncanonical_encoding_of_the_same_256_bit_key(self):
+        noncanonical = f"{TEST_HELPER_TOKEN[:-1]}9"
+        self.assertEqual(
+            base64.urlsafe_b64decode(f"{noncanonical}="),
+            TEST_HELPER_KEY,
+        )
+        with self.assertRaisesRegex(RuntimeError, "Helper token is invalid"):
+            server._validate_helper_token(noncanonical)
+
+    def test_atomic_publication_never_replaces_an_existing_token(self):
+        self.token_file.parent.mkdir(mode=0o700)
+        self.token_file.write_text(f"{TEST_HELPER_TOKEN}\n")
+        if os.name == "posix":
+            self.token_file.chmod(0o600)
+
+        with (
+            patch.object(
+                server.secrets,
+                "token_urlsafe",
+                return_value=TEST_OTHER_HELPER_TOKEN,
+            ),
+            self.assertRaises(FileExistsError),
+        ):
+            server._create_helper_token(self.token_file)
+
+        self.assertEqual(self.token_file.read_text(), f"{TEST_HELPER_TOKEN}\n")
+        self.assertEqual(
+            list(self.token_file.parent.glob(f".{self.token_file.name}.*.tmp")),
+            [],
+        )
+
+    def test_concurrent_creators_publish_one_complete_token(self):
+        self.token_file.parent.mkdir(mode=0o700)
+        publication_barrier = threading.Barrier(2)
+        values = iter((TEST_HELPER_TOKEN, TEST_OTHER_HELPER_TOKEN))
+        values_lock = threading.Lock()
+        real_link = os.link
+        results = []
+        errors = []
+
+        def next_token(_byte_count):
+            with values_lock:
+                return next(values)
+
+        def synchronized_link(source, destination, **kwargs):
+            source_path = Path(source)
+            self.assertIn(
+                source_path.read_text(),
+                (f"{TEST_HELPER_TOKEN}\n", f"{TEST_OTHER_HELPER_TOKEN}\n"),
+            )
+            if os.name == "posix":
+                self.assertEqual(source_path.stat().st_mode & 0o777, 0o600)
+            publication_barrier.wait(timeout=5)
+            return real_link(source, destination, **kwargs)
+
+        def create():
+            try:
+                results.append(server._load_or_create_helper_token(self.token_file))
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        with (
+            patch.object(server.secrets, "token_urlsafe", side_effect=next_token),
+            patch.object(server.os, "link", side_effect=synchronized_link),
+        ):
+            threads = [threading.Thread(target=create) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(self.token_file.read_text(), f"{results[0]}\n")
+        self.assertEqual(
+            list(self.token_file.parent.glob(f".{self.token_file.name}.*.tmp")),
+            [],
+        )
+
+    def test_failed_publication_leaves_no_partial_final_file(self):
+        self.token_file.parent.mkdir(mode=0o700)
+        with (
+            patch.object(
+                server.secrets,
+                "token_urlsafe",
+                return_value=TEST_HELPER_TOKEN,
+            ),
+            patch.object(
+                server.os,
+                "link",
+                side_effect=OSError("synthetic publication failure"),
+            ),
+            self.assertRaisesRegex(OSError, "synthetic publication failure"),
+        ):
+            server._create_helper_token(self.token_file)
+
+        self.assertFalse(self.token_file.exists())
+        self.assertEqual(
+            list(self.token_file.parent.glob(f".{self.token_file.name}.*.tmp")),
+            [],
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission contract")
+    def test_rejects_group_or_world_access_to_the_token_file(self):
+        self.token_file.parent.mkdir(mode=0o700)
+        self.token_file.write_text(f"{TEST_HELPER_TOKEN}\n")
+        self.token_file.chmod(0o640)
+
+        with self.assertRaisesRegex(PermissionError, "group or other"):
+            server._load_or_create_helper_token(self.token_file)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission contract")
+    def test_rejects_group_or_world_access_to_the_token_directory(self):
+        self.token_file.parent.mkdir(mode=0o755)
+        self.token_file.parent.chmod(0o755)
+
+        with self.assertRaisesRegex(PermissionError, "group or other"):
+            server._load_or_create_helper_token(self.token_file)
+
+    def test_rejects_relative_or_in_checkout_token_paths(self):
+        with self.assertRaisesRegex(RuntimeError, "absolute"):
+            server._validate_helper_token_path(Path("relative-helper-token"))
+
+        checkout_token = Path(server.__file__).resolve().parent / "synthetic-token"
+        with self.assertRaisesRegex(RuntimeError, "outside the project"):
+            server._validate_helper_token_path(checkout_token)
+
+
+class HelperStartupTests(unittest.TestCase):
+    def test_invalid_token_state_fails_before_binding_the_server(self):
+        with (
+            patch.object(
+                server,
+                "_load_or_create_helper_token",
+                side_effect=RuntimeError("synthetic token failure"),
+            ),
+            patch.object(server.http.server, "HTTPServer") as http_server,
+            patch("builtins.print") as print_message,
+        ):
+            result = server.main([])
+
+        self.assertEqual(result, 1)
+        http_server.assert_not_called()
+        rendered = " ".join(str(call) for call in print_message.call_args_list)
+        self.assertNotIn(TEST_HELPER_TOKEN, rendered)
+
+    def test_invalid_persisted_token_fails_before_binding_the_server(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            token_file = Path(temporary_directory) / "config" / "helper-token"
+            token_file.parent.mkdir(mode=0o700)
+            token_file.write_text("invalid-token\n")
+            if os.name == "posix":
+                token_file.parent.chmod(0o700)
+                token_file.chmod(0o600)
+
+            with (
+                patch.object(server, "HELPER_TOKEN_FILE", token_file),
+                patch.object(server.http.server, "HTTPServer") as http_server,
+                patch("builtins.print"),
+            ):
+                result = server.main([])
+
+        self.assertEqual(result, 1)
+        http_server.assert_not_called()
+
+    def test_show_token_is_the_explicit_non_binding_onboarding_path(self):
+        with (
+            patch.object(
+                server,
+                "_load_or_create_helper_token",
+                return_value=TEST_HELPER_TOKEN,
+            ),
+            patch.object(server.http.server, "HTTPServer") as http_server,
+            patch("builtins.print") as print_message,
+        ):
+            result = server.main(["--show-token"])
+
+        self.assertEqual(result, 0)
+        print_message.assert_called_once_with(TEST_HELPER_TOKEN)
+        http_server.assert_not_called()
+
+    def test_normal_startup_never_prints_the_token(self):
+        fake_server = Mock()
+        fake_server.serve_forever.side_effect = KeyboardInterrupt
+        accounts_file = Mock()
+        accounts_file.exists.return_value = True
+        with server._AUTH_CHALLENGE_LOCK:
+            server._AUTH_CHALLENGES[TEST_CHALLENGE] = {
+                "deadline": 999_999.0,
+                "expiresAt": 999_999_000,
+                "host": f"{server.HOST}:{server.PORT}",
+                "origin": TEST_EXTENSION_ORIGIN,
+            }
+        with (
+            patch.object(
+                server,
+                "_load_or_create_helper_token",
+                return_value=TEST_HELPER_TOKEN,
+            ),
+            patch.object(server, "ACCOUNTS_FILE", accounts_file),
+            patch.object(
+                server.http.server,
+                "HTTPServer",
+                return_value=fake_server,
+            ),
+            patch("builtins.print") as print_message,
+        ):
+            result = server.main([])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(server.HELPER_TOKEN, TEST_HELPER_TOKEN)
+        self.assertEqual(server._AUTH_CHALLENGES, {})
+        fake_server.serve_forever.assert_called_once_with()
+        fake_server.server_close.assert_called_once_with()
+        rendered = " ".join(str(call) for call in print_message.call_args_list)
+        self.assertNotIn(TEST_HELPER_TOKEN, rendered)
 
 
 class TokenExpiryTests(unittest.TestCase):
@@ -554,19 +876,147 @@ class AccountMetadataTests(unittest.TestCase):
 
 
 class HandlerTransportTests(unittest.TestCase):
+    def setUp(self):
+        with server._AUTH_CHALLENGE_LOCK:
+            server._AUTH_CHALLENGES.clear()
+
+    def test_host_policy_requires_the_exact_bound_loopback_authority(self):
+        self.assertTrue(RecordingHandler()._check_host())
+
+        for host in (
+            None,
+            "localhost:8421",
+            "127.0.0.1",
+            "synthetic-rebind.invalid:8421",
+        ):
+            with self.subTest(host=host):
+                rejected = RecordingHandler(host=host)
+                self.assertFalse(rejected._check_host())
+                self.assertEqual(rejected.response_status, 403)
+                self.assertEqual(
+                    rejected.error,
+                    (403, "Forbidden: invalid Host header"),
+                )
+
+        duplicate = RecordingHandler()
+        duplicate.headers["Host"] = f"{server.HOST}:{server.PORT}"
+        self.assertFalse(duplicate._check_host())
+        self.assertEqual(duplicate.response_status, 403)
+
     def test_origin_policy_allows_extension_or_no_origin_and_rejects_web_origins(self):
         self.assertTrue(RecordingHandler()._check_origin())
         self.assertTrue(
-            RecordingHandler(origin="moz-extension://synthetic-extension-id")._check_origin(),
+            RecordingHandler(origin=TEST_EXTENSION_ORIGIN)._check_origin(),
         )
 
-        rejected = RecordingHandler(origin="https://example.invalid")
-        self.assertFalse(rejected._check_origin())
-        self.assertEqual(rejected.response_status, 403)
-        self.assertEqual(rejected.error, (403, "Forbidden: cross-origin request"))
+        for origin in (
+            "https://example.invalid",
+            "moz-extension://synthetic-extension-id/path",
+            "moz-extension://",
+        ):
+            with self.subTest(origin=origin):
+                rejected = RecordingHandler(origin=origin)
+                self.assertFalse(rejected._check_origin())
+                self.assertEqual(rejected.response_status, 403)
+                self.assertEqual(
+                    rejected.error,
+                    (403, "Forbidden: cross-origin request"),
+                )
+
+        duplicate = RecordingHandler(origin=TEST_EXTENSION_ORIGIN)
+        duplicate.headers["Origin"] = TEST_EXTENSION_ORIGIN
+        self.assertFalse(duplicate._check_origin())
+        self.assertEqual(duplicate.response_status, 403)
+
+    def test_request_proof_is_single_use_and_legacy_authorization_is_rejected(self):
+        target = f"/roles?account={TEST_ACCOUNT_ID}"
+        accepted = RecordingHandler(path=target, origin=TEST_EXTENSION_ORIGIN)
+        self.assertTrue(accepted._check_request_auth(target, TEST_EXTENSION_ORIGIN))
+        self.assertIsNotNone(accepted._response_auth)
+
+        replay = RecordingHandler(
+            path=target,
+            origin=TEST_EXTENSION_ORIGIN,
+            authenticated=False,
+        )
+        replay.headers[server._CHALLENGE_HEADER] = accepted.headers[
+            server._CHALLENGE_HEADER
+        ]
+        replay.headers[server._REQUEST_PROOF_HEADER] = accepted.headers[
+            server._REQUEST_PROOF_HEADER
+        ]
+        self.assertFalse(replay._check_request_auth(target, TEST_EXTENSION_ORIGIN))
+        self.assertEqual(replay.response_status, 401)
+        self.assertEqual(replay.json_body(), {"error": "Authentication required"})
+        self.assertNotIn(server._RESPONSE_PROOF_HEADER, replay.header_values())
+
+        legacy = RecordingHandler(
+            path=target,
+            origin=TEST_EXTENSION_ORIGIN,
+            authorization=f"Bearer {TEST_HELPER_TOKEN}",
+        )
+        self.assertFalse(legacy._check_request_auth(target, TEST_EXTENSION_ORIGIN))
+        self.assertEqual(legacy.response_status, 401)
+        self.assertNotIn("WWW-Authenticate", legacy.header_values())
+        self.assertNotIn(TEST_HELPER_TOKEN, legacy.wfile.getvalue().decode())
+
+    def test_request_proof_comparison_runs_for_missing_malformed_and_wrong_proofs(self):
+        target = "/accounts"
+        for case in ("missing", "malformed", "wrong"):
+            with self.subTest(case=case):
+                handler = RecordingHandler(path=target)
+                if case == "missing":
+                    del handler.headers[server._REQUEST_PROOF_HEADER]
+                elif case == "malformed":
+                    handler.headers.replace_header(
+                        server._REQUEST_PROOF_HEADER,
+                        "not-a-proof",
+                    )
+                else:
+                    proof = handler.headers[server._REQUEST_PROOF_HEADER]
+                    handler.headers.replace_header(
+                        server._REQUEST_PROOF_HEADER,
+                        ("1" if proof[0] != "1" else "2") + proof[1:],
+                    )
+                with patch.object(
+                    server.hmac,
+                    "compare_digest",
+                    wraps=server.hmac.compare_digest,
+                ) as compare_digest:
+                    self.assertFalse(handler._check_request_auth(target, "-"))
+                compare_digest.assert_called_once()
+                self.assertEqual(handler.response_status, 401)
+                self.assertNotIn(
+                    server._RESPONSE_PROOF_HEADER,
+                    handler.header_values(),
+                )
+
+    def test_duplicate_auth_headers_fail_without_consuming_the_challenge(self):
+        for duplicated_header in (
+            server._CHALLENGE_HEADER,
+            server._REQUEST_PROOF_HEADER,
+        ):
+            with self.subTest(duplicated_header=duplicated_header):
+                handler = RecordingHandler(
+                    path="/accounts",
+                    origin=TEST_EXTENSION_ORIGIN,
+                )
+                challenge = handler.headers[server._CHALLENGE_HEADER]
+                handler.headers[duplicated_header] = handler.headers[
+                    duplicated_header
+                ]
+
+                self.assertFalse(
+                    handler._check_request_auth(
+                        "/accounts",
+                        TEST_EXTENSION_ORIGIN,
+                    )
+                )
+                self.assertEqual(handler.response_status, 401)
+                self.assertIn(challenge, server._AUTH_CHALLENGES)
 
     def test_send_json_sets_transport_security_and_extension_cors_headers(self):
-        handler = RecordingHandler(origin="moz-extension://synthetic-extension-id")
+        handler = RecordingHandler(origin=TEST_EXTENSION_ORIGIN)
         payload = {"ok": True, "roles": [TEST_ROLE_ALPHA]}
 
         handler._send_json(payload, 201)
@@ -582,10 +1032,18 @@ class HandlerTransportTests(unittest.TestCase):
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(
             headers["Access-Control-Allow-Origin"],
-            "moz-extension://synthetic-extension-id",
+            TEST_EXTENSION_ORIGIN,
         )
         self.assertEqual(headers["Access-Control-Allow-Methods"], "GET, OPTIONS")
-        self.assertEqual(headers["Access-Control-Allow-Headers"], "Content-Type")
+        self.assertEqual(
+            headers["Access-Control-Allow-Headers"],
+            "X-Containoodle-Challenge, X-Containoodle-Request-Proof",
+        )
+        self.assertEqual(
+            headers["Access-Control-Expose-Headers"],
+            "X-Containoodle-Response-Proof",
+        )
+        self.assertEqual(headers["Vary"], "Origin")
 
     def test_send_json_omits_cors_headers_without_an_origin(self):
         handler = RecordingHandler()
@@ -600,8 +1058,13 @@ class HandlerTransportTests(unittest.TestCase):
 
     def test_options_allows_extension_origins_and_rejects_other_callers(self):
         allowed = RecordingHandler(
-            origin="moz-extension://synthetic-extension-id",
+            origin=TEST_EXTENSION_ORIGIN,
             command="OPTIONS",
+            authenticated=False,
+        )
+        allowed.headers["Access-Control-Request-Method"] = "GET"
+        allowed.headers["Access-Control-Request-Headers"] = (
+            "x-containoodle-request-proof, x-containoodle-challenge"
         )
         allowed.do_OPTIONS()
 
@@ -609,18 +1072,59 @@ class HandlerTransportTests(unittest.TestCase):
         self.assertTrue(allowed.response_ended)
         self.assertEqual(allowed.wfile.getvalue(), b"")
         self.assertEqual(allowed.header_values(), {
-            "Access-Control-Allow-Origin": "moz-extension://synthetic-extension-id",
+            "Access-Control-Allow-Origin": TEST_EXTENSION_ORIGIN,
             "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-            "Access-Control-Max-Age": "86400",
+            "Access-Control-Allow-Headers": (
+                "X-Containoodle-Challenge, X-Containoodle-Request-Proof"
+            ),
+            "Access-Control-Expose-Headers": "X-Containoodle-Response-Proof",
+            "Access-Control-Max-Age": "600",
+            "Cache-Control": "no-store",
+            "Vary": "Origin",
         })
 
         for origin in (None, "https://example.invalid"):
             with self.subTest(origin=origin):
-                rejected = RecordingHandler(origin=origin, command="OPTIONS")
+                rejected = RecordingHandler(
+                    origin=origin,
+                    command="OPTIONS",
+                    authenticated=False,
+                )
                 rejected.do_OPTIONS()
                 self.assertEqual(rejected.response_status, 403)
-                self.assertEqual(rejected.error, (403, None))
+                self.assertIsNotNone(rejected.error)
+
+        rejected_host = RecordingHandler(
+            origin=TEST_EXTENSION_ORIGIN,
+            command="OPTIONS",
+            host="synthetic-rebind.invalid:8421",
+            authenticated=False,
+        )
+        rejected_host.do_OPTIONS()
+        self.assertEqual(rejected_host.response_status, 403)
+        self.assertEqual(
+            rejected_host.error,
+            (403, "Forbidden: invalid Host header"),
+        )
+
+        invalid_preflights = (
+            ("POST", "x-containoodle-challenge, x-containoodle-request-proof"),
+            ("GET", "authorization"),
+            ("GET", "x-containoodle-challenge"),
+        )
+        for method, requested_headers in invalid_preflights:
+            with self.subTest(method=method, requested_headers=requested_headers):
+                rejected = RecordingHandler(
+                    origin=TEST_EXTENSION_ORIGIN,
+                    command="OPTIONS",
+                    authenticated=False,
+                )
+                rejected.headers["Access-Control-Request-Method"] = method
+                rejected.headers[
+                    "Access-Control-Request-Headers"
+                ] = requested_headers
+                rejected.do_OPTIONS()
+                self.assertEqual(rejected.response_status, 403)
 
     def test_access_log_strips_the_complete_query_string(self):
         handler = RecordingHandler(
@@ -636,8 +1140,351 @@ class HandlerTransportTests(unittest.TestCase):
         print_message.assert_called_once_with("  GET /generate-url → 200")
 
 
+class HelperHmacProtocolTests(unittest.TestCase):
+    def setUp(self):
+        with server._AUTH_CHALLENGE_LOCK:
+            server._AUTH_CHALLENGES.clear()
+
+    def test_python_javascript_canonical_proof_vectors(self):
+        host = "127.0.0.1:8421"
+        origin = TEST_EXTENSION_ORIGIN
+        target = (
+            f"/generate-url?account={TEST_ACCOUNT_ID}"
+            "&role=__CONTAINOODLE_TEST_ROLE__"
+        )
+        body = b'{"ok":true}'
+
+        self.assertEqual(
+            server._server_proof(TEST_CHALLENGE, 2_000_000_030_000, host, origin),
+            "3a65edaffa3b75c35fd50b08cd767f2f230d26731b84b0d63436da4c9cf3fd93",
+        )
+        self.assertEqual(
+            server._request_proof(TEST_CHALLENGE, "GET", target, host, origin),
+            "c6782764d40751c6e26ea3ec9a5555b54e93471075a619106739f5e9a236ed65",
+        )
+        self.assertEqual(
+            server._response_proof(
+                TEST_CHALLENGE,
+                200,
+                target,
+                body,
+                host,
+                origin,
+            ),
+            "cf971959cbc2a14a3c224a20f3f55f248b4012672121b78155b70153d08d6a7a",
+        )
+
+    def test_independently_calculated_authentication_vectors(self):
+        key_token = "A" * 43
+        challenge = f"E{'A' * 42}"
+        expires_at = 2_000_000_000_000
+        host = "127.0.0.1:8421"
+        origin = "moz-extension://containoodle-test"
+        target = f"/roles?account={TEST_ACCOUNT_ID}"
+        body = b'{"ok":true}'
+
+        with patch.object(server, "HELPER_TOKEN", key_token):
+            self.assertEqual(
+                server._server_proof(challenge, expires_at, host, origin),
+                "9daaa0c5cf0423e064008d04d556d583cbe1a85d49686a2fb3ac95b82d9965f7",
+            )
+            self.assertEqual(
+                server._request_proof(challenge, "GET", target, host, origin),
+                "b720c08ea0105097044bb6b4dda370f8821672d1fcd2701644d19f58b49670f3",
+            )
+            self.assertEqual(
+                hashlib.sha256(body).hexdigest(),
+                "4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93",
+            )
+            self.assertEqual(
+                server._response_proof(
+                    challenge,
+                    200,
+                    target,
+                    body,
+                    host,
+                    origin,
+                ),
+                "ebbf1fe5a09a44e2fb4be869f3302d3412e01e246e0b7dc562bf5aa466e761ff",
+            )
+
+    def test_challenge_route_returns_only_a_bound_server_proof(self):
+        accounts_file = Mock()
+        handler = RecordingHandler(
+            path=server._AUTH_CHALLENGE_PATH,
+            origin=TEST_EXTENSION_ORIGIN,
+            authenticated=False,
+        )
+        with (
+            patch.object(server, "ACCOUNTS_FILE", accounts_file),
+            patch.object(server.secrets, "token_urlsafe", return_value=TEST_CHALLENGE),
+            patch.object(server.time, "time", return_value=2_000_000_000.0),
+            patch.object(server.time, "monotonic", return_value=100.0),
+            patch.object(server, "_find_sso_cache_file") as find_cache,
+            patch.object(server, "generate_signin_url") as generate_url,
+        ):
+            handler.do_GET()
+
+        self.assertEqual(handler.response_status, 200)
+        self.assertEqual(handler.json_body(), {
+            "version": 1,
+            "challenge": TEST_CHALLENGE,
+            "expiresAt": 2_000_000_030_000,
+            "serverProof": (
+                "3a65edaffa3b75c35fd50b08cd767f2f"
+                "230d26731b84b0d63436da4c9cf3fd93"
+            ),
+        })
+        headers = handler.header_values()
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Access-Control-Allow-Origin"], TEST_EXTENSION_ORIGIN)
+        self.assertNotIn(server._RESPONSE_PROOF_HEADER, headers)
+        self.assertNotIn("Authorization", str(headers))
+        rendered = handler.wfile.getvalue().decode() + str(headers)
+        self.assertNotIn(TEST_HELPER_TOKEN, rendered)
+        accounts_file.read_text.assert_not_called()
+        find_cache.assert_not_called()
+        generate_url.assert_not_called()
+        self.assertIn(TEST_CHALLENGE, server._AUTH_CHALLENGES)
+
+    def test_challenge_route_rejects_bad_bindings_without_allocating(self):
+        cases = (
+            {
+                "name": "foreign host",
+                "handler": RecordingHandler(
+                    path=server._AUTH_CHALLENGE_PATH,
+                    host="synthetic-rebind.invalid:8421",
+                    authenticated=False,
+                ),
+            },
+            {
+                "name": "foreign origin",
+                "handler": RecordingHandler(
+                    path=server._AUTH_CHALLENGE_PATH,
+                    origin="https://example.invalid",
+                    authenticated=False,
+                ),
+            },
+            {
+                "name": "query string",
+                "handler": RecordingHandler(
+                    path=f"{server._AUTH_CHALLENGE_PATH}?unexpected=1",
+                    origin=TEST_EXTENSION_ORIGIN,
+                    authenticated=False,
+                ),
+            },
+        )
+        duplicate_origin = RecordingHandler(
+            path=server._AUTH_CHALLENGE_PATH,
+            origin=TEST_EXTENSION_ORIGIN,
+            authenticated=False,
+        )
+        duplicate_origin.headers["Origin"] = TEST_EXTENSION_ORIGIN
+        cases += ({"name": "duplicate origin", "handler": duplicate_origin},)
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                with server._AUTH_CHALLENGE_LOCK:
+                    server._AUTH_CHALLENGES.clear()
+                with patch.object(server.secrets, "token_urlsafe") as random_token:
+                    case["handler"].do_GET()
+                self.assertIn(case["handler"].response_status, (403, 404))
+                random_token.assert_not_called()
+                self.assertEqual(server._AUTH_CHALLENGES, {})
+
+    def test_no_origin_challenge_uses_the_dash_binding(self):
+        handler = RecordingHandler(
+            path=server._AUTH_CHALLENGE_PATH,
+            authenticated=False,
+        )
+        with patch.object(
+            server.secrets,
+            "token_urlsafe",
+            return_value=TEST_CHALLENGE,
+        ):
+            handler.do_GET()
+
+        payload = handler.json_body()
+        self.assertEqual(
+            payload["serverProof"],
+            server._server_proof(
+                payload["challenge"],
+                payload["expiresAt"],
+                f"{server.HOST}:{server.PORT}",
+                "-",
+            ),
+        )
+        self.assertNotIn("Access-Control-Allow-Origin", handler.header_values())
+
+    def test_challenge_state_is_bounded_fifo_and_prunes_expiry(self):
+        challenges = [
+            _test_base64url(index.to_bytes(32, "big"))
+            for index in range(server._AUTH_CHALLENGE_LIMIT + 2)
+        ]
+        with (
+            patch.object(server.secrets, "token_urlsafe", side_effect=challenges),
+            patch.object(server.time, "monotonic", return_value=100.0),
+            patch.object(server.time, "time", return_value=2_000_000_000.0),
+        ):
+            for _ in range(server._AUTH_CHALLENGE_LIMIT + 1):
+                server._issue_auth_challenge(
+                    f"{server.HOST}:{server.PORT}",
+                    TEST_EXTENSION_ORIGIN,
+                )
+
+        self.assertEqual(len(server._AUTH_CHALLENGES), server._AUTH_CHALLENGE_LIMIT)
+        self.assertNotIn(challenges[0], server._AUTH_CHALLENGES)
+        self.assertIn(challenges[1], server._AUTH_CHALLENGES)
+
+        with (
+            patch.object(server.secrets, "token_urlsafe", return_value=challenges[-1]),
+            patch.object(server.time, "monotonic", return_value=131.0),
+        ):
+            server._issue_auth_challenge(
+                f"{server.HOST}:{server.PORT}",
+                TEST_EXTENSION_ORIGIN,
+            )
+        self.assertEqual(list(server._AUTH_CHALLENGES), [challenges[-1]])
+
+    def test_target_and_origin_tampering_does_not_consume_the_challenge(self):
+        target = f"/roles?account={TEST_ACCOUNT_ID}"
+        handler = RecordingHandler(path=target, origin=TEST_EXTENSION_ORIGIN)
+        challenge = handler.headers[server._CHALLENGE_HEADER]
+        proof = handler.headers[server._REQUEST_PROOF_HEADER]
+
+        self.assertIsNone(server._consume_auth_challenge(
+            challenge,
+            proof,
+            "GET",
+            f"/accounts?account={TEST_ACCOUNT_ID}",
+            f"{server.HOST}:{server.PORT}",
+            TEST_EXTENSION_ORIGIN,
+        ))
+        self.assertIsNone(server._consume_auth_challenge(
+            challenge,
+            proof,
+            "GET",
+            target,
+            f"{server.HOST}:{server.PORT}",
+            "moz-extension://different-synthetic-origin",
+        ))
+        self.assertIn(challenge, server._AUTH_CHALLENGES)
+        self.assertEqual(
+            server._consume_auth_challenge(
+                challenge,
+                proof,
+                "GET",
+                target,
+                f"{server.HOST}:{server.PORT}",
+                TEST_EXTENSION_ORIGIN,
+            ),
+            challenge,
+        )
+
+    def test_expired_challenge_is_rejected_and_removed(self):
+        with patch.object(server.time, "monotonic", return_value=100.0):
+            handler = RecordingHandler(path="/accounts")
+        challenge = handler.headers[server._CHALLENGE_HEADER]
+        proof = handler.headers[server._REQUEST_PROOF_HEADER]
+
+        with patch.object(server.time, "monotonic", return_value=131.0):
+            self.assertIsNone(server._consume_auth_challenge(
+                challenge,
+                proof,
+                "GET",
+                "/accounts",
+                f"{server.HOST}:{server.PORT}",
+                "-",
+            ))
+        self.assertNotIn(challenge, server._AUTH_CHALLENGES)
+
+    def test_concurrent_replay_allows_exactly_one_consumer(self):
+        handler = RecordingHandler(path="/accounts")
+        challenge = handler.headers[server._CHALLENGE_HEADER]
+        proof = handler.headers[server._REQUEST_PROOF_HEADER]
+        start = threading.Barrier(2)
+        results = []
+
+        def consume():
+            start.wait(timeout=5)
+            results.append(server._consume_auth_challenge(
+                challenge,
+                proof,
+                "GET",
+                "/accounts",
+                f"{server.HOST}:{server.PORT}",
+                "-",
+            ))
+
+        threads = [threading.Thread(target=consume) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(results.count(challenge), 1)
+        self.assertEqual(results.count(None), 1)
+
+    def test_valid_proof_is_consumed_before_route_validation(self):
+        target = "/roles?account=not-an-account"
+        accepted = RecordingHandler(path=target, origin=TEST_EXTENSION_ORIGIN)
+        challenge = accepted.headers[server._CHALLENGE_HEADER]
+        proof = accepted.headers[server._REQUEST_PROOF_HEADER]
+        accepted.do_GET()
+        self.assertEqual(accepted.response_status, 400)
+        self.assertIn(server._RESPONSE_PROOF_HEADER, accepted.header_values())
+
+        replay = RecordingHandler(
+            path=target,
+            origin=TEST_EXTENSION_ORIGIN,
+            authenticated=False,
+        )
+        replay.headers[server._CHALLENGE_HEADER] = challenge
+        replay.headers[server._REQUEST_PROOF_HEADER] = proof
+        replay.do_GET()
+        self.assertEqual(replay.response_status, 401)
+        self.assertEqual(replay.json_body(), {"error": "Authentication required"})
+        self.assertNotIn(server._RESPONSE_PROOF_HEADER, replay.header_values())
+
+    def test_response_proof_binds_status_target_body_host_and_origin(self):
+        target = f"/roles?account={TEST_ACCOUNT_ID}"
+        body = b'{"ok":true}'
+        host = f"{server.HOST}:{server.PORT}"
+        proof = server._response_proof(
+            TEST_CHALLENGE,
+            200,
+            target,
+            body,
+            host,
+            TEST_EXTENSION_ORIGIN,
+        )
+        variants = (
+            (201, target, body, host, TEST_EXTENSION_ORIGIN),
+            (200, "/accounts", body, host, TEST_EXTENSION_ORIGIN),
+            (200, target, b'{"ok":false}', host, TEST_EXTENSION_ORIGIN),
+            (200, target, body, "127.0.0.1:9999", TEST_EXTENSION_ORIGIN),
+            (200, target, body, host, "moz-extension://different-synthetic-origin"),
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual(
+                    server._response_proof(
+                        TEST_CHALLENGE,
+                        variant[0],
+                        variant[1],
+                        variant[2],
+                        variant[3],
+                        variant[4],
+                    ),
+                    proof,
+                )
+
+
 class HandlerRouteTests(unittest.TestCase):
     def setUp(self):
+        with server._AUTH_CHALLENGE_LOCK:
+            server._AUTH_CHALLENGES.clear()
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.accounts_file = Path(self.temporary_directory.name) / "accounts.json"
@@ -646,6 +1493,19 @@ class HandlerRouteTests(unittest.TestCase):
         self.assertIsNone(handler.error)
         self.assertEqual(handler.response_status, status)
         self.assertEqual(handler.json_body(), body)
+        response_auth = getattr(handler, "_response_auth", None)
+        if response_auth:
+            self.assertEqual(
+                handler.header_values()[server._RESPONSE_PROOF_HEADER],
+                server._response_proof(
+                    response_auth["challenge"],
+                    status,
+                    response_auth["target"],
+                    handler.wfile.getvalue(),
+                    response_auth["host"],
+                    response_auth["origin"],
+                ),
+            )
 
     def test_every_supported_get_route_rejects_a_foreign_origin_first(self):
         for path in (
@@ -673,6 +1533,76 @@ class HandlerRouteTests(unittest.TestCase):
                 accounts_file.read_text.assert_not_called()
                 get_account_meta.assert_not_called()
 
+    def test_every_supported_get_route_rejects_auth_before_side_effects(self):
+        for auth_case in ("missing", "malformed", "wrong"):
+            for path in (
+                "/accounts",
+                f"/roles?account={TEST_ACCOUNT_ID}",
+                f"/generate-url?account={TEST_ACCOUNT_ID}",
+            ):
+                with self.subTest(auth_case=auth_case, path=path):
+                    accounts_file = Mock()
+                    handler = RecordingHandler(
+                        path=path,
+                        origin=TEST_EXTENSION_ORIGIN,
+                    )
+                    if auth_case == "missing":
+                        del handler.headers[server._CHALLENGE_HEADER]
+                        del handler.headers[server._REQUEST_PROOF_HEADER]
+                    elif auth_case == "malformed":
+                        handler.headers.replace_header(
+                            server._REQUEST_PROOF_HEADER,
+                            "not-a-proof",
+                        )
+                    else:
+                        proof = handler.headers[server._REQUEST_PROOF_HEADER]
+                        handler.headers.replace_header(
+                            server._REQUEST_PROOF_HEADER,
+                            ("1" if proof[0] != "1" else "2") + proof[1:],
+                        )
+                    with (
+                        patch.object(server, "ACCOUNTS_FILE", accounts_file),
+                        patch.object(
+                            server.ContainoodleHandler,
+                            "_get_account_meta",
+                        ) as get_account_meta,
+                        patch.object(server, "_find_sso_cache_file") as find_cache,
+                        patch.object(server, "generate_signin_url") as generate_url,
+                    ):
+                        handler.do_GET()
+
+                    self.assert_json_response(
+                        handler,
+                        401,
+                        {"error": "Authentication required"},
+                    )
+                    accounts_file.read_text.assert_not_called()
+                    get_account_meta.assert_not_called()
+                    find_cache.assert_not_called()
+                    generate_url.assert_not_called()
+                    self.assertNotIn(
+                        server._RESPONSE_PROOF_HEADER,
+                        handler.header_values(),
+                    )
+
+    def test_supported_routes_reject_a_rebound_host_before_auth_or_filesystem(self):
+        accounts_file = Mock()
+        handler = RecordingHandler(
+            path="/accounts",
+            host="synthetic-rebind.invalid:8421",
+            authorization=None,
+        )
+
+        with patch.object(server, "ACCOUNTS_FILE", accounts_file):
+            handler.do_GET()
+
+        self.assertEqual(handler.response_status, 403)
+        self.assertEqual(
+            handler.error,
+            (403, "Forbidden: invalid Host header"),
+        )
+        accounts_file.read_text.assert_not_called()
+
     def test_accounts_route_returns_the_stored_document(self):
         accounts = [
             {
@@ -694,6 +1624,23 @@ class HandlerRouteTests(unittest.TestCase):
         self.assertEqual(
             handler.header_values()["Access-Control-Allow-Origin"],
             "moz-extension://synthetic-extension-id",
+        )
+
+    def test_accounts_route_allows_authenticated_no_origin_clients(self):
+        accounts = [{
+            "accountId": TEST_ACCOUNT_ID,
+            "accountName": "synthetic-command-line-account",
+        }]
+        self.accounts_file.write_text(json.dumps(accounts))
+        handler = RecordingHandler(path="/accounts", origin=None)
+
+        with patch.object(server, "ACCOUNTS_FILE", self.accounts_file):
+            handler.do_GET()
+
+        self.assert_json_response(handler, 200, accounts)
+        self.assertNotIn(
+            "Access-Control-Allow-Origin",
+            handler.header_values(),
         )
 
     def test_accounts_route_reports_missing_and_invalid_json(self):

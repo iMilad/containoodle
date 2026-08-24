@@ -62,9 +62,27 @@
             spellcheck="false"
             aria-describedby="backend-url-help"
           >
-          <button type="button" id="backend-save">Save &amp; test</button>
         </div>
-        <p class="hint" id="backend-url-help">A successful test also refreshes the account list from the helper.</p>
+        <p class="hint" id="backend-url-help">The URL and token are replaced only after a successful test, which also refreshes the account list.</p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="backend-token">Helper access token</label>
+        <input
+          type="password"
+          id="backend-token"
+          placeholder="Paste the token from server.py --show-token"
+          autocomplete="new-password"
+          autocapitalize="off"
+          maxlength="43"
+          spellcheck="false"
+          aria-describedby="backend-token-help backend-token-status"
+        >
+        <p class="hint" id="backend-token-help">Run <code>python3 server.py --show-token</code>, then paste its 43-character result here. It is stored only in this Firefox profile; the extension never redisplays it after saving. Leave this field blank to test with the token already stored.</p>
+        <p class="status" id="backend-token-status" role="status" aria-live="polite">Checking saved token…</p>
+      </div>
+      <div class="actions">
+        <button type="button" id="backend-save">Save &amp; test</button>
       </div>
       <p class="status" id="backend-status" role="status" aria-live="polite">Not tested yet</p>
 
@@ -80,11 +98,11 @@
       <details class="settings-details" id="console-permissions">
         <summary>
           <span>Reuse an existing console session</span>
-          <small>Optional: faster repeated backend launches</small>
+          <small>Offered during your first helper setup</small>
         </summary>
         <div class="details-body">
           <p class="hint">When enabled, Containoodle can check whether this account's container is already signed in and reuse that session instead of starting another sign-in. It also suppresses the AWS cookie banner in new containers.</p>
-          <p class="hint">This is only a convenience for local-helper mode. Normal backend launches still work without it. Firefox will ask for permission to read AWS console cookies; revoking access stops future checks but does not delete cookies already managed by Firefox.</p>
+          <p class="hint">On your first local-helper <strong>Save &amp; test</strong>, Firefox asks once for permission to read AWS console cookies. Accepting enables session reuse; declining does not block setup or normal backend launches. Containoodle will not ask automatically again, but you can use <strong>Allow session reuse</strong> below. Revoking access stops future checks but does not delete cookies already managed by Firefox.</p>
           <div class="actions">
             <button type="button" id="console-grant">Allow session reuse</button>
             <button type="button" id="console-revoke">Revoke</button>

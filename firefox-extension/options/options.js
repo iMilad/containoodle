@@ -10,7 +10,11 @@ import { normalizeStartUrl, portalOriginPattern } from "../shared/portal.js";
 import { REGION_RE } from "../shared/accounts.js";
 import { validateGroupNameRule } from "../shared/group-naming.js";
 import {
+  BACKEND_AUTH_TOKEN_KEY,
   DEFAULT_BACKEND_URL,
+  backendFetch,
+  isBackendAuthenticationError,
+  normalizeBackendToken,
   normalizeBackendUrl,
   safeBackendUrl,
 } from "../shared/backend.js";
@@ -26,17 +30,25 @@ const DEFAULT_CONFIG = {
 
 const PORTAL_API_ORIGINS = ["https://*.amazonaws.com/*"];
 const CONSOLE_ORIGINS = ["https://*.amazon.com/*"];
+const BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY =
+  "backendSessionReuseAutoOfferHandled";
 
 const el = (id) => document.getElementById(id);
 
 let config = { ...DEFAULT_CONFIG };
 let configSaveQueue = Promise.resolve();
 let backendRequestController = null;
+let backendSessionReuseAutoOfferHandled = false;
+let consolePermissionGranted = false;
 
 function setStatus(id, message, ok) {
   const node = el(id);
   node.textContent = message;
   node.className = `status ${ok === undefined ? "" : ok ? "ok" : "error"}`;
+}
+
+function setBackendTokenInvalid(invalid) {
+  el("backend-token").setAttribute("aria-invalid", String(Boolean(invalid)));
 }
 
 function saveConfig(patch) {
@@ -85,7 +97,11 @@ function bindMode() {
       if (config.mode === "portal") {
         await Promise.all([refreshPortalPinsStatus(), refreshPortalReadiness()]);
       } else {
-        await Promise.all([refreshBackendCacheStatus(), refreshConsoleStatus()]);
+        await Promise.all([
+          refreshBackendCacheStatus(),
+          refreshBackendTokenStatus(),
+          refreshConsoleStatus(),
+        ]);
       }
     });
   }
@@ -118,6 +134,91 @@ async function refreshBackendCacheStatus() {
   setStatus("backend-accounts-status", formatCacheSummary(await readAccountsState()));
 }
 
+async function readStoredBackendToken() {
+  const stored = await browser.storage.local.get(BACKEND_AUTH_TOKEN_KEY);
+  const value = stored[BACKEND_AUTH_TOKEN_KEY];
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    return normalizeBackendToken(value);
+  } catch {
+    return null;
+  }
+}
+
+async function refreshBackendTokenStatus() {
+  if (config.mode !== "backend") return;
+  let token = null;
+  try {
+    token = await readStoredBackendToken();
+  } catch {
+    // A generic status keeps storage failures from exposing stored values.
+  }
+  setStatus(
+    "backend-token-status",
+    token
+      ? "A helper access token is stored"
+      : "No helper access token is stored",
+    token ? true : undefined
+  );
+  setBackendTokenInvalid(false);
+}
+
+async function tokenForBackendRequest({ allowEnteredToken }) {
+  const entered = allowEnteredToken ? el("backend-token").value : "";
+  if (entered.trim()) {
+    try {
+      return normalizeBackendToken(entered);
+    } catch {
+      setBackendTokenInvalid(true);
+      setStatus("backend-token-status", "The helper access token is invalid", false);
+      setStatus("backend-status", "Enter the 43-character token from server.py --show-token", false);
+      return null;
+    }
+  }
+
+  let stored = null;
+  try {
+    stored = await readStoredBackendToken();
+  } catch {
+    // Report the same missing-token state without exposing storage details.
+  }
+  if (!stored) {
+    setBackendTokenInvalid(true);
+    setStatus("backend-token-status", "No helper access token is stored", false);
+    setStatus("backend-status", "Helper access token required", false);
+    return null;
+  }
+  return stored;
+}
+
+function backendAccountState(accounts) {
+  return {
+    accountsCache: accounts,
+    accountsCacheAt: Date.now(),
+    accountsCacheSource: "backend",
+  };
+}
+
+function commitBackendConnection(url, token, accounts) {
+  const operation = async () => {
+    if (config.mode !== "backend") return false;
+    const nextConfig = { ...config, backendUrl: url };
+    await browser.storage.local.set({
+      config: nextConfig,
+      [BACKEND_AUTH_TOKEN_KEY]: token,
+      ...backendAccountState(accounts),
+      ...(backendSessionReuseAutoOfferHandled
+        ? { [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: true }
+        : {}),
+    });
+    config = nextConfig;
+    return true;
+  };
+  const result = configSaveQueue.then(operation, operation);
+  configSaveQueue = result.catch(() => {});
+  return result;
+}
+
 async function refreshBackendAccounts({ saveUrl }) {
   // This guard is the Options-page half of the no-backend Portal contract.
   if (config.mode !== "backend") return;
@@ -136,39 +237,74 @@ async function refreshBackendAccounts({ saveUrl }) {
   const buttons = [el("backend-save"), el("backend-refresh")];
   for (const button of buttons) button.disabled = true;
   setStatus("backend-status", saveUrl ? "Testing local helper…" : "Refreshing accounts…");
-  let urlSaved = !saveUrl;
   try {
-    if (saveUrl) {
-      await saveConfig({ backendUrl: url });
-      urlSaved = true;
-      el("backend-url").value = url;
+    const token = await tokenForBackendRequest({ allowEnteredToken: saveUrl });
+    if (!token) return;
+    if (controller.signal.aborted || config.mode !== "backend") return;
+
+    const response = await backendFetch(`${url}/accounts`, token, {
+      signal: controller.signal,
+    });
+    if (response.status === 401) {
+      setBackendTokenInvalid(true);
+      setStatus("backend-token-status", "The helper access token was rejected", false);
+      setStatus("backend-status", "Authentication failed", false);
+      return;
+    }
+    if (response.status === 403) {
+      setStatus("backend-status", "The local helper rejected this request", false);
+      return;
+    }
+    if (!response.ok) {
+      setStatus("backend-status", `Local helper returned HTTP ${response.status}`, false);
+      return;
+    }
+
+    let accounts;
+    try {
+      accounts = await response.json();
+    } catch {
+      setStatus("backend-status", "Local helper returned an unexpected response", false);
+      return;
+    }
+    if (!Array.isArray(accounts)) {
+      setStatus("backend-status", "Local helper returned an unexpected response", false);
+      return;
     }
     if (controller.signal.aborted || config.mode !== "backend") return;
+    setBackendTokenInvalid(false);
 
-    const response = await fetch(`${url}/accounts`, { signal: controller.signal });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const accounts = await response.json();
-    if (!Array.isArray(accounts)) throw new Error("unexpected response");
-    if (controller.signal.aborted || config.mode !== "backend") return;
-
-    await browser.storage.local.set({
-      accountsCache: accounts,
-      accountsCacheAt: Date.now(),
-      accountsCacheSource: "backend",
-    });
+    if (saveUrl) {
+      let committed;
+      try {
+        committed = await commitBackendConnection(url, token, accounts);
+      } catch {
+        setStatus("backend-status", "Helper connected, but settings could not be saved", false);
+        return;
+      }
+      if (!committed) return;
+      el("backend-url").value = url;
+      el("backend-token").value = "";
+      await refreshBackendTokenStatus();
+    } else {
+      try {
+        await browser.storage.local.set(backendAccountState(accounts));
+      } catch {
+        setStatus("backend-status", "Helper connected, but the account cache could not be updated", false);
+        return;
+      }
+    }
     setStatus("backend-status", `Connected to local helper · ${accounts.length} accounts refreshed`, true);
     await refreshBackendCacheStatus();
   } catch (err) {
     if (err && err.name === "AbortError") return;
-    setStatus(
-      "backend-status",
-      `${saveUrl && !urlSaved
-        ? "Could not save helper URL"
-        : saveUrl
-          ? "Saved, but helper is unreachable"
-          : "Refresh failed"}: ${err.message}`,
-      false
-    );
+    if (isBackendAuthenticationError(err)) {
+      setBackendTokenInvalid(true);
+      setStatus("backend-token-status", "The helper access token was rejected", false);
+      setStatus("backend-status", "Helper authentication failed", false);
+      return;
+    }
+    setStatus("backend-status", "Local helper is unreachable", false);
   } finally {
     if (backendRequestController === controller) {
       backendRequestController = null;
@@ -179,7 +315,15 @@ async function refreshBackendAccounts({ saveUrl }) {
 
 function bindBackend() {
   el("backend-url").value = config.backendUrl;
+  // A stored authentication value is deliberately never copied into the DOM.
+  el("backend-token").value = "";
+  setBackendTokenInvalid(false);
+  el("backend-token").addEventListener("input", () => {
+    setBackendTokenInvalid(false);
+  });
   el("backend-save").addEventListener("click", () => {
+    if (config.mode !== "backend") return;
+    beginBackendSessionReuseAutoOffer();
     void refreshBackendAccounts({ saveUrl: true });
   });
   el("backend-refresh").addEventListener("click", () => {
@@ -209,9 +353,63 @@ function renderConsoleStatus(granted) {
   );
 }
 
+function markBackendSessionReuseAutoOfferHandled() {
+  if (backendSessionReuseAutoOfferHandled) return;
+  backendSessionReuseAutoOfferHandled = true;
+  try {
+    void browser.storage.local.set({
+      [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: true,
+    }).catch(() => {});
+  } catch {
+    // The in-memory marker still prevents another prompt on this page.
+  }
+}
+
+function beginBackendSessionReuseAutoOffer() {
+  if (
+    config.mode !== "backend" ||
+    backendSessionReuseAutoOfferHandled ||
+    consolePermissionGranted
+  ) {
+    return;
+  }
+
+  // Mark first, then invoke request directly in the click handler's call stack
+  // so Firefox recognizes the user gesture. This optional prompt must never
+  // delay or determine the helper connection result.
+  markBackendSessionReuseAutoOfferHandled();
+  let request;
+  try {
+    request = browser.permissions.request({ origins: CONSOLE_ORIGINS });
+  } catch (err) {
+    setStatus(
+      "console-status",
+      err.message || "Could not request session reuse permission",
+      false,
+    );
+    return;
+  }
+
+  void Promise.resolve(request).then((granted) => {
+    consolePermissionGranted = Boolean(granted);
+    if (config.mode === "backend") renderConsoleStatus(consolePermissionGranted);
+  }).catch((err) => {
+    if (config.mode === "backend") {
+      setStatus(
+        "console-status",
+        err.message || "Could not request session reuse permission",
+        false,
+      );
+    }
+  });
+}
+
 async function refreshConsoleStatus() {
   try {
-    renderConsoleStatus(await browser.permissions.contains({ origins: CONSOLE_ORIGINS }));
+    const granted = await browser.permissions.contains({ origins: CONSOLE_ORIGINS });
+    consolePermissionGranted = granted;
+    if (granted) markBackendSessionReuseAutoOfferHandled();
+    renderConsoleStatus(granted);
   } catch (err) {
     setStatus("console-status", err.message || "Could not inspect console permission", false);
   }
@@ -462,9 +660,24 @@ async function refreshPermissionStatuses() {
 }
 
 async function init() {
-  const { config: stored } = await browser.storage.local.get("config");
+  const storedState = await browser.storage.local.get([
+    "config",
+    BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY,
+  ]);
+  const stored = storedState.config;
   config = { ...DEFAULT_CONFIG, ...(stored || {}) };
   config.backendUrl = safeBackendUrl(config.backendUrl);
+  backendSessionReuseAutoOfferHandled =
+    storedState[BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY] === true;
+
+  try {
+    consolePermissionGranted = await browser.permissions.contains({
+      origins: CONSOLE_ORIGINS,
+    });
+    if (consolePermissionGranted) markBackendSessionReuseAutoOfferHandled();
+  } catch {
+    // The normal status refresh below reports permission inspection failures.
+  }
 
   bindMode();
   bindBackend();
@@ -476,7 +689,11 @@ async function init() {
   if (config.mode === "portal") {
     await Promise.all([refreshPortalPinsStatus(), refreshPortalReadiness()]);
   } else {
-    await Promise.all([refreshBackendCacheStatus(), refreshConsoleStatus()]);
+    await Promise.all([
+      refreshBackendCacheStatus(),
+      refreshBackendTokenStatus(),
+      refreshConsoleStatus(),
+    ]);
   }
 
   browser.permissions.onAdded.addListener(() => { void refreshPermissionStatuses(); });

@@ -1,6 +1,50 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
+const TEST_HELPER_TOKEN = "A".repeat(43);
+const TEST_HELPER_ROLE = "__CONTAINOODLE_TEST_ROLE__";
+
+function decodeBase64Url(value) {
+  const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=");
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function encodeBase64Url(bytes) {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function hmacHex(token, canonical) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    decodeBase64Url(token),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(canonical),
+  );
+  return [...new Uint8Array(signature)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 class ClassList {
   constructor(element) {
     this.element = element;
@@ -115,7 +159,7 @@ function storageGet(storageData, keys) {
 }
 
 const originalGlobals = Object.fromEntries(
-  ["browser", "document", "fetch", "setTimeout"].map((name) => [
+  ["browser", "document", "fetch", "location", "setTimeout"].map((name) => [
     name,
     {
       exists: Object.prototype.hasOwnProperty.call(globalThis, name),
@@ -142,6 +186,7 @@ function createSidebarFixture({
     },
     portalPinnedAccounts: [],
     backendPinnedAccountIds: [],
+    backendAuthToken: TEST_HELPER_TOKEN,
     ...storage,
   };
   const sentMessages = [];
@@ -287,7 +332,7 @@ function createSidebarFixture({
   };
 }
 
-async function loadSidebar(fixture) {
+async function loadSidebar(fixture, { waitForInitialRefresh = true } = {}) {
   const nativeSetTimeout = originalGlobals.setTimeout.value;
   globalThis.setTimeout = (...args) => {
     const timer = nativeSetTimeout(...args);
@@ -297,10 +342,18 @@ async function loadSidebar(fixture) {
   globalThis.document = fixture.document;
   globalThis.browser = fixture.browser;
   globalThis.fetch = fixture.fetch;
+  globalThis.location = { origin: TEST_EXTENSION_ORIGIN };
   await import(
     `../firefox-extension/sidebar/sidebar.js?test=${importSequence += 1}`
   );
-  await settle();
+  if (waitForInitialRefresh) {
+    await waitFor(
+      () => !fixture.ids.get("loading-state").classList.contains("visible"),
+      "sidebar initial refresh did not finish",
+    );
+  } else {
+    await settle();
+  }
 }
 
 async function settle(turns = 5) {
@@ -324,17 +377,169 @@ function cleanupGlobals() {
   }
 }
 
-function backendResponse(accounts, onRequest = () => {}) {
-  return async () => {
-    onRequest();
-    return {
-      ok: true,
-      async json() {
-        return accounts;
-      },
-    };
+function backendResponse(
+  payload,
+  onRequest = () => {},
+  { status = 200, token = TEST_HELPER_TOKEN, authFailure = null } = {},
+) {
+  let challengeSequence = 0;
+  return async (url, options = {}) => {
+    onRequest(url, options);
+    const requestUrl = new URL(url);
+    if (requestUrl.pathname === "/auth/challenge") {
+      const challengeBytes = new Uint8Array(32);
+      challengeBytes[31] = challengeSequence += 1;
+      const challenge = encodeBase64Url(challengeBytes);
+      const expiresAt = Date.now() + 30_000;
+      const serverProof = authFailure === "server-proof"
+        ? "0".repeat(64)
+        : await hmacHex(token, [
+          "containoodle-server-v1",
+          challenge,
+          String(expiresAt),
+          requestUrl.host,
+          TEST_EXTENSION_ORIGIN,
+        ].join("\n"));
+      return new Response(JSON.stringify({
+        version: 1,
+        challenge,
+        expiresAt,
+        serverProof,
+      }), { status: 200 });
+    }
+
+    const body = JSON.stringify(await payload);
+    const challenge = new Headers(options.headers).get(
+      "X-Containoodle-Challenge",
+    );
+    const target = `${requestUrl.pathname}${requestUrl.search}`;
+    const responseProof = authFailure === "response-proof"
+      ? "0".repeat(64)
+      : await hmacHex(token, [
+        "containoodle-response-v1",
+        challenge,
+        String(status),
+        target,
+        await sha256Hex(body),
+        requestUrl.host,
+        TEST_EXTENSION_ORIGIN,
+      ].join("\n"));
+    return new Response(body, {
+      status,
+      headers: { "X-Containoodle-Response-Proof": responseProof },
+    });
   };
 }
+
+function assertNoRawHelperToken(url, options, token = TEST_HELPER_TOKEN) {
+  const headers = new Headers(options.headers);
+  assert.equal(headers.has("Authorization"), false);
+  const rendered = `${url}\n${[...headers].flat().join("\n")}`;
+  assert.doesNotMatch(rendered, new RegExp(token));
+}
+
+test("backend account refresh authenticates while portal mode never calls the helper", async () => {
+  const requests = [];
+  const backend = createSidebarFixture({
+    storage: {
+      config: {
+        mode: "backend",
+        backendUrl: "http://127.0.0.1:8421",
+        portalStartUrl: "https://d-0000000000.awsapps.com/start",
+      },
+    },
+    fetchImpl: backendResponse([], (url, options) => {
+      requests.push({ url: String(url), options });
+    }),
+  });
+
+  try {
+    await loadSidebar(backend);
+    assert.equal(requests.length, 2);
+    assert.deepEqual(
+      requests.map((request) => new URL(request.url).pathname),
+      ["/auth/challenge", "/accounts"],
+    );
+    for (const request of requests) {
+      assertNoRawHelperToken(request.url, request.options);
+    }
+  } finally {
+    cleanupGlobals();
+  }
+
+  let portalHelperCalls = 0;
+  const portal = createSidebarFixture({
+    fetchImpl: async () => {
+      portalHelperCalls += 1;
+      throw new Error("unexpected helper call");
+    },
+  });
+  try {
+    await loadSidebar(portal);
+    assert.equal(portalHelperCalls, 0);
+    assert.equal(portal.storageData.backendAuthToken, TEST_HELPER_TOKEN);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend account refresh fails closed with clear token status", async () => {
+  let fetchCalls = 0;
+  const missing = createSidebarFixture({
+    storage: {
+      config: {
+        mode: "backend",
+        backendUrl: "http://127.0.0.1:8421",
+        portalStartUrl: "",
+      },
+      backendAuthToken: undefined,
+    },
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      throw new Error("unexpected fetch");
+    },
+  });
+
+  try {
+    await loadSidebar(missing);
+    assert.strictEqual(fetchCalls, 0);
+    assert.strictEqual(
+      missing.ids.get("status-text").textContent,
+      "Helper access token required"
+    );
+  } finally {
+    cleanupGlobals();
+  }
+
+  const rejectedRequests = [];
+  const rejected = createSidebarFixture({
+    storage: {
+      config: {
+        mode: "backend",
+        backendUrl: "http://127.0.0.1:8421",
+        portalStartUrl: "",
+      },
+    },
+    fetchImpl: backendResponse([], (url, options) => {
+      rejectedRequests.push({ url: String(url), options });
+    }, { authFailure: "server-proof" }),
+  });
+
+  try {
+    await loadSidebar(rejected);
+    assert.strictEqual(
+      rejected.ids.get("status-text").textContent,
+      "Helper access token rejected"
+    );
+    assert.equal(rejectedRequests.length, 1);
+    assertNoRawHelperToken(
+      rejectedRequests[0].url,
+      rejectedRequests[0].options,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
 
 function accountRow(root, accountName) {
   const pending = [root];
@@ -812,12 +1017,12 @@ test("a backend pin reply arriving after a portal switch is ignored", async () =
 });
 
 test("a deferred backend response cannot replace portal accounts after a mode switch", async () => {
-  const accountId = "123456789012";
+  const accountId = "0".repeat(12);
   const storeId = "firefox-container-1";
   let resolveBackend;
   let backendSignal;
   let backendRequested = false;
-  const backendResponse = new Promise((resolve) => {
+  const backendPayload = new Promise((resolve) => {
     resolveBackend = resolve;
   });
   const fixture = createSidebarFixture({
@@ -830,7 +1035,7 @@ test("a deferred backend response cannot replace portal accounts after a mode sw
       portalPinnedAccounts: [{
         accountId,
         accountName: "Portal DEV",
-        role: "PortalRole",
+        role: TEST_HELPER_ROLE,
       }],
       [`accountContainer/${accountId}`]: storeId,
       [`containerAccount/${storeId}`]: accountId,
@@ -847,17 +1052,17 @@ test("a deferred backend response cannot replace portal accounts after a mode sw
       windowId: 1,
       title: "AWS Console",
     }],
-    fetchImpl(_url, options = {}) {
+    fetchImpl: backendResponse(backendPayload, (url, options) => {
+      if (new URL(url).pathname === "/auth/challenge") return;
       backendRequested = true;
       backendSignal = options.signal;
-      // Deliberately ignore abort so this simulates a transport that resolves
-      // late; the refresh generation must still reject the stale result.
-      return backendResponse;
-    },
+      // The signed mock deliberately ignores abort while awaiting its payload,
+      // so the refresh generation must still reject the stale verified result.
+    }),
   });
 
   try {
-    await loadSidebar(fixture);
+    await loadSidebar(fixture, { waitForInitialRefresh: false });
     await waitFor(() => backendRequested, "sidebar did not start its backend request");
 
     await fixture.browser.storage.local.set({
@@ -872,16 +1077,11 @@ test("a deferred backend response cannot replace portal accounts after a mode sw
     );
     assert.equal(backendSignal.aborted, true);
 
-    resolveBackend({
-      ok: true,
-      async json() {
-        return [{
-          accountId,
-          accountName: "Backend PROD",
-          role: "BackendRole",
-        }];
-      },
-    });
+    resolveBackend([{
+      accountId,
+      accountName: "Backend PROD",
+      role: TEST_HELPER_ROLE,
+    }]);
     await settle(10);
 
     const list = fixture.ids.get("account-list");

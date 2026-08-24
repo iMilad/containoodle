@@ -3,8 +3,13 @@ import assert from "node:assert";
 import { readFileSync } from "node:fs";
 
 const START = "https://d-0000000000.awsapps.com/start";
-const ACCOUNT_ID = "123456789012";
-const OTHER_ACCOUNT_ID = "210987654321";
+const ACCOUNT_ID = "0".repeat(12);
+const TEST_HELPER_TOKEN = "A".repeat(43);
+const TEST_HELPER_ROLE = "__CONTAINOODLE_TEST_ROLE__";
+const TEST_PORTAL_ROLE = "__CONTAINOODLE_TEST_PORTAL_ROLE__";
+const TEST_BACKEND_ROLE = "__CONTAINOODLE_TEST_BACKEND_ROLE__";
+const TEST_LEGACY_ROLE = "__CONTAINOODLE_TEST_LEGACY_ROLE__";
+const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
 const BACKEND_SIGNIN_URL = (() => {
   const url = new URL("https://signin.aws.amazon.com/federation");
   url.searchParams.set("Action", "login");
@@ -23,6 +28,117 @@ const SOURCE_TAB = {
   windowId: 7,
   incognito: false,
 };
+
+function decodeBase64Url(value) {
+  const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=");
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function encodeBase64Url(bytes) {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function hmacHex(token, canonical) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    decodeBase64Url(token),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(canonical),
+  );
+  return [...new Uint8Array(signature)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function authenticatedBackendFetch({
+  token = TEST_HELPER_TOKEN,
+  authFailure = null,
+  onRequest = () => {},
+  responseForRequest = async () => ({ status: 200, payload: {} }),
+} = {}) {
+  let challengeSequence = 0;
+  return async (url, options = {}) => {
+    onRequest(String(url), options);
+    const requestUrl = new URL(url);
+    if (requestUrl.pathname === "/auth/challenge") {
+      const challengeBytes = new Uint8Array(32);
+      challengeBytes[31] = challengeSequence += 1;
+      const challenge = encodeBase64Url(challengeBytes);
+      const expiresAt = Date.now() + 30_000;
+      const serverProof = authFailure === "server-proof"
+        ? "0".repeat(64)
+        : await hmacHex(token, [
+          "containoodle-server-v1",
+          challenge,
+          String(expiresAt),
+          requestUrl.host,
+          TEST_EXTENSION_ORIGIN,
+        ].join("\n"));
+      return new Response(JSON.stringify({
+        version: 1,
+        challenge,
+        expiresAt,
+        serverProof,
+      }), { status: 200 });
+    }
+
+    const {
+      status = 200,
+      payload = {},
+      rawBody,
+      responseProofFailure = false,
+    } = await responseForRequest(
+      requestUrl,
+      options,
+    );
+    const body = rawBody === undefined ? JSON.stringify(payload) : String(rawBody);
+    const challenge = new Headers(options.headers).get(
+      "X-Containoodle-Challenge",
+    );
+    const target = `${requestUrl.pathname}${requestUrl.search}`;
+    const responseProof = authFailure === "response-proof" || responseProofFailure
+      ? "0".repeat(64)
+      : await hmacHex(token, [
+        "containoodle-response-v1",
+        challenge,
+        String(status),
+        target,
+        await sha256Hex(body),
+        requestUrl.host,
+        TEST_EXTENSION_ORIGIN,
+      ].join("\n"));
+    return new Response(body, {
+      status,
+      headers: { "X-Containoodle-Response-Proof": responseProof },
+    });
+  };
+}
+
+function assertNoRawHelperToken(url, options, token = TEST_HELPER_TOKEN) {
+  const headers = new Headers(options.headers);
+  assert.strictEqual(headers.has("Authorization"), false);
+  const rendered = `${url}\n${[...headers].flat().join("\n")}`;
+  assert.doesNotMatch(rendered, new RegExp(token));
+}
 
 const STORAGE_FIXTURE_NAMES = [
   "portal-v1.0.3.json",
@@ -57,6 +173,7 @@ function makeBrowser(initialStorage = null) {
     },
     accountsCache: [{ accountId: ACCOUNT_ID, accountName: "backend-prod-data" }],
     accountsCacheSource: "backend",
+    backendAuthToken: TEST_HELPER_TOKEN,
     portalPinnedAccounts: [{ accountId: ACCOUNT_ID, accountName: "portal-prod-data" }],
   } : structuredClone(initialStorage);
   const tabs = new Map([[SOURCE_TAB.id, { ...SOURCE_TAB }]]);
@@ -505,6 +622,7 @@ let backgroundImportNonce = 0;
 
 async function loadBackground(fixture) {
   globalThis.browser = fixture.browser;
+  globalThis.location = { origin: TEST_EXTENSION_ORIGIN };
   globalThis.fetch = async () => {
     throw new Error("unexpected fetch");
   };
@@ -808,8 +926,8 @@ test("backend pin updates cancel before writing after a mode switch", async () =
     await onMessage({
       type: "set-backend-pin",
       mode: "backend",
-      accountId: OTHER_ACCOUNT_ID,
-      pinned: true,
+      accountId: ACCOUNT_ID,
+      pinned: false,
     }, {}),
     {
       ok: false,
@@ -835,7 +953,7 @@ test("backend pin actions are inert in portal mode", async () => {
     await onMessage({
       type: "set-backend-pin",
       mode: "backend",
-      accountId: OTHER_ACCOUNT_ID,
+      accountId: ACCOUNT_ID,
       pinned: true,
     }, {}),
     {
@@ -964,10 +1082,9 @@ test("persisted manual group title overrides automatic account-name replacement"
   assert.strictEqual(fixture.identities[0].name, "corp-prod-billing");
 });
 
-test("naming config changes retitle known automatic groups but preserve manual titles", async () => {
+test("naming config changes retitle known automatic groups from portal pin fallback", async () => {
   const fixture = makeBrowser();
   fixture.storageData.portalPinnedAccounts = [];
-  fixture.storageData[`tabGroupTitle/${OTHER_ACCOUNT_ID}`] = "Pinned QA title";
   Object.assign(fixture.storageData.config, {
     groupNamePattern: "^corp-(?:dev|qa)-(.+)$",
     groupNameReplacement: "$1",
@@ -978,22 +1095,10 @@ test("naming config changes retitle known automatic groups but preserve manual t
     await handoffPortalAccount(onMessage, "corp-dev-payments"),
     { ok: true }
   );
-  assert.deepStrictEqual(
-    await handoffPortalAccount(onMessage, "corp-qa-audit", OTHER_ACCOUNT_ID),
-    { ok: true }
-  );
   assert.strictEqual(groupForAccount(fixture).title, "payments");
-  assert.strictEqual(
-    groupForAccount(fixture, OTHER_ACCOUNT_ID).title,
-    "Pinned QA title"
-  );
   assert.strictEqual(
     fixture.storageData[`portalAccountOriginalName/${ACCOUNT_ID}`],
     "corp-dev-payments"
-  );
-  assert.strictEqual(
-    fixture.storageData[`portalAccountOriginalName/${OTHER_ACCOUNT_ID}`],
-    "corp-qa-audit"
   );
 
   // Simulate a portal group created before v1.0.5 remembered original names.
@@ -1001,7 +1106,6 @@ test("naming config changes retitle known automatic groups but preserve manual t
   delete fixture.storageData[`portalAccountOriginalName/${ACCOUNT_ID}`];
   fixture.storageData.portalPinnedAccounts = [
     { accountId: ACCOUNT_ID, accountName: "corp-dev-payments" },
-    { accountId: OTHER_ACCOUNT_ID, accountName: "corp-qa-audit" },
   ];
 
   const oldConfig = fixture.storageData.config;
@@ -1016,12 +1120,49 @@ test("naming config changes retitle known automatic groups but preserve manual t
 
   await waitFor(() => groupForAccount(fixture).title === "AWS-payments");
   assert.strictEqual(groupForAccount(fixture).title, "AWS-payments");
-  assert.strictEqual(
-    groupForAccount(fixture, OTHER_ACCOUNT_ID).title,
-    "Pinned QA title"
+});
+
+test("naming config changes preserve persisted manual group titles", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.portalPinnedAccounts = [];
+  fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`] = "Pinned QA title";
+  Object.assign(fixture.storageData.config, {
+    groupNamePattern: "^corp-(?:dev|qa)-(.+)$",
+    groupNameReplacement: "$1",
+  });
+  const onMessage = await loadBackground(fixture);
+
+  assert.deepStrictEqual(
+    await handoffPortalAccount(onMessage, "corp-qa-audit"),
+    { ok: true }
   );
+  assert.strictEqual(groupForAccount(fixture).title, "Pinned QA title");
   assert.strictEqual(
-    fixture.storageData[`tabGroupTitle/${OTHER_ACCOUNT_ID}`],
+    fixture.storageData[`portalAccountOriginalName/${ACCOUNT_ID}`],
+    "corp-qa-audit"
+  );
+
+  let manualTitleChecks = 0;
+  const originalGet = fixture.browser.storage.local.get;
+  fixture.browser.storage.local.get = async (keys) => {
+    const stored = await originalGet(keys);
+    if (keys === `tabGroupTitle/${ACCOUNT_ID}`) manualTitleChecks += 1;
+    return stored;
+  };
+  const oldConfig = fixture.storageData.config;
+  const newConfig = {
+    ...oldConfig,
+    groupNameReplacement: "AWS-$1",
+  };
+  fixture.storageData.config = newConfig;
+  for (const listener of fixture.events.storageChanged.listeners) {
+    listener({ config: { oldValue: oldConfig, newValue: newConfig } }, "local");
+  }
+
+  await waitFor(() => manualTitleChecks > 0);
+  assert.strictEqual(groupForAccount(fixture).title, "Pinned QA title");
+  assert.strictEqual(
+    fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`],
     "Pinned QA title"
   );
 });
@@ -1052,17 +1193,13 @@ test("a naming change during portal launch wins over the launch config snapshot"
   assert.strictEqual(groupForAccount(fixture).title, "new-payments");
 });
 
-test("active mode account and remembered-role sources never cross", async () => {
+test("portal mode never resolves a backend-cached account", async () => {
   const fixture = makeBrowser();
   fixture.storageData.accountsCache = [
     { accountId: ACCOUNT_ID, accountName: "backend-prod-only" },
   ];
   fixture.storageData.accountsCacheSource = "backend";
-  fixture.storageData.portalPinnedAccounts = [
-    { accountId: OTHER_ACCOUNT_ID, accountName: "portal-dev-only", role: "PortalRole" },
-  ];
-  fixture.storageData[`roleChoice/${ACCOUNT_ID}`] = "LegacySharedRole";
-  fixture.storageData[`backendRoleChoice/${ACCOUNT_ID}`] = "BackendOnlyRole";
+  fixture.storageData.portalPinnedAccounts = [];
   const onMessage = await loadBackground(fixture);
   assert.deepStrictEqual(fixture.storageData.accountsCache, [
     { accountId: ACCOUNT_ID, accountName: "backend-prod-only" },
@@ -1081,14 +1218,43 @@ test("active mode account and remembered-role sources never cross", async () => 
     "portal mode must not resolve a backend-cached account"
   );
   assert.strictEqual(fetchCalls, 0, "portal mode must not probe the backend");
+  assert.strictEqual(fixture.storageData.backendAuthToken, TEST_HELPER_TOKEN);
+});
 
+test("backend mode ignores portal sources and stale portal actions", async () => {
+  const fixture = makeBrowser();
   fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.accountsCache = [];
+  fixture.storageData.accountsCacheSource = "backend";
+  fixture.storageData.portalPinnedAccounts = [
+    {
+      accountId: ACCOUNT_ID,
+      accountName: "portal-dev-only",
+      role: TEST_PORTAL_ROLE,
+    },
+  ];
+  fixture.storageData[`roleChoice/${ACCOUNT_ID}`] = TEST_LEGACY_ROLE;
+  fixture.storageData[`backendRoleChoice/${ACCOUNT_ID}`] = TEST_BACKEND_ROLE;
+  const onMessage = await loadBackground(fixture);
+
+  let fetchCalls = 0;
+  let backendRequestOptions = null;
+  globalThis.fetch = async (_url, options) => {
+    fetchCalls += 1;
+    backendRequestOptions = options;
+    throw new Error("unreachable");
+  };
+
   assert.deepStrictEqual(
-    await onMessage({ type: "launch", accountId: OTHER_ACCOUNT_ID }, {}),
+    await onMessage({ type: "launch", accountId: ACCOUNT_ID }, {}),
     { ok: false, error: "Account not found — check the backend account list" },
     "backend mode must not resolve a portal pin"
   );
   assert.strictEqual(fetchCalls, 1);
+  assertNoRawHelperToken(
+    "http://127.0.0.1:8421/auth/challenge",
+    backendRequestOptions,
+  );
   assert.deepStrictEqual(
     await onMessage({ type: "open-portal" }, {}),
     { ok: false, error: "Portal mode is not active" },
@@ -1114,7 +1280,7 @@ test("active mode account and remembered-role sources never cross", async () => 
     await onMessage({
       type: "launch",
       accountId: ACCOUNT_ID,
-      role: "PortalRole",
+      role: TEST_PORTAL_ROLE,
       mode: "portal",
     }, {}),
     {
@@ -1137,7 +1303,7 @@ test("active mode account and remembered-role sources never cross", async () => 
   fixture.storageData.portalPinnedAccounts = [
     { accountId: ACCOUNT_ID, accountName: "portal-dev-owned" },
   ];
-  fixture.storageData[`portalRoleChoice/${ACCOUNT_ID}`] = "PortalRememberedRole";
+  fixture.storageData[`portalRoleChoice/${ACCOUNT_ID}`] = TEST_PORTAL_ROLE;
   assert.deepStrictEqual(
     await onMessage({ type: "launch", accountId: ACCOUNT_ID }, {}),
     {
@@ -1146,13 +1312,208 @@ test("active mode account and remembered-role sources never cross", async () => 
       tabId: fixture.createdTabs[0].id,
     }
   );
-  assert.ok(fixture.createdTabs[0].url.includes("role_name=PortalRememberedRole"));
+  assert.ok(fixture.createdTabs[0].url.includes(`role_name=${TEST_PORTAL_ROLE}`));
   assert.strictEqual(
-    fixture.createdTabs[0].url.includes("LegacySharedRole"),
+    fixture.createdTabs[0].url.includes(TEST_LEGACY_ROLE),
     false,
     "legacy shared roleChoice must not participate at runtime"
   );
+  assert.strictEqual(
+    fixture.createdTabs[0].url.includes(TEST_BACKEND_ROLE),
+    false,
+    "backend remembered roles must not participate in portal mode"
+  );
   assert.strictEqual(fetchCalls, 1);
+});
+
+test("backend launches fail closed before helper or container work without a token", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  delete fixture.storageData.backendAuthToken;
+  const onMessage = await loadBackground(fixture);
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("unexpected fetch");
+  };
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "launch",
+      accountId: ACCOUNT_ID,
+      role: TEST_HELPER_ROLE,
+      mode: "backend",
+    }, {}),
+    {
+      ok: false,
+      needsOptions: true,
+      error: "Local helper access token is missing or invalid",
+    }
+  );
+  assert.strictEqual(fetchCalls, 0);
+  assert.strictEqual(fixture.createdTabs.length, 0);
+  assert.strictEqual(fixture.identities.length, 0);
+});
+
+test("backend role discovery authenticates the helper request", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+    async responseForRequest() {
+      return { payload: { ok: true, roles: [TEST_HELPER_ROLE] } };
+    },
+  });
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "discover-roles",
+      accountId: ACCOUNT_ID,
+      mode: "backend",
+    }, {}),
+    { ok: true, roles: [TEST_HELPER_ROLE] }
+  );
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    ["/auth/challenge", "/roles"],
+  );
+  for (const request of requests) {
+    assertNoRawHelperToken(request.url, request.options);
+  }
+});
+
+test("a helper rejection returns to settings without opening a console tab", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    authFailure: "server-proof",
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+  });
+  const storageBefore = structuredClone(fixture.storageData);
+  const cookiesBefore = structuredClone(fixture.cookieWrites);
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "launch",
+      accountId: ACCOUNT_ID,
+      role: TEST_HELPER_ROLE,
+      mode: "backend",
+    }, {}),
+    {
+      ok: false,
+      needsOptions: true,
+      error: "Local helper access token was rejected",
+    }
+  );
+  assert.strictEqual(fixture.createdTabs.length, 0);
+  assert.strictEqual(fixture.identities.length, 0);
+  assert.deepStrictEqual(fixture.storageData, storageBefore);
+  assert.deepStrictEqual(fixture.cookieWrites, cookiesBefore);
+  assert.strictEqual(requests.length, 1);
+  assert.strictEqual(new URL(requests[0].url).pathname, "/auth/challenge");
+  assertNoRawHelperToken(requests[0].url, requests[0].options);
+});
+
+test("a later helper trust failure leaves discovered roles and containers untouched", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+    async responseForRequest(url) {
+      if (url.pathname === "/roles") {
+        return { payload: { ok: true, roles: [TEST_HELPER_ROLE] } };
+      }
+      return {
+        payload: {
+          ok: true,
+          containerUrl: `ext+container:name=Containoodle&url=${
+            encodeURIComponent(BACKEND_SIGNIN_URL)
+          }`,
+        },
+        responseProofFailure: true,
+      };
+    },
+  });
+  const storageBefore = structuredClone(fixture.storageData);
+  const cookiesBefore = structuredClone(fixture.cookieWrites);
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "launch",
+      accountId: ACCOUNT_ID,
+      mode: "backend",
+    }, {}),
+    {
+      ok: false,
+      needsOptions: true,
+      error: "Local helper access token was rejected",
+    },
+  );
+  assert.strictEqual(fixture.createdTabs.length, 0);
+  assert.strictEqual(fixture.identities.length, 0);
+  assert.deepStrictEqual(fixture.storageData, storageBefore);
+  assert.deepStrictEqual(fixture.cookieWrites, cookiesBefore);
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    ["/auth/challenge", "/roles", "/auth/challenge", "/generate-url"],
+  );
+  for (const request of requests) {
+    assertNoRawHelperToken(request.url, request.options);
+  }
+});
+
+test("a signed helper 401 is classified before parsing its response body", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+    async responseForRequest() {
+      return { status: 401, rawBody: "__CONTAINOODLE_TEST_NON_JSON__" };
+    },
+  });
+  const storageBefore = structuredClone(fixture.storageData);
+  const cookiesBefore = structuredClone(fixture.cookieWrites);
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "launch",
+      accountId: ACCOUNT_ID,
+      role: TEST_HELPER_ROLE,
+      mode: "backend",
+    }, {}),
+    {
+      ok: false,
+      needsOptions: true,
+      error: "Local helper access token was rejected",
+    },
+  );
+  assert.strictEqual(fixture.createdTabs.length, 0);
+  assert.strictEqual(fixture.identities.length, 0);
+  assert.deepStrictEqual(fixture.storageData, storageBefore);
+  assert.deepStrictEqual(fixture.cookieWrites, cookiesBefore);
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    ["/auth/challenge", "/generate-url"],
+  );
+  for (const request of requests) {
+    assertNoRawHelperToken(request.url, request.options);
+  }
 });
 
 test("backend session reuse never overrides an explicit role choice", async () => {
@@ -1189,6 +1550,8 @@ test("backend session reuse never overrides an explicit role choice", async () =
   });
   const onMessage = await loadBackground(fixture);
 
+  delete fixture.storageData.backendAuthToken;
+
   const reused = await onMessage({
     type: "launch",
     accountId: ACCOUNT_ID,
@@ -1200,30 +1563,46 @@ test("backend session reuse never overrides an explicit role choice", async () =
     "https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1"
   );
   const cookieReadCount = fixture.cookieReads.length;
+  fixture.storageData.backendAuthToken = TEST_HELPER_TOKEN;
 
   const signinUrl = BACKEND_SIGNIN_URL;
   let backendUrl = null;
-  globalThis.fetch = async (url) => {
-    backendUrl = String(url);
-    return {
-      ok: true,
-      async json() {
-        return {
+  let backendOptions = null;
+  const backendRequests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      backendRequests.push({ url, options });
+      if (new URL(url).pathname !== "/auth/challenge") {
+        backendUrl = url;
+        backendOptions = options;
+      }
+    },
+    async responseForRequest() {
+      return {
+        payload: {
           ok: true,
           containerUrl: `ext+container:name=Containoodle&url=${encodeURIComponent(signinUrl)}`,
-        };
-      },
-    };
-  };
+        },
+      };
+    },
+  });
   const explicit = await onMessage({
     type: "launch",
     accountId: ACCOUNT_ID,
-    role: "PowerUserAccess",
+    role: TEST_HELPER_ROLE,
     mode: "backend",
   }, {});
 
   assert.strictEqual(explicit.ok, true);
-  assert.match(backendUrl, /role=PowerUserAccess/);
+  assert.strictEqual(new URL(backendUrl).searchParams.get("role"), TEST_HELPER_ROLE);
+  assert.deepStrictEqual(
+    backendRequests.map((request) => new URL(request.url).pathname),
+    ["/auth/challenge", "/generate-url"],
+  );
+  for (const request of backendRequests) {
+    assertNoRawHelperToken(request.url, request.options);
+  }
+  assert.ok(new Headers(backendOptions.headers).has("X-Containoodle-Request-Proof"));
   assert.strictEqual(fixture.createdTabs[1].url, signinUrl);
   assert.strictEqual(
     fixture.cookieReads.length,
@@ -1232,7 +1611,7 @@ test("backend session reuse never overrides an explicit role choice", async () =
   );
   assert.strictEqual(
     fixture.storageData[`backendRoleChoice/${ACCOUNT_ID}`],
-    "PowerUserAccess"
+    TEST_HELPER_ROLE
   );
 });
 
@@ -1256,16 +1635,18 @@ test("a mode switch during backend work cancels the old-mode tab creation", asyn
 
   let resolveBackend;
   let backendRequested = false;
-  globalThis.fetch = async () => {
-    backendRequested = true;
-    return new Promise((resolve) => {
-      resolveBackend = resolve;
-    });
-  };
+  globalThis.fetch = authenticatedBackendFetch({
+    responseForRequest() {
+      backendRequested = true;
+      return new Promise((resolve) => {
+        resolveBackend = resolve;
+      });
+    },
+  });
   const launching = onMessage({
     type: "launch",
     accountId: ACCOUNT_ID,
-    role: "PowerUserAccess",
+    role: TEST_HELPER_ROLE,
     mode: "backend",
   }, {});
   await waitFor(() => backendRequested);
@@ -1276,14 +1657,11 @@ test("a mode switch during backend work cancels the old-mode tab creation", asyn
     listener({ config: { oldValue: oldConfig, newValue: newConfig } }, "local");
   }
   resolveBackend({
-    ok: true,
-    async json() {
-      return {
-        ok: true,
-        containerUrl: `ext+container:name=Containoodle&url=${
-          encodeURIComponent(BACKEND_SIGNIN_URL)
-        }`,
-      };
+    payload: {
+      ok: true,
+      containerUrl: `ext+container:name=Containoodle&url=${
+        encodeURIComponent(BACKEND_SIGNIN_URL)
+      }`,
     },
   });
 
@@ -1484,19 +1862,37 @@ test("v1.0.3 storage fixtures survive install and startup cleanup", async (t) =>
   }
 });
 
-test("legacy manual accounts and automatic titles migrate, while reset clears real overrides", async () => {
+test("the stored helper token survives install, update, and startup cleanup", async () => {
+  const lifecycleCases = [
+    ["runtimeInstalled", { reason: "install" }],
+    ["runtimeInstalled", { reason: "update", previousVersion: "1.0.3" }],
+    ["runtimeStartup", undefined],
+  ];
+
+  for (const [eventName, details] of lifecycleCases) {
+    const before = readStorageFixture("backend-v1.0.3.json");
+    before.backendAuthToken = TEST_HELPER_TOKEN;
+    const fixture = makeBrowser(before);
+    await loadBackground(fixture);
+
+    await fireBackgroundLifecycle(fixture.events[eventName], details);
+    assert.strictEqual(fixture.storageData.backendAuthToken, TEST_HELPER_TOKEN);
+
+    await fireBackgroundLifecycle(fixture.events[eventName], details);
+    assert.strictEqual(fixture.storageData.backendAuthToken, TEST_HELPER_TOKEN);
+  }
+});
+
+test("legacy automatic titles migrate and reset clears a new manual override", async () => {
   const fixture = makeBrowser();
   delete fixture.storageData.portalPinnedAccounts;
   fixture.storageData.accountsCacheSource = "manual";
   fixture.storageData.accountsCache = [
     { accountId: ACCOUNT_ID, accountName: "corp-dev-payments" },
-    { accountId: OTHER_ACCOUNT_ID, accountName: "corp-qa-audit" },
   ];
   fixture.storageData.accountsCacheAt = 123;
   fixture.storageData[`accountOriginalName/${ACCOUNT_ID}`] = "corp-dev-payments";
-  fixture.storageData[`accountOriginalName/${OTHER_ACCOUNT_ID}`] = "corp-qa-audit";
   fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`] = "corp-dev-payments";
-  fixture.storageData[`tabGroupTitle/${OTHER_ACCOUNT_ID}`] = "Hand-picked title";
   Object.assign(fixture.storageData.config, {
     groupNamePattern: "^corp-(?:dev|qa)-(.+)$",
     groupNameReplacement: "$1",
@@ -1506,7 +1902,6 @@ test("legacy manual accounts and automatic titles migrate, while reset clears re
   await waitFor(() => fixture.storageData["migration/groupTitlesAutomaticV1"] === true);
   assert.deepStrictEqual(fixture.storageData.portalPinnedAccounts, [
     { accountId: ACCOUNT_ID, accountName: "corp-dev-payments" },
-    { accountId: OTHER_ACCOUNT_ID, accountName: "corp-qa-audit" },
   ]);
   assert.strictEqual(fixture.storageData.accountsCache, undefined);
   assert.strictEqual(fixture.storageData.accountsCacheAt, undefined);
@@ -1525,16 +1920,11 @@ test("legacy manual accounts and automatic titles migrate, while reset clears re
     undefined,
     "a known old automatic title is cleared"
   );
-  assert.strictEqual(
-    fixture.storageData[`tabGroupTitle/${OTHER_ACCOUNT_ID}`],
-    "Hand-picked title",
-    "a genuinely different manual title survives migration"
-  );
 
   const launchResult = await onMessage({
     type: "launch",
     accountId: ACCOUNT_ID,
-    role: "ReadOnlyAccess",
+    role: TEST_PORTAL_ROLE,
   }, {});
   assert.strictEqual(launchResult.ok, true);
   assert.strictEqual(groupForAccount(fixture, ACCOUNT_ID, 1).title, "payments");
@@ -1550,11 +1940,55 @@ test("legacy manual accounts and automatic titles migrate, while reset clears re
 
   assert.deepStrictEqual(
     await onMessage({ type: "reset-group-titles" }, {}),
-    { ok: true, cleared: 2 }
+    { ok: true, cleared: 1 }
   );
   assert.strictEqual(fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`], undefined);
-  assert.strictEqual(fixture.storageData[`tabGroupTitle/${OTHER_ACCOUNT_ID}`], undefined);
   assert.strictEqual(groupForAccount(fixture, ACCOUNT_ID, 1).title, "payments");
+});
+
+test("legacy manual titles survive migration and remain resettable", async () => {
+  const fixture = makeBrowser();
+  delete fixture.storageData.portalPinnedAccounts;
+  fixture.storageData.accountsCacheSource = "manual";
+  fixture.storageData.accountsCache = [
+    { accountId: ACCOUNT_ID, accountName: "corp-qa-audit" },
+  ];
+  fixture.storageData.accountsCacheAt = 123;
+  fixture.storageData[`accountOriginalName/${ACCOUNT_ID}`] = "corp-qa-audit";
+  fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`] = "Hand-picked title";
+  Object.assign(fixture.storageData.config, {
+    groupNamePattern: "^corp-(?:dev|qa)-(.+)$",
+    groupNameReplacement: "$1",
+  });
+  const onMessage = await loadBackground(fixture);
+
+  await waitFor(() => fixture.storageData["migration/groupTitlesAutomaticV1"] === true);
+  assert.deepStrictEqual(fixture.storageData.portalPinnedAccounts, [
+    { accountId: ACCOUNT_ID, accountName: "corp-qa-audit" },
+  ]);
+  assert.strictEqual(fixture.storageData.accountsCache, undefined);
+  assert.strictEqual(fixture.storageData.accountsCacheAt, undefined);
+  assert.strictEqual(fixture.storageData.accountsCacheSource, undefined);
+  assert.strictEqual(
+    fixture.storageData[`portalAccountOriginalName/${ACCOUNT_ID}`],
+    "corp-qa-audit"
+  );
+  assert.strictEqual(
+    fixture.storageData[`accountOriginalName/${ACCOUNT_ID}`],
+    undefined,
+    "the legacy cross-mode name key is removed"
+  );
+  assert.strictEqual(
+    fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`],
+    "Hand-picked title",
+    "a genuinely different manual title survives migration"
+  );
+
+  assert.deepStrictEqual(
+    await onMessage({ type: "reset-group-titles" }, {}),
+    { ok: true, cleared: 1 }
+  );
+  assert.strictEqual(fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`], undefined);
 });
 
 test("portal click handoff uses no backend and opens the exact shortcut in a container", async () => {
