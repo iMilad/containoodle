@@ -9,7 +9,11 @@
 
 import { accountEnv } from "./env.js";
 import {
+  BACKEND_AUTH_TOKEN_KEY,
   DEFAULT_BACKEND_URL,
+  backendFetch,
+  isBackendAuthenticationError,
+  normalizeBackendToken,
   safeBackendUrl,
 } from "../shared/backend.js";
 
@@ -27,6 +31,7 @@ let config = { ...DEFAULT_CONFIG };
 let accounts = [];
 let backendOnline = false;
 let usingCache = false;
+let backendAuthProblem = null;
 let searchActiveQuery = "";
 let searchPinnedQuery = "";
 let searchAllQuery = "";
@@ -165,9 +170,25 @@ async function readAccounts(activeConfig) {
     const controller = new AbortController();
     backendRequestController = controller;
     try {
-      const res = await fetch(`${activeConfig.backendUrl}/accounts`, {
-        signal: controller.signal,
-      });
+      const stored = await browser.storage.local.get(BACKEND_AUTH_TOKEN_KEY);
+      let token;
+      try {
+        token = normalizeBackendToken(stored[BACKEND_AUTH_TOKEN_KEY]);
+      } catch {
+        const err = new Error("Local helper access token is missing or invalid");
+        err.backendAuthProblem = "required";
+        throw err;
+      }
+      const res = await backendFetch(
+        `${activeConfig.backendUrl}/accounts`,
+        token,
+        { signal: controller.signal }
+      );
+      if (res.status === 401) {
+        const err = new Error("Local helper access token was rejected");
+        err.backendAuthProblem = "rejected";
+        throw err;
+      }
       if (!res.ok) throw new Error();
       const data = await res.json();
       if (!Array.isArray(data)) throw new Error();
@@ -176,14 +197,22 @@ async function readAccounts(activeConfig) {
         accounts: data,
         backendOnline: true,
         usingCache: false,
+        backendAuthProblem: null,
         cacheChanged: JSON.stringify(cached) !== JSON.stringify(data),
       };
-    } catch {
+    } catch (err) {
       const cached = await readAccountsCache();
+      const authProblem = isBackendAuthenticationError(err)
+        ? "rejected"
+        : err && (
+          err.backendAuthProblem === "required" ||
+          err.backendAuthProblem === "rejected"
+        ) ? err.backendAuthProblem : null;
       return {
         accounts: cached,
         backendOnline: false,
         usingCache: cached.length > 0,
+        backendAuthProblem: authProblem,
         cacheChanged: false,
       };
     } finally {
@@ -200,6 +229,7 @@ async function readAccounts(activeConfig) {
     accounts: normalizePortalPins(portalPinnedAccounts),
     backendOnline: false,
     usingCache: false,
+    backendAuthProblem: null,
     cacheChanged: false,
   };
 }
@@ -218,7 +248,11 @@ function updateStatus() {
     return;
   }
   statusDot.className = `dot ${backendOnline ? "online" : "offline"}`;
-  if (backendOnline) {
+  if (backendAuthProblem === "required") {
+    statusText.textContent = "Helper access token required";
+  } else if (backendAuthProblem === "rejected") {
+    statusText.textContent = "Helper access token rejected";
+  } else if (backendOnline) {
     statusText.textContent = `Connected · ${accounts.length} accounts`;
   } else {
     statusText.textContent = usingCache
@@ -1039,6 +1073,7 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
   if (
     keys.includes("config") ||
+    (config.mode === "backend" && keys.includes(BACKEND_AUTH_TOKEN_KEY)) ||
     (config.mode === "backend" && keys.includes("accountsCache")) ||
     (config.mode === "portal" && keys.includes("portalPinnedAccounts"))
   ) {
@@ -1082,6 +1117,7 @@ async function fullRefresh() {
   accounts = nextAccounts.accounts;
   backendOnline = nextAccounts.backendOnline;
   usingCache = nextAccounts.usingCache;
+  backendAuthProblem = nextAccounts.backendAuthProblem;
   rememberedRoles = nextMetadata.rememberedRoles;
   portalRoles = nextMetadata.portalRoles;
   portalAccountOriginalNames = nextMetadata.portalAccountOriginalNames;

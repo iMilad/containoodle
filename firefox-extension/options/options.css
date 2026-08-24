@@ -137,7 +137,8 @@ h3 {
 
 .form-grid .field + .field { margin-top: 0; }
 
-input[type="text"] {
+input[type="text"],
+input[type="password"] {
   flex: 1;
   width: 100%;
   background: var(--bg-item);
@@ -150,7 +151,8 @@ input[type="text"] {
   outline: none;
 }
 
-input[type="text"]:focus-visible {
+input[type="text"]:focus-visible,
+input[type="password"]:focus-visible {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-glow);
 }

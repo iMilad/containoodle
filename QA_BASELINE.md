@@ -61,9 +61,10 @@ These checks passed against the frozen v1.0.3 tracked source:
   successfully with `3.11.15` after the Phase 0 files were added.
 
 The JavaScript suite runs production modules against synthetic browser and DOM
-fixtures; it is not a real-Firefox end-to-end test. The three Python tests cover
-only SSO token-expiry handling. The manual Firefox and non-production AWS gates
-below remain necessary.
+fixtures; it is not a real-Firefox end-to-end test. At the frozen v1.0.3
+baseline, the three Python tests cover only SSO token-expiry handling. Later
+phases expand that characterization without replacing the manual Firefox and
+non-production AWS gates below.
 
 Phase 1 adds both complete v1.0.3 storage fixtures to `npm test`. The tests prove
 that importing the background preserves the full migrated snapshot and that
@@ -81,6 +82,34 @@ I/O remain mocked; this is not a live AWS or helper integration test.
 Valid JSON with a malformed account schema remains a later input-hardening gap,
 not behavior that Phase 2 freezes as acceptable.
 
+Phase 3 is an intentional strict local-helper protocol change. The candidate
+uses synchronized manifest, package, and package-lock version `1.1.0`; the
+frozen table above remains the `1.0.3` rollback reference. The candidate
+creates a persistent 256-bit helper access token outside the checkout and
+requires a fresh proof derived from it on `/accounts`, `/roles`, and
+`/generate-url` before account files, the AWS CLI cache, subprocesses, or
+federation code are reached. The extension
+stores its copy under the separate `backendAuthToken` key but never transmits the
+saved value. Each logical request verifies a signed, short-lived helper challenge,
+sends a single-use HMAC proof bound to the exact request target, loopback Host, and
+Firefox-extension Origin, then verifies a proof over the exact response bytes and
+status before parsing them. OPTIONS remains unauthenticated because CORS preflight
+cannot carry the request proof, but it requires the exact helper Host and a
+Firefox-extension Origin. These are mocked protocol tests, not a real-Firefox CORS
+or socket test. The Phase 3 candidate suite currently reports 143 JavaScript
+tests and 72 Python tests; the Python protocol tests remain socket-free and run
+with filesystem, subprocess, AWS, federation, and home-directory access isolated.
+
+The frozen v1.0.3 state has no helper access token. Phase 3 deliberately fails
+every helper request and new helper-generated session closed until the token is
+entered and successfully tested; there is no legacy unauthenticated helper
+fallback. A mapped, still-signed-in Firefox container may continue through the
+separately granted session-reuse path because that path does not call the helper.
+The old extension/new helper and new extension/old helper combinations are
+intentionally incompatible, so both pieces must be updated together. Portal mode
+remains usable: portal-specific paths must not look up the helper token by its
+storage key, call the helper, or attach that token to any request.
+
 ## Stored-state compatibility contract
 
 Unless a future change has an explicit, tested migration, an in-place upgrade
@@ -92,9 +121,17 @@ must preserve:
   cached portal region;
 - both directions of every account/container mapping;
 - manually saved `tabGroupTitle/*` values;
-- migration markers and unrelated extension-local keys; and
+- migration markers, `backendSessionReuseAutoOfferHandled` once set, and
+  unrelated extension-local keys; and
 - exact-origin, role-discovery, and session-reuse permission grants held by
   Firefox.
+
+After Phase 3 setup, `backendAuthToken` is also stable local state. It must survive
+startup and extension updates, but its real value must be redacted entirely from QA
+snapshots, logs, screenshots, issues, and test fixtures.
+`backendSessionReuseAutoOfferHandled` records only that the one-time permission
+offer was handled; Firefox's optional host permission remains the authoritative
+session-reuse enabled state.
 
 `tabGroups/<accountId>/<windowId>` is the deliberate exception: the numeric
 Firefox group IDs are transient and v1.0.3 removes these storage entries on
@@ -138,12 +175,17 @@ upgrade-only checks are explicitly identified below.
   optional backend session reuse in the test profile.
 - [ ] Make a second profile clone with the exact portal origin retained but
   both optional broad host grants revoked. The candidate must preserve both
-  granted and revoked states without an unexpected permission prompt.
+  granted and revoked states during update and startup without an unexpected
+  permission prompt.
+- [ ] Prepare two fresh candidate profiles with no console permission and no
+  `backendSessionReuseAutoOfferHandled` key: one for accepting the one-time
+  backend offer and one for declining it.
 - [ ] Keep mapped containers and tabs open. Create one automatic group title
   and one manually renamed group, and save a group-name rule.
-- [ ] Record a sanitized storage snapshot, `browser.permissions.getAll()`,
+- [ ] Record a sanitized storage snapshot with `backendAuthToken` omitted,
+  `browser.permissions.getAll()`,
   container names/counts, open account tabs, and visible group titles. Do not
-  export cookies or session URLs.
+  export cookies, helper tokens, or session URLs.
 - [ ] Stop or stub the helper before the before/after storage comparison so a
   cache refresh cannot be mistaken for an upgrade mutation. Start it only for
   the helper smoke gate.
@@ -162,6 +204,12 @@ upgrade-only checks are explicitly identified below.
   other key, and remain idempotent when repeated.
 - [ ] Treat the Phase 2 Python result as mocked helper characterization, not a
   live AWS, federation-endpoint, or socket-level integration result.
+- [ ] Confirm the Phase 3 tests reject missing, malformed, duplicate, expired,
+  replayed, and target/Host/Origin-mismatched challenges or proofs with the same
+  generic 401 before filesystem/AWS work. Confirm altered or unsigned response
+  bytes/status are rejected before JSON parsing or browser action.
+- [ ] Confirm every extension helper call uses the central authenticated fetch
+  path, while portal-mode tests perform no helper-token lookup or helper request.
 
 ### In-place upgrade hard gate
 
@@ -169,7 +217,25 @@ upgrade-only checks are explicitly identified below.
   account tabs first.
 - [ ] Confirm the version changes while active mode and stable storage values
   remain unchanged. In the granted clone, all three grants must remain; in the
-  revoked clone, both optional grants must remain revoked without a prompt.
+  revoked clone, both optional grants must remain absent during update and
+  startup without a prompt. No permission may change unless the tester accepts
+  a Firefox permission request.
+- [ ] On a frozen v1.0.3 backend profile, attempt a helper-required launch with
+  no reusable mapped live session. Confirm the candidate clearly reports that a
+  helper access token is required and makes no helper request or console tab
+  before setup. This one new missing-key state is intentional.
+- [ ] After the storage comparison, use `server.py --show-token`, save and test
+  the token once, and confirm subsequent update/startup cycles preserve it
+  without placing it back into the password field.
+- [ ] In the granted upgrade clone, the first backend **Save & test** must retain
+  the existing session-reuse grant without showing a redundant prompt and must
+  record `backendSessionReuseAutoOfferHandled` as `true`.
+- [ ] In the revoked upgrade clone, if
+  `backendSessionReuseAutoOfferHandled` is absent, the first backend **Save &
+  test** must present the expected one-time offer. Decline it and confirm the
+  permission stays absent, the marker becomes `true`, and later **Save & test**
+  operations do not prompt again. This user-triggered offer is not an
+  update/startup permission mutation.
 - [ ] Confirm existing tabs remain in their original containers and no
   duplicate same-name container appears.
 - [ ] Confirm backend and portal pins, account names, and remembered roles stay
@@ -187,6 +253,30 @@ The open-group check is especially important. v1.0.3 clears stored
 visible group, then creates a new group on the next launch because it has no
 rediscovery path. The no-duplicate check is deliberately stricter than the
 v1.0.3 baseline and is expected to require a later implementation change.
+
+### Fresh-profile one-time session-reuse offer gate
+
+- [ ] In both fresh profiles, confirm `https://*.amazon.com/*` is not granted
+  and `backendSessionReuseAutoOfferHandled` is absent before backend setup.
+- [ ] Choose the first backend **Save & test** in the acceptance profile. The
+  Firefox request for `https://*.amazon.com/*` must begin directly from that
+  click, without waiting for the helper result. Accept it, complete a valid
+  helper test, and confirm the permission is present, session reuse is enabled,
+  and `backendSessionReuseAutoOfferHandled` is `true`.
+- [ ] Repeat **Save & test** and restart Firefox. The accepted profile must stay
+  enabled without another prompt.
+- [ ] Choose the first backend **Save & test** in the decline profile, decline
+  the Firefox request, and confirm the helper URL, token, and
+  account cache are still saved successfully. The console permission must remain
+  absent and `backendSessionReuseAutoOfferHandled` must be `true`.
+- [ ] Repeat **Save & test**, refresh accounts, launch through the helper, and
+  restart Firefox. Normal helper mode must remain functional and the automatic
+  permission prompt must not return.
+- [ ] Choose **Allow session reuse** in the declined profile, accept Firefox's
+  request, and confirm reuse becomes enabled. Then choose **Revoke**, confirm the
+  permission is absent, and verify later **Save & test** operations do
+  not automatically prompt again. The manual **Allow session reuse** control must
+  remain available.
 
 ### Portal-mode smoke gate
 
@@ -213,8 +303,18 @@ v1.0.3 baseline and is expected to require a later implementation change.
 
 ### Local-helper smoke gate
 
-- [ ] In the dedicated non-production setup, use **Save & test** and confirm
-  the helper URL and backend account cache/count.
+- [ ] In the dedicated non-production setup, run `python3 server.py --show-token`,
+  start the helper normally, paste the token once, then use **Save & test** and
+  confirm the helper URL and backend account cache/count. The displayed token
+  must not be captured in QA output.
+- [ ] Confirm missing, malformed, and wrong tokens fail clearly before
+  `accounts.json`, the AWS CLI cache, AWS CLI subprocesses, or federation calls.
+  A failed replacement must preserve the last working URL, token, and cache.
+- [ ] Confirm the Options password field is empty after reload and a stored-token
+  status is shown without displaying the value.
+- [ ] If a protocol-capable no-Origin diagnostic is exercised, confirm it fails
+  without a fresh valid challenge/request proof and succeeds with one. The saved
+  helper secret itself must never appear in the URL, headers, or body.
 - [ ] Confirm portal pins never appear in the helper list and helper pins never
   alter portal pins.
 - [ ] Launch an account and verify the existing mapped container and group are
@@ -242,12 +342,21 @@ v1.0.3 baseline and is expected to require a later implementation change.
 - [ ] Switch normally in both directions. Each mode must restore its own pins
   and roles, the shared account must keep its mapped container, and one mode
   must not revoke the other mode's optional permission.
+- [ ] While portal mode is active, changing or removing `backendAuthToken` must
+  not trigger a helper request or affect portal readiness, pins, or launch flow.
 
 ### Live non-production acceptance gate
 
 - [ ] Only after every local gate passes, start the real helper and run both
   launch paths against non-production AWS accounts. Verify the visible account
   ID and role.
+- [ ] Validate the custom proof-header preflight in real Firefox: Save & test,
+  account refresh, role discovery, and URL generation must all succeed with the
+  stored token and fail closed after a controlled token rotation.
+- [ ] Stop the real helper and place a controlled fake listener on the configured
+  loopback port. It may echo the Firefox Origin, but without a valid signed
+  challenge the extension must not send a protected request, accept account data,
+  create a container, or open a tab.
 - [ ] Keep two accounts open concurrently and confirm their sessions do not
   cross. Perform read-only console navigation only; no AWS resource change is
   needed.

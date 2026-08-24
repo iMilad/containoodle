@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { BACKEND_AUTH_TOKEN_KEY } from "../firefox-extension/shared/backend.js";
 
 const OPTIONS_MODULE = new URL(
   "../firefox-extension/options/options.js",
@@ -9,11 +10,55 @@ const OPTIONS_MODULE = new URL(
 
 const PORTAL_API_ORIGINS = ["https://*.amazonaws.com/*"];
 const CONSOLE_ORIGINS = ["https://*.amazon.com/*"];
+const BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY =
+  "backendSessionReuseAutoOfferHandled";
+const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
+const SYNTHETIC_HELPER_TOKEN = `__CONTAINOODLE_TEST_${"0".repeat(23)}`;
+const REPLACEMENT_SYNTHETIC_HELPER_TOKEN = `__CONTAINOODLE_TEST_${"4".repeat(23)}`;
+
+function decodeBase64Url(value) {
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/") + "=";
+  const binary = atob(base64);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function encodeBase64Url(bytes) {
+  const binary = String.fromCharCode(...bytes);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function hmacHex(token, canonical) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    decodeBase64Url(token),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(canonical),
+  );
+  return [...new Uint8Array(signature)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 let importSequence = 0;
 
 const originalGlobals = Object.fromEntries(
-  ["document", "browser", "fetch", "window"].map((name) => [
+  ["document", "browser", "fetch", "location", "window"].map((name) => [
     name,
     {
       exists: Object.prototype.hasOwnProperty.call(globalThis, name),
@@ -66,6 +111,9 @@ class FakeElement {
 function createEvent() {
   const listeners = [];
   return {
+    get listenerCount() {
+      return listeners.length;
+    },
     addListener(listener) {
       listeners.push(listener);
     },
@@ -84,6 +132,8 @@ function createDocument() {
     "open-portal",
     "portal-refresh",
     "backend-url",
+    "backend-token",
+    "backend-token-status",
     "backend-save",
     "backend-refresh",
     "backend-status",
@@ -121,6 +171,7 @@ function createDocument() {
 
   backendPanel.controls = [
     "backend-url",
+    "backend-token",
     "backend-save",
     "backend-refresh",
     "console-grant",
@@ -180,17 +231,27 @@ function createFixture({
       groupNameReplacement: "",
       ...config,
     },
+    [BACKEND_AUTH_TOKEN_KEY]: SYNTHETIC_HELPER_TOKEN,
+    [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: true,
     ...storage,
   };
   let sessionAvailable = portalSession;
   let readinessOverride = null;
   let permissionRequestAllowed = true;
+  let permissionRequestError = null;
   let permissionRemovalFailureOrigin = null;
   let configWriteGate = null;
+  let failNextStorageWrite = false;
   let failNextConfigWrite = false;
   let deferBackendFetch = false;
   let abortedFetches = 0;
   let resetGroupTitlesResult = { ok: true };
+  let backendFetchStatus = 200;
+  let backendFetchPayload = [];
+  let backendFetchError = null;
+  let backendAuthFailure = null;
+  let challengeSequence = 0;
+  let helperToken = storageData[BACKEND_AUTH_TOKEN_KEY];
 
   function currentReadiness() {
     if (readinessOverride) return { ...readinessOverride };
@@ -229,6 +290,10 @@ function createFixture({
           return { ...storageData };
         },
         async set(values) {
+          if (failNextStorageWrite) {
+            failNextStorageWrite = false;
+            throw new Error("simulated storage write failure");
+          }
           if (values.config && configWriteGate) {
             const gate = configWriteGate;
             configWriteGate = null;
@@ -255,6 +320,11 @@ function createFixture({
       },
       async request({ origins }) {
         permissionRequests.push([...origins]);
+        if (permissionRequestError) {
+          const error = permissionRequestError;
+          permissionRequestError = null;
+          throw error;
+        }
         if (!permissionRequestAllowed) return false;
         origins.forEach((origin) => permissionSet.add(origin));
         return true;
@@ -288,18 +358,62 @@ function createFixture({
     },
   };
 
-  function backendResponse() {
-    return {
-      ok: true,
-      async json() {
-        return [];
-      },
-    };
-  }
-
-  async function fetch(url, { signal } = {}) {
-    fetchCalls.push(String(url));
-    if (!deferBackendFetch) return backendResponse();
+  async function fetch(url, options = {}) {
+    const { signal } = options;
+    fetchCalls.push({ url: String(url), options: { ...options } });
+    if (backendFetchError) throw backendFetchError;
+    const requestUrl = new URL(url);
+    if (requestUrl.pathname === "/auth/challenge") {
+      const challengeBytes = new Uint8Array(32);
+      challengeBytes[31] = challengeSequence += 1;
+      const challenge = encodeBase64Url(challengeBytes);
+      const expiresAt = Date.now() + 30_000;
+      const canonical = [
+        "containoodle-server-v1",
+        challenge,
+        String(expiresAt),
+        requestUrl.host,
+        TEST_EXTENSION_ORIGIN,
+      ].join("\n");
+      const serverProof = backendAuthFailure === "server-proof"
+        ? "0".repeat(64)
+        : await hmacHex(helperToken, canonical);
+      return new Response(JSON.stringify({
+        version: 1,
+        challenge,
+        expiresAt,
+        serverProof,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (!deferBackendFetch) {
+      const body = JSON.stringify(structuredClone(backendFetchPayload));
+      const challenge = new Headers(options.headers).get(
+        "X-Containoodle-Challenge",
+      );
+      const target = `${requestUrl.pathname}${requestUrl.search}`;
+      const canonical = [
+        "containoodle-response-v1",
+        challenge,
+        String(backendFetchStatus),
+        target,
+        await sha256Hex(body),
+        requestUrl.host,
+        TEST_EXTENSION_ORIGIN,
+      ].join("\n");
+      const responseProof = backendAuthFailure === "response-proof"
+        ? "0".repeat(64)
+        : await hmacHex(helperToken, canonical);
+      return new Response(body, {
+        status: backendFetchStatus,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Containoodle-Response-Proof": responseProof,
+        },
+      });
+    }
     return new Promise((resolve, reject) => {
       const abort = () => {
         abortedFetches += 1;
@@ -351,6 +465,9 @@ function createFixture({
     setPermissionRequestAllowed(value) {
       permissionRequestAllowed = value;
     },
+    failNextPermissionRequest(error = new Error("simulated permission request failure")) {
+      permissionRequestError = error;
+    },
     failPermissionRemovalFor(origin) {
       permissionRemovalFailureOrigin = origin;
     },
@@ -363,8 +480,24 @@ function createFixture({
     failFollowingConfigWrite() {
       failNextConfigWrite = true;
     },
+    failFollowingStorageWrite() {
+      failNextStorageWrite = true;
+    },
     setDeferredBackendFetch(value) {
       deferBackendFetch = value;
+    },
+    setBackendFetchResponse(status, payload = []) {
+      backendFetchStatus = status;
+      backendFetchPayload = payload;
+    },
+    setBackendFetchError(error) {
+      backendFetchError = error;
+    },
+    setBackendAuthFailure(value) {
+      backendAuthFailure = value;
+    },
+    setHelperToken(value) {
+      helperToken = value;
     },
     setResetGroupTitlesResult(value) {
       resetGroupTitlesResult = { ...value };
@@ -375,19 +508,41 @@ function createFixture({
   };
 }
 
-async function settle(turns = 5) {
+async function settle(turns = 20) {
   for (let index = 0; index < turns; index += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
+}
+
+async function waitFor(check, message, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(check(), message);
+}
+
+async function waitForBackendRequest(fixture) {
+  await waitFor(
+    () =>
+      !fixture.elements.get("backend-save").disabled &&
+      !fixture.elements.get("backend-refresh").disabled,
+    "backend request did not finish",
+  );
 }
 
 async function loadOptions(fixture) {
   globalThis.document = fixture.document;
   globalThis.browser = fixture.browser;
   globalThis.fetch = fixture.fetch;
+  globalThis.location = { origin: TEST_EXTENSION_ORIGIN };
   globalThis.window = fixture.fakeWindow;
   await import(`${OPTIONS_MODULE.href}?test=${importSequence += 1}`);
-  await settle();
+  await waitFor(
+    () => fixture.onAdded.listenerCount === 1 && fixture.onRemoved.listenerCount === 1,
+    "options initialization did not finish",
+  );
 }
 
 function cleanupGlobals() {
@@ -395,6 +550,19 @@ function cleanupGlobals() {
     if (original.exists) globalThis[name] = original.value;
     else delete globalThis[name];
   }
+}
+
+function protectedFetchCalls(fixture) {
+  return fixture.fetchCalls.filter(
+    (call) => new URL(call.url).pathname !== "/auth/challenge",
+  );
+}
+
+function assertNoRawHelperToken(call, ...tokens) {
+  const headers = new Headers(call.options.headers);
+  assert.equal(headers.has("Authorization"), false);
+  const rendered = `${call.url}\n${[...headers].flat().join("\n")}`;
+  for (const token of tokens) assert.doesNotMatch(rendered, new RegExp(token));
 }
 
 test("renders the active mode, switches live, and guards backend fetches in portal mode", async () => {
@@ -434,7 +602,6 @@ test("renders the active mode, switches live, and guards backend fetches in port
 
     // Invoke a stale backend handler directly: the mode guard must still stop I/O.
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
     assert.deepEqual(fixture.fetchCalls, []);
   } finally {
     cleanupGlobals();
@@ -512,10 +679,422 @@ test("backend refresh marks its cache as backend-owned", async () => {
   try {
     await loadOptions(fixture);
     await fixture.elements.get("backend-refresh").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
 
     assert.deepEqual(fixture.storageData.accountsCache, []);
     assert.equal(fixture.storageData.accountsCacheSource, "backend");
+    assert.equal(fixture.fetchCalls.length, 2);
+    assert.equal(protectedFetchCalls(fixture).length, 1);
+    for (const call of fixture.fetchCalls) {
+      assertNoRawHelperToken(call, SYNTHETIC_HELPER_TOKEN);
+    }
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend save tests a replacement token before storing URL and token", async () => {
+  const previousUrl = "http://127.0.0.1:8765";
+  const nextUrl = "http://127.0.0.1:8877";
+  const fixture = createFixture();
+  try {
+    await loadOptions(fixture);
+    fixture.setHelperToken(REPLACEMENT_SYNTHETIC_HELPER_TOKEN);
+    fixture.elements.get("backend-url").value = nextUrl;
+    fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.equal(fixture.fetchCalls.length, 2);
+    const [protectedCall] = protectedFetchCalls(fixture);
+    assert.equal(protectedCall.url, `${nextUrl}/accounts`);
+    for (const call of fixture.fetchCalls) {
+      assertNoRawHelperToken(
+        call,
+        SYNTHETIC_HELPER_TOKEN,
+        REPLACEMENT_SYNTHETIC_HELPER_TOKEN,
+      );
+    }
+    assert.notEqual(previousUrl, nextUrl);
+    assert.equal(fixture.storageData.config.backendUrl, nextUrl);
+    assert.equal(
+      fixture.storageData[BACKEND_AUTH_TOKEN_KEY],
+      REPLACEMENT_SYNTHETIC_HELPER_TOKEN,
+    );
+    assert.equal(fixture.elements.get("backend-token").value, "");
+    assert.equal(
+      fixture.elements.get("backend-token").getAttribute("aria-invalid"),
+      "false",
+    );
+    assert.equal(
+      fixture.elements.get("backend-token-status").textContent,
+      "A helper access token is stored",
+    );
+    assert.doesNotMatch(
+      fixture.elements.get("backend-status").textContent,
+      /__CONTAINOODLE_TEST_/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend setup reports a stored token without copying it into the page", async () => {
+  const fixture = createFixture();
+  try {
+    await loadOptions(fixture);
+
+    assert.equal(fixture.elements.get("backend-token").value, "");
+    assert.equal(
+      fixture.elements.get("backend-token-status").textContent,
+      "A helper access token is stored",
+    );
+    assert.equal(
+      [...fixture.elements.values()].some((element) =>
+        element.textContent.includes(SYNTHETIC_HELPER_TOKEN)
+      ),
+      false,
+    );
+
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+    assert.equal(protectedFetchCalls(fixture).length, 1);
+    for (const call of fixture.fetchCalls) {
+      assertNoRawHelperToken(call, SYNTHETIC_HELPER_TOKEN);
+    }
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("first backend Save & test offers session reuse synchronously without blocking helper setup", async () => {
+  const fixture = createFixture({
+    storage: { [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: undefined },
+  });
+  fixture.setPermissionRequestAllowed(false);
+  try {
+    await loadOptions(fixture);
+
+    await fixture.elements.get("backend-save").dispatch("click");
+    assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+    assert.equal(
+      fixture.storageData[BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY],
+      true,
+    );
+
+    await waitForBackendRequest(fixture);
+    assert.match(
+      fixture.elements.get("backend-status").textContent,
+      /Connected to local helper/,
+    );
+    assert.match(
+      fixture.elements.get("console-status").textContent,
+      /Disabled/,
+    );
+
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+    assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("session reuse auto-offer errors and marker write failures do not block helper setup or reprompt", async () => {
+  const fixture = createFixture({
+    storage: { [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: undefined },
+  });
+  fixture.failFollowingStorageWrite();
+  fixture.failNextPermissionRequest();
+  let persistedStorage;
+  try {
+    await loadOptions(fixture);
+
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+    assert.equal(
+      fixture.storageData[BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY],
+      true,
+    );
+    assert.match(
+      fixture.elements.get("backend-status").textContent,
+      /Connected to local helper/,
+    );
+    assert.match(
+      fixture.elements.get("console-status").textContent,
+      /simulated permission request failure/,
+    );
+
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+    assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+    persistedStorage = structuredClone(fixture.storageData);
+  } finally {
+    cleanupGlobals();
+  }
+
+  const reloaded = createFixture({ storage: persistedStorage });
+  try {
+    await loadOptions(reloaded);
+    await reloaded.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(reloaded);
+
+    assert.deepEqual(reloaded.permissionRequests, []);
+    assert.match(
+      reloaded.elements.get("backend-status").textContent,
+      /Connected to local helper/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("accepted session reuse is not auto-offered again after revoke, while manual Allow can re-request", async () => {
+  const fixture = createFixture({
+    storage: { [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: undefined },
+  });
+  try {
+    await loadOptions(fixture);
+
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+    assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+    assert.match(fixture.elements.get("console-status").textContent, /Enabled/);
+
+    await fixture.elements.get("console-revoke").dispatch("click");
+    await settle();
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+    assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+
+    await fixture.elements.get("console-grant").dispatch("click");
+    await settle();
+    assert.deepEqual(fixture.permissionRequests, [
+      CONSOLE_ORIGINS,
+      CONSOLE_ORIGINS,
+    ]);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a remembered auto-offer decision survives reload and an existing grant records the marker", async () => {
+  const remembered = createFixture();
+  try {
+    await loadOptions(remembered);
+    await remembered.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(remembered);
+    assert.deepEqual(remembered.permissionRequests, []);
+  } finally {
+    cleanupGlobals();
+  }
+
+  const alreadyGranted = createFixture({
+    granted: CONSOLE_ORIGINS,
+    storage: { [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: undefined },
+  });
+  try {
+    await loadOptions(alreadyGranted);
+    assert.equal(
+      alreadyGranted.storageData[BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY],
+      true,
+    );
+    await alreadyGranted.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(alreadyGranted);
+    assert.deepEqual(alreadyGranted.permissionRequests, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a stale backend Save & test click in portal mode cannot consume or trigger the auto-offer", async () => {
+  const fixture = createFixture({
+    config: { mode: "portal" },
+    storage: { [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: undefined },
+  });
+  try {
+    await loadOptions(fixture);
+    await fixture.elements.get("backend-save").dispatch("click");
+
+    assert.deepEqual(fixture.permissionRequests, []);
+    assert.equal(
+      fixture.storageData[BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY],
+      undefined,
+    );
+    assert.deepEqual(fixture.fetchCalls, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend save with a rejected token preserves the working URL and token", async () => {
+  const previousUrl = "http://127.0.0.1:8765";
+  const fixture = createFixture();
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+    fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.equal(fixture.storageData.config.backendUrl, previousUrl);
+    assert.equal(
+      fixture.storageData[BACKEND_AUTH_TOKEN_KEY],
+      SYNTHETIC_HELPER_TOKEN,
+    );
+    assert.equal(
+      fixture.elements.get("backend-token-status").textContent,
+      "The helper access token was rejected",
+    );
+    assert.equal(
+      fixture.elements.get("backend-status").textContent,
+      "Helper authentication failed",
+    );
+    assert.equal(
+      fixture.elements.get("backend-token").getAttribute("aria-invalid"),
+      "true",
+    );
+    assert.equal(fixture.fetchCalls.length, 1);
+    assert.equal(new URL(fixture.fetchCalls[0].url).pathname, "/auth/challenge");
+    assertNoRawHelperToken(
+      fixture.fetchCalls[0],
+      SYNTHETIC_HELPER_TOKEN,
+      REPLACEMENT_SYNTHETIC_HELPER_TOKEN,
+    );
+    assert.doesNotMatch(
+      fixture.elements.get("backend-status").textContent,
+      /__CONTAINOODLE_TEST_/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend save rejects a malformed draft token before any request", async () => {
+  const fixture = createFixture();
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+    fixture.elements.get("backend-token").value = "__SYNTHETIC_INVALID_TOKEN__";
+    await fixture.elements.get("backend-save").dispatch("click");
+
+    assert.deepEqual(fixture.fetchCalls, []);
+    assert.equal(fixture.storageData.config.backendUrl, "http://127.0.0.1:8765");
+    assert.equal(
+      fixture.storageData[BACKEND_AUTH_TOKEN_KEY],
+      SYNTHETIC_HELPER_TOKEN,
+    );
+    assert.equal(
+      fixture.elements.get("backend-token-status").textContent,
+      "The helper access token is invalid",
+    );
+    assert.equal(
+      fixture.elements.get("backend-token").getAttribute("aria-invalid"),
+      "true",
+    );
+    await fixture.elements.get("backend-token").dispatch("input");
+    assert.equal(
+      fixture.elements.get("backend-token").getAttribute("aria-invalid"),
+      "false",
+    );
+    assert.doesNotMatch(
+      fixture.elements.get("backend-status").textContent,
+      /__SYNTHETIC_INVALID_TOKEN__|__CONTAINOODLE_TEST_/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend save with an unreachable helper preserves the working settings", async () => {
+  const fixture = createFixture();
+  fixture.setBackendFetchError(new TypeError("synthetic network failure"));
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+    fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.equal(fixture.storageData.config.backendUrl, "http://127.0.0.1:8765");
+    assert.equal(
+      fixture.storageData[BACKEND_AUTH_TOKEN_KEY],
+      SYNTHETIC_HELPER_TOKEN,
+    );
+    assert.equal(
+      fixture.elements.get("backend-status").textContent,
+      "Local helper is unreachable",
+    );
+    assert.doesNotMatch(
+      fixture.elements.get("backend-status").textContent,
+      /synthetic network failure|__CONTAINOODLE_TEST_/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend save preserves working settings when local storage rejects the commit", async () => {
+  const fixture = createFixture();
+  fixture.failFollowingConfigWrite();
+  try {
+    await loadOptions(fixture);
+    fixture.setHelperToken(REPLACEMENT_SYNTHETIC_HELPER_TOKEN);
+    fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+    fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.equal(fixture.storageData.config.backendUrl, "http://127.0.0.1:8765");
+    assert.equal(
+      fixture.storageData[BACKEND_AUTH_TOKEN_KEY],
+      SYNTHETIC_HELPER_TOKEN,
+    );
+    assert.equal(
+      fixture.elements.get("backend-status").textContent,
+      "Helper connected, but settings could not be saved",
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend refresh requires a stored token and never uses the draft field", async () => {
+  const fixture = createFixture({
+    storage: { [BACKEND_AUTH_TOKEN_KEY]: undefined },
+  });
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
+    await fixture.elements.get("backend-refresh").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.deepEqual(fixture.fetchCalls, []);
+    assert.equal(
+      fixture.elements.get("backend-status").textContent,
+      "Helper access token required",
+    );
+    assert.equal(fixture.storageData[BACKEND_AUTH_TOKEN_KEY], undefined);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("portal mode never uses the stored helper token or calls the helper", async () => {
+  const fixture = createFixture({ config: { mode: "portal" } });
+  try {
+    await loadOptions(fixture);
+
+    assert.equal(fixture.elements.get("backend-token").value, "");
+    await fixture.elements.get("backend-save").dispatch("click");
+    await fixture.elements.get("backend-refresh").dispatch("click");
+    assert.deepEqual(fixture.fetchCalls, []);
+    assert.equal(
+      fixture.storageData[BACKEND_AUTH_TOKEN_KEY],
+      SYNTHETIC_HELPER_TOKEN,
+    );
   } finally {
     cleanupGlobals();
   }
@@ -527,7 +1106,6 @@ test("backend settings reject remote helper addresses without saving or fetching
     await loadOptions(fixture);
     fixture.elements.get("backend-url").value = "https://example.invalid";
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
 
     assert.equal(
       fixture.storageData.config.backendUrl,
@@ -694,20 +1272,30 @@ test("switching to portal cancels pending and in-flight backend work", async () 
   const pendingSave = createFixture();
   try {
     await loadOptions(pendingSave);
-    const releaseConfigWrite = pendingSave.pauseNextConfigWrite();
+    pendingSave.setDeferredBackendFetch(true);
     await pendingSave.elements.get("backend-save").dispatch("click");
-    await settle(1);
+    await waitFor(
+      () => pendingSave.fetchCalls.length === 2,
+      "backend save did not start its protected request",
+    );
+    assert.equal(pendingSave.fetchCalls.length, 2);
 
     const portalMode = pendingSave.elements.get("mode-portal");
     portalMode.checked = true;
-    const switching = portalMode.dispatch("change");
-    await settle(1);
-    releaseConfigWrite();
-    await switching;
-    await settle();
+    await portalMode.dispatch("change");
+    await waitFor(
+      () =>
+        pendingSave.storageData.config.mode === "portal" &&
+        pendingSave.abortedFetches === 1,
+      "portal switch did not cancel the backend save",
+    );
 
     assert.equal(pendingSave.storageData.config.mode, "portal");
-    assert.deepEqual(pendingSave.fetchCalls, []);
+    assert.equal(pendingSave.abortedFetches, 1);
+    assert.equal(
+      pendingSave.storageData[BACKEND_AUTH_TOKEN_KEY],
+      SYNTHETIC_HELPER_TOKEN,
+    );
   } finally {
     cleanupGlobals();
   }
@@ -717,13 +1305,21 @@ test("switching to portal cancels pending and in-flight backend work", async () 
     await loadOptions(inFlight);
     inFlight.setDeferredBackendFetch(true);
     await inFlight.elements.get("backend-refresh").dispatch("click");
-    await settle();
-    assert.equal(inFlight.fetchCalls.length, 1);
+    await waitFor(
+      () => inFlight.fetchCalls.length === 2,
+      "backend refresh did not start its protected request",
+    );
+    assert.equal(inFlight.fetchCalls.length, 2);
 
     const portalMode = inFlight.elements.get("mode-portal");
     portalMode.checked = true;
     await portalMode.dispatch("change");
-    await settle();
+    await waitFor(
+      () =>
+        inFlight.storageData.config.mode === "portal" &&
+        inFlight.abortedFetches === 1,
+      "portal switch did not cancel the backend refresh",
+    );
 
     assert.equal(inFlight.abortedFetches, 1);
     assert.equal(inFlight.storageData.config.mode, "portal");
@@ -1060,7 +1656,20 @@ test("options markup separates portal pins from backend session reuse", async ()
   assert.ok(backendPanel, "backend panel must remain present");
   assert.ok(portalPanel, "portal panel must remain present");
   assert.match(backendPanel[0], /id="console-permissions"/);
+  assert.match(
+    backendPanel[0],
+    /type="password"[\s\S]*?id="backend-token"|id="backend-token"[\s\S]*?type="password"/,
+  );
+  assert.ok(
+    backendPanel[0].indexOf('id="backend-url"') <
+      backendPanel[0].indexOf('id="backend-token"') &&
+      backendPanel[0].indexOf('id="backend-token"') <
+      backendPanel[0].indexOf('id="backend-save"'),
+    "keyboard order must be helper URL, helper token, then Save & test",
+  );
+  assert.doesNotMatch(backendPanel[0], /id="backend-token"[^>]*\svalue=/);
   assert.doesNotMatch(portalPanel[0], /id="console-permissions"/);
+  assert.doesNotMatch(portalPanel[0], /id="backend-token"/);
   assert.match(portalPanel[0], /id="portal-pins-status"/);
   assert.doesNotMatch(html, /id="accounts-json"/);
   assert.doesNotMatch(html, /id="accounts-save"/);
