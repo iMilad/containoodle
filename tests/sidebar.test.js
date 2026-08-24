@@ -363,9 +363,11 @@ async function settle(turns = 5) {
 }
 
 async function waitFor(check, message) {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  const nativeSetTimeout = originalGlobals.setTimeout.value;
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
     if (check()) return;
-    await settle(1);
+    await new Promise((resolve) => nativeSetTimeout(resolve, 5));
   }
   assert.ok(check(), message);
 }

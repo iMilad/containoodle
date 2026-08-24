@@ -111,6 +111,9 @@ class FakeElement {
 function createEvent() {
   const listeners = [];
   return {
+    get listenerCount() {
+      return listeners.length;
+    },
     addListener(listener) {
       listeners.push(listener);
     },
@@ -511,6 +514,24 @@ async function settle(turns = 20) {
   }
 }
 
+async function waitFor(check, message, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(check(), message);
+}
+
+async function waitForBackendRequest(fixture) {
+  await waitFor(
+    () =>
+      !fixture.elements.get("backend-save").disabled &&
+      !fixture.elements.get("backend-refresh").disabled,
+    "backend request did not finish",
+  );
+}
+
 async function loadOptions(fixture) {
   globalThis.document = fixture.document;
   globalThis.browser = fixture.browser;
@@ -518,7 +539,10 @@ async function loadOptions(fixture) {
   globalThis.location = { origin: TEST_EXTENSION_ORIGIN };
   globalThis.window = fixture.fakeWindow;
   await import(`${OPTIONS_MODULE.href}?test=${importSequence += 1}`);
-  await settle();
+  await waitFor(
+    () => fixture.onAdded.listenerCount === 1 && fixture.onRemoved.listenerCount === 1,
+    "options initialization did not finish",
+  );
 }
 
 function cleanupGlobals() {
@@ -578,7 +602,6 @@ test("renders the active mode, switches live, and guards backend fetches in port
 
     // Invoke a stale backend handler directly: the mode guard must still stop I/O.
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
     assert.deepEqual(fixture.fetchCalls, []);
   } finally {
     cleanupGlobals();
@@ -656,7 +679,7 @@ test("backend refresh marks its cache as backend-owned", async () => {
   try {
     await loadOptions(fixture);
     await fixture.elements.get("backend-refresh").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
 
     assert.deepEqual(fixture.storageData.accountsCache, []);
     assert.equal(fixture.storageData.accountsCacheSource, "backend");
@@ -680,7 +703,7 @@ test("backend save tests a replacement token before storing URL and token", asyn
     fixture.elements.get("backend-url").value = nextUrl;
     fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
 
     assert.equal(fixture.fetchCalls.length, 2);
     const [protectedCall] = protectedFetchCalls(fixture);
@@ -734,7 +757,7 @@ test("backend setup reports a stored token without copying it into the page", as
     );
 
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
     assert.equal(protectedFetchCalls(fixture).length, 1);
     for (const call of fixture.fetchCalls) {
       assertNoRawHelperToken(call, SYNTHETIC_HELPER_TOKEN);
@@ -759,7 +782,7 @@ test("first backend Save & test offers session reuse synchronously without block
       true,
     );
 
-    await settle();
+    await waitForBackendRequest(fixture);
     assert.match(
       fixture.elements.get("backend-status").textContent,
       /Connected to local helper/,
@@ -770,7 +793,7 @@ test("first backend Save & test offers session reuse synchronously without block
     );
 
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
     assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
   } finally {
     cleanupGlobals();
@@ -788,7 +811,7 @@ test("session reuse auto-offer errors and marker write failures do not block hel
     await loadOptions(fixture);
 
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
 
     assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
     assert.equal(
@@ -805,7 +828,7 @@ test("session reuse auto-offer errors and marker write failures do not block hel
     );
 
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
     assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
     persistedStorage = structuredClone(fixture.storageData);
   } finally {
@@ -816,7 +839,7 @@ test("session reuse auto-offer errors and marker write failures do not block hel
   try {
     await loadOptions(reloaded);
     await reloaded.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(reloaded);
 
     assert.deepEqual(reloaded.permissionRequests, []);
     assert.match(
@@ -836,14 +859,14 @@ test("accepted session reuse is not auto-offered again after revoke, while manua
     await loadOptions(fixture);
 
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
     assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
     assert.match(fixture.elements.get("console-status").textContent, /Enabled/);
 
     await fixture.elements.get("console-revoke").dispatch("click");
     await settle();
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
     assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
 
     await fixture.elements.get("console-grant").dispatch("click");
@@ -862,7 +885,7 @@ test("a remembered auto-offer decision survives reload and an existing grant rec
   try {
     await loadOptions(remembered);
     await remembered.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(remembered);
     assert.deepEqual(remembered.permissionRequests, []);
   } finally {
     cleanupGlobals();
@@ -879,7 +902,7 @@ test("a remembered auto-offer decision survives reload and an existing grant rec
       true,
     );
     await alreadyGranted.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(alreadyGranted);
     assert.deepEqual(alreadyGranted.permissionRequests, []);
   } finally {
     cleanupGlobals();
@@ -894,7 +917,6 @@ test("a stale backend Save & test click in portal mode cannot consume or trigger
   try {
     await loadOptions(fixture);
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
 
     assert.deepEqual(fixture.permissionRequests, []);
     assert.equal(
@@ -915,7 +937,7 @@ test("backend save with a rejected token preserves the working URL and token", a
     fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
     fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
 
     assert.equal(fixture.storageData.config.backendUrl, previousUrl);
     assert.equal(
@@ -957,7 +979,6 @@ test("backend save rejects a malformed draft token before any request", async ()
     fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
     fixture.elements.get("backend-token").value = "__SYNTHETIC_INVALID_TOKEN__";
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
 
     assert.deepEqual(fixture.fetchCalls, []);
     assert.equal(fixture.storageData.config.backendUrl, "http://127.0.0.1:8765");
@@ -995,7 +1016,7 @@ test("backend save with an unreachable helper preserves the working settings", a
     fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
     fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
 
     assert.equal(fixture.storageData.config.backendUrl, "http://127.0.0.1:8765");
     assert.equal(
@@ -1024,7 +1045,7 @@ test("backend save preserves working settings when local storage rejects the com
     fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
     fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
 
     assert.equal(fixture.storageData.config.backendUrl, "http://127.0.0.1:8765");
     assert.equal(
@@ -1048,7 +1069,7 @@ test("backend refresh requires a stored token and never uses the draft field", a
     await loadOptions(fixture);
     fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
     await fixture.elements.get("backend-refresh").dispatch("click");
-    await settle();
+    await waitForBackendRequest(fixture);
 
     assert.deepEqual(fixture.fetchCalls, []);
     assert.equal(
@@ -1069,7 +1090,6 @@ test("portal mode never uses the stored helper token or calls the helper", async
     assert.equal(fixture.elements.get("backend-token").value, "");
     await fixture.elements.get("backend-save").dispatch("click");
     await fixture.elements.get("backend-refresh").dispatch("click");
-    await settle();
     assert.deepEqual(fixture.fetchCalls, []);
     assert.equal(
       fixture.storageData[BACKEND_AUTH_TOKEN_KEY],
@@ -1086,7 +1106,6 @@ test("backend settings reject remote helper addresses without saving or fetching
     await loadOptions(fixture);
     fixture.elements.get("backend-url").value = "https://example.invalid";
     await fixture.elements.get("backend-save").dispatch("click");
-    await settle();
 
     assert.equal(
       fixture.storageData.config.backendUrl,
@@ -1255,13 +1274,21 @@ test("switching to portal cancels pending and in-flight backend work", async () 
     await loadOptions(pendingSave);
     pendingSave.setDeferredBackendFetch(true);
     await pendingSave.elements.get("backend-save").dispatch("click");
-    await settle();
+    await waitFor(
+      () => pendingSave.fetchCalls.length === 2,
+      "backend save did not start its protected request",
+    );
     assert.equal(pendingSave.fetchCalls.length, 2);
 
     const portalMode = pendingSave.elements.get("mode-portal");
     portalMode.checked = true;
     await portalMode.dispatch("change");
-    await settle();
+    await waitFor(
+      () =>
+        pendingSave.storageData.config.mode === "portal" &&
+        pendingSave.abortedFetches === 1,
+      "portal switch did not cancel the backend save",
+    );
 
     assert.equal(pendingSave.storageData.config.mode, "portal");
     assert.equal(pendingSave.abortedFetches, 1);
@@ -1278,13 +1305,21 @@ test("switching to portal cancels pending and in-flight backend work", async () 
     await loadOptions(inFlight);
     inFlight.setDeferredBackendFetch(true);
     await inFlight.elements.get("backend-refresh").dispatch("click");
-    await settle();
+    await waitFor(
+      () => inFlight.fetchCalls.length === 2,
+      "backend refresh did not start its protected request",
+    );
     assert.equal(inFlight.fetchCalls.length, 2);
 
     const portalMode = inFlight.elements.get("mode-portal");
     portalMode.checked = true;
     await portalMode.dispatch("change");
-    await settle();
+    await waitFor(
+      () =>
+        inFlight.storageData.config.mode === "portal" &&
+        inFlight.abortedFetches === 1,
+      "portal switch did not cancel the backend refresh",
+    );
 
     assert.equal(inFlight.abortedFetches, 1);
     assert.equal(inFlight.storageData.config.mode, "portal");
