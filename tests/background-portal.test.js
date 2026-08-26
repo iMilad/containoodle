@@ -5,18 +5,24 @@ import { readFileSync } from "node:fs";
 const START = "https://d-0000000000.awsapps.com/start";
 const ACCOUNT_ID = "0".repeat(12);
 const TEST_HELPER_TOKEN = "A".repeat(43);
+const TEST_SSO_IDENTITY = "a".repeat(64);
+const TEST_OTHER_SSO_IDENTITY = "b".repeat(64);
+const TEST_STALE_REUSE_IDENTITY = "c".repeat(64);
+const TEST_SSO_PROFILE = "__containoodle_test_profile__";
 const TEST_HELPER_ROLE = "__CONTAINOODLE_TEST_ROLE__";
 const TEST_PORTAL_ROLE = "__CONTAINOODLE_TEST_PORTAL_ROLE__";
 const TEST_BACKEND_ROLE = "__CONTAINOODLE_TEST_BACKEND_ROLE__";
 const TEST_LEGACY_ROLE = "__CONTAINOODLE_TEST_LEGACY_ROLE__";
 const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
+const BACKEND_CONSOLE_URL =
+  "https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1";
 const BACKEND_SIGNIN_URL = (() => {
   const url = new URL("https://signin.aws.amazon.com/federation");
   url.searchParams.set("Action", "login");
   url.searchParams.set("Issuer", "");
   url.searchParams.set(
     "Destination",
-    "https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1",
+    BACKEND_CONSOLE_URL,
   );
   url.searchParams.set("SigninToken", "test-only");
   return url.href;
@@ -72,6 +78,7 @@ async function sha256Hex(value) {
 function authenticatedBackendFetch({
   token = TEST_HELPER_TOKEN,
   authFailure = null,
+  identityPayload = { ok: true, identityKey: TEST_SSO_IDENTITY },
   onRequest = () => {},
   responseForRequest = async () => ({ status: 200, payload: {} }),
 } = {}) {
@@ -101,15 +108,18 @@ function authenticatedBackendFetch({
       }), { status: 200 });
     }
 
+    const response = requestUrl.pathname === "/sso-identity" && identityPayload
+      ? { status: 200, payload: identityPayload }
+      : await responseForRequest(
+        requestUrl,
+        options,
+      );
     const {
       status = 200,
       payload = {},
       rawBody,
       responseProofFailure = false,
-    } = await responseForRequest(
-      requestUrl,
-      options,
-    );
+    } = response;
     const body = rawBody === undefined ? JSON.stringify(payload) : String(rawBody);
     const challenge = new Headers(options.headers).get(
       "X-Containoodle-Challenge",
@@ -670,6 +680,72 @@ async function waitFor(check) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   assert.ok(check(), "timed out waiting for background work");
+}
+
+async function completeTabNavigation(
+  fixture,
+  tabId,
+  url,
+  overrides = {},
+) {
+  const tab = fixture.tabs.get(tabId);
+  assert.ok(tab, `missing test tab ${tabId}`);
+  Object.assign(tab, overrides, { url, status: "complete" });
+  for (const listener of fixture.events.tabsUpdated.listeners) {
+    listener(
+      tabId,
+      { url, status: "complete" },
+      { ...tab },
+    );
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function removeTabWithEvent(fixture, tabId) {
+  fixture.tabs.delete(tabId);
+  for (const listener of fixture.events.tabsRemoved.listeners) {
+    listener(tabId, { isWindowClosing: false });
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function launchFreshBackendForBinding({
+  existingBinding = TEST_OTHER_SSO_IDENTITY,
+} = {}) {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.backendSsoProfile = TEST_SSO_PROFILE;
+  fixture.storageData.backendSsoIdentityKey = TEST_SSO_IDENTITY;
+  fixture.storageData.accountsCache[0].role = TEST_HELPER_ROLE;
+  if (existingBinding !== undefined) {
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] =
+      existingBinding;
+  }
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+    async responseForRequest() {
+      return {
+        payload: {
+          ok: true,
+          containerUrl: `ext+container:name=Containoodle&url=${
+            encodeURIComponent(BACKEND_SIGNIN_URL)
+          }`,
+        },
+      };
+    },
+  });
+  const result = await onMessage({
+    type: "launch",
+    accountId: ACCOUNT_ID,
+    mode: "backend",
+  }, {});
+  assert.strictEqual(result.ok, true);
+  return { fixture, onMessage, requests, result };
 }
 
 async function fireBackgroundLifecycle(event, details) {
@@ -1379,11 +1455,522 @@ test("backend role discovery authenticates the helper request", async () => {
   );
   assert.deepStrictEqual(
     requests.map((request) => new URL(request.url).pathname),
-    ["/auth/challenge", "/roles"],
+    ["/auth/challenge", "/sso-identity", "/auth/challenge", "/roles"],
   );
+  const identityRequest = new URL(requests[1].url);
+  const rolesRequest = new URL(requests[3].url);
+  assert.strictEqual(identityRequest.searchParams.has("profile"), false);
+  assert.strictEqual(rolesRequest.searchParams.get("identity"), TEST_SSO_IDENTITY);
+  assert.strictEqual(fixture.storageData.backendSsoIdentityKey, TEST_SSO_IDENTITY);
   for (const request of requests) {
     assertNoRawHelperToken(request.url, request.options);
   }
+});
+
+test("backend profile launches scope helper requests, roles, and reuse metadata to one identity", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.backendSsoProfile = TEST_SSO_PROFILE;
+  fixture.storageData.backendSsoIdentityKey = TEST_OTHER_SSO_IDENTITY;
+  fixture.storageData[`backendRoleChoice/${ACCOUNT_ID}`] = TEST_LEGACY_ROLE;
+  fixture.storageData[
+    `backendRoleChoice/${TEST_OTHER_SSO_IDENTITY}/${ACCOUNT_ID}`
+  ] = "__CONTAINOODLE_TEST_OTHER_IDENTITY_ROLE__";
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+    async responseForRequest(url) {
+      if (url.pathname === "/roles") {
+        return { payload: { ok: true, roles: [TEST_HELPER_ROLE] } };
+      }
+      return {
+        payload: {
+          ok: true,
+          containerUrl: `ext+container:name=Containoodle&url=${
+            encodeURIComponent(BACKEND_SIGNIN_URL)
+          }`,
+        },
+      };
+    },
+  });
+
+  const result = await onMessage({
+    type: "launch",
+    accountId: ACCOUNT_ID,
+    mode: "backend",
+  }, {});
+
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    [
+      "/auth/challenge",
+      "/sso-identity",
+      "/auth/challenge",
+      "/roles",
+      "/auth/challenge",
+      "/generate-url",
+    ],
+  );
+  for (const request of requests) assertNoRawHelperToken(request.url, request.options);
+  for (const index of [1, 3, 5]) {
+    assert.strictEqual(
+      new URL(requests[index].url).searchParams.get("profile"),
+      TEST_SSO_PROFILE,
+    );
+  }
+  for (const index of [3, 5]) {
+    assert.strictEqual(
+      new URL(requests[index].url).searchParams.get("identity"),
+      TEST_SSO_IDENTITY,
+    );
+  }
+  assert.strictEqual(
+    new URL(requests[5].url).searchParams.get("role"),
+    TEST_HELPER_ROLE,
+  );
+  assert.strictEqual(
+    fixture.storageData[
+      `backendRoleChoice/${TEST_SSO_IDENTITY}/${ACCOUNT_ID}`
+    ],
+    TEST_HELPER_ROLE,
+  );
+  assert.strictEqual(
+    fixture.storageData[`backendRoleChoice/${ACCOUNT_ID}`],
+    TEST_LEGACY_ROLE,
+  );
+  assert.strictEqual(
+    fixture.storageData[
+      `backendRoleChoice/${TEST_OTHER_SSO_IDENTITY}/${ACCOUNT_ID}`
+    ],
+    "__CONTAINOODLE_TEST_OTHER_IDENTITY_ROLE__",
+  );
+  assert.strictEqual(
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
+    undefined,
+  );
+  await completeTabNavigation(
+    fixture,
+    result.tabId,
+    BACKEND_CONSOLE_URL,
+  );
+  await waitFor(
+    () => fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] ===
+      TEST_SSO_IDENTITY,
+  );
+});
+
+test("an unexpected SSO identity response fails before roles, containers, or tabs", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.backendSsoIdentityKey = TEST_OTHER_SSO_IDENTITY;
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    identityPayload: {
+      ok: true,
+      identityKey: TEST_SSO_IDENTITY,
+      __containoodleTestUnexpectedField: true,
+    },
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+  });
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "launch",
+      accountId: ACCOUNT_ID,
+      role: TEST_HELPER_ROLE,
+      mode: "backend",
+    }, {}),
+    { ok: false, error: "Local helper returned an invalid SSO identity" },
+  );
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    ["/auth/challenge", "/sso-identity"],
+  );
+  assert.strictEqual(
+    fixture.storageData.backendSsoIdentityKey,
+    TEST_OTHER_SSO_IDENTITY,
+  );
+  assert.strictEqual(fixture.identities.length, 0);
+  assert.strictEqual(fixture.createdTabs.length, 0);
+});
+
+test("a live backend session bound to another identity is bypassed and rebound after sign-in", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.accountsCache[0].role = TEST_HELPER_ROLE;
+  const storeId = "firefox-container-backend-identity-mismatch";
+  fixture.identities.push({
+    name: "backend-prod-data",
+    cookieStoreId: storeId,
+    color: "red",
+    icon: "briefcase",
+  });
+  fixture.storageData[`accountContainer/${ACCOUNT_ID}`] = storeId;
+  fixture.storageData[`containerAccount/${storeId}`] = ACCOUNT_ID;
+  fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] =
+    TEST_OTHER_SSO_IDENTITY;
+  fixture.addTargetPortalCookie(storeId, {
+    name: "noflush_Region",
+    value: "eu-west-1",
+    domain: ".console.aws.amazon.com",
+    hostOnly: false,
+    path: "/",
+    secure: true,
+  });
+  fixture.addTargetPortalCookie(storeId, {
+    name: "aws-signer-token_eu-west-1",
+    value: "__CONTAINOODLE_TEST_LIVE_SESSION__",
+    domain: ".console.aws.amazon.com",
+    hostOnly: false,
+    path: "/",
+    secure: true,
+    expirationDate: Math.ceil(Date.now() / 1000) + 3600,
+  });
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+    async responseForRequest() {
+      return {
+        payload: {
+          ok: true,
+          containerUrl: `ext+container:name=Containoodle&url=${
+            encodeURIComponent(BACKEND_SIGNIN_URL)
+          }`,
+        },
+      };
+    },
+  });
+
+  const result = await onMessage({
+    type: "launch",
+    accountId: ACCOUNT_ID,
+    mode: "backend",
+  }, {});
+
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(fixture.cookieReads.length, 0);
+  assert.strictEqual(fixture.createdTabs[0].url, BACKEND_SIGNIN_URL);
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    [
+      "/auth/challenge",
+      "/sso-identity",
+      "/auth/challenge",
+      "/generate-url",
+    ],
+  );
+  assert.strictEqual(
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
+    TEST_OTHER_SSO_IDENTITY,
+  );
+  await completeTabNavigation(
+    fixture,
+    result.tabId,
+    BACKEND_CONSOLE_URL,
+  );
+  await waitFor(
+    () => fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] ===
+      TEST_SSO_IDENTITY,
+  );
+});
+
+test("a completed federation error page preserves the old reuse marker", async () => {
+  const { fixture, onMessage, requests, result } =
+    await launchFreshBackendForBinding();
+
+  await completeTabNavigation(
+    fixture,
+    result.tabId,
+    "https://signin.aws.amazon.com/federation?__containoodle_test_error__=1",
+  );
+  assert.strictEqual(
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
+    TEST_OTHER_SSO_IDENTITY,
+  );
+
+  const second = await onMessage({
+    type: "launch",
+    accountId: ACCOUNT_ID,
+    mode: "backend",
+  }, {});
+  assert.strictEqual(second.ok, true);
+  assert.strictEqual(
+    requests.filter((request) =>
+      new URL(request.url).pathname === "/generate-url"
+    ).length,
+    2,
+    "an unverified launch must generate a new federation URL next time",
+  );
+});
+
+test("removing a fresh sign-in tab preserves the old reuse marker", async () => {
+  const { fixture, onMessage, requests, result } =
+    await launchFreshBackendForBinding();
+
+  await removeTabWithEvent(fixture, result.tabId);
+  assert.strictEqual(
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
+    TEST_OTHER_SSO_IDENTITY,
+  );
+
+  const second = await onMessage({
+    type: "launch",
+    accountId: ACCOUNT_ID,
+    mode: "backend",
+  }, {});
+  assert.strictEqual(second.ok, true);
+  assert.strictEqual(
+    requests.filter((request) =>
+      new URL(request.url).pathname === "/generate-url"
+    ).length,
+    2,
+  );
+});
+
+test("a timed-out fresh sign-in cannot bind after later console navigation", async () => {
+  const nativeSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, delay, ...args) => nativeSetTimeout(
+    callback,
+    delay === 120_000 ? 0 : delay,
+    ...args,
+  );
+  let launched;
+  try {
+    launched = await launchFreshBackendForBinding();
+  } finally {
+    globalThis.setTimeout = nativeSetTimeout;
+  }
+  const { fixture, result } = launched;
+  await new Promise((resolve) => nativeSetTimeout(resolve, 10));
+  assert.strictEqual(
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
+    TEST_OTHER_SSO_IDENTITY,
+  );
+
+  await completeTabNavigation(
+    fixture,
+    result.tabId,
+    BACKEND_CONSOLE_URL,
+  );
+  assert.strictEqual(
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
+    TEST_OTHER_SSO_IDENTITY,
+  );
+});
+
+test("profile replacement after tab creation prevents verified reuse binding", async () => {
+  const { fixture, result } = await launchFreshBackendForBinding({
+    existingBinding: TEST_STALE_REUSE_IDENTITY,
+  });
+  fixture.storageData.backendSsoProfile =
+    "__containoodle_test_replacement_profile__";
+  fixture.storageData.backendSsoIdentityKey = TEST_OTHER_SSO_IDENTITY;
+
+  await completeTabNavigation(
+    fixture,
+    result.tabId,
+    BACKEND_CONSOLE_URL,
+  );
+  assert.strictEqual(
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
+    TEST_STALE_REUSE_IDENTITY,
+  );
+});
+
+test("a console completion in another container preserves the old reuse marker", async () => {
+  const { fixture, result } = await launchFreshBackendForBinding();
+
+  await completeTabNavigation(
+    fixture,
+    result.tabId,
+    BACKEND_CONSOLE_URL,
+    { cookieStoreId: "firefox-container-__containoodle_test_other__" },
+  );
+  assert.strictEqual(
+    fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
+    TEST_OTHER_SSO_IDENTITY,
+  );
+});
+
+test("a profile replacement after identity authentication cancels before live-session reuse", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.backendSsoProfile = TEST_SSO_PROFILE;
+  fixture.storageData.backendSsoIdentityKey = TEST_SSO_IDENTITY;
+  const storeId = "firefox-container-backend-profile-race";
+  fixture.identities.push({
+    name: "backend-prod-data",
+    cookieStoreId: storeId,
+    color: "red",
+    icon: "briefcase",
+  });
+  fixture.storageData[`accountContainer/${ACCOUNT_ID}`] = storeId;
+  fixture.storageData[`containerAccount/${storeId}`] = ACCOUNT_ID;
+  fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] =
+    TEST_SSO_IDENTITY;
+  fixture.addTargetPortalCookie(storeId, {
+    name: "noflush_Region",
+    value: "eu-west-1",
+    domain: ".console.aws.amazon.com",
+    hostOnly: false,
+    path: "/",
+    secure: true,
+  });
+  const onMessage = await loadBackground(fixture);
+  const originalGet = fixture.browser.storage.local.get;
+  let replaced = false;
+  fixture.browser.storage.local.get = async (keys) => {
+    const stored = await originalGet(keys);
+    if (keys === `backendContainerIdentity/${ACCOUNT_ID}` && !replaced) {
+      replaced = true;
+      fixture.storageData.backendSsoProfile =
+        "__containoodle_test_replacement_profile__";
+      fixture.storageData.backendSsoIdentityKey = TEST_OTHER_SSO_IDENTITY;
+    }
+    return stored;
+  };
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+  });
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "launch",
+      accountId: ACCOUNT_ID,
+      mode: "backend",
+    }, {}),
+    {
+      ok: false,
+      cancelled: true,
+      error: "Connection mode changed — try again",
+    },
+  );
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    ["/auth/challenge", "/sso-identity"],
+  );
+  assert.strictEqual(fixture.cookieReads.length, 0);
+  assert.strictEqual(fixture.createdTabs.length, 0);
+});
+
+test("a profile replacement during URL generation cancels before container or tab mutation", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.backendSsoProfile = TEST_SSO_PROFILE;
+  fixture.storageData.backendSsoIdentityKey = TEST_SSO_IDENTITY;
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+    async responseForRequest(url) {
+      assert.strictEqual(url.pathname, "/generate-url");
+      fixture.storageData.backendSsoProfile =
+        "__containoodle_test_replacement_profile__";
+      fixture.storageData.backendSsoIdentityKey = TEST_OTHER_SSO_IDENTITY;
+      return {
+        payload: {
+          ok: true,
+          containerUrl: `ext+container:name=Containoodle&url=${
+            encodeURIComponent(BACKEND_SIGNIN_URL)
+          }`,
+        },
+      };
+    },
+  });
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "launch",
+      accountId: ACCOUNT_ID,
+      role: TEST_HELPER_ROLE,
+      mode: "backend",
+    }, {}),
+    {
+      ok: false,
+      cancelled: true,
+      error: "Connection mode changed — try again",
+    },
+  );
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    [
+      "/auth/challenge",
+      "/sso-identity",
+      "/auth/challenge",
+      "/generate-url",
+    ],
+  );
+  assert.strictEqual(fixture.identities.length, 0);
+  assert.strictEqual(fixture.createdTabs.length, 0);
+});
+
+test("a helper URL replacement during URL generation cancels before container or tab mutation", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.backendSsoProfile = TEST_SSO_PROFILE;
+  fixture.storageData.backendSsoIdentityKey = TEST_SSO_IDENTITY;
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url, options) {
+      requests.push({ url, options });
+    },
+    async responseForRequest(url) {
+      assert.strictEqual(url.pathname, "/generate-url");
+      fixture.storageData.config = {
+        ...fixture.storageData.config,
+        backendUrl: "http://127.0.0.1:8422",
+      };
+      return {
+        payload: {
+          ok: true,
+          containerUrl: `ext+container:name=Containoodle&url=${
+            encodeURIComponent(BACKEND_SIGNIN_URL)
+          }`,
+        },
+      };
+    },
+  });
+
+  assert.deepStrictEqual(
+    await onMessage({
+      type: "launch",
+      accountId: ACCOUNT_ID,
+      role: TEST_HELPER_ROLE,
+      mode: "backend",
+    }, {}),
+    {
+      ok: false,
+      cancelled: true,
+      error: "Connection mode changed — try again",
+    },
+  );
+  assert.deepStrictEqual(
+    requests.map((request) => new URL(request.url).pathname),
+    [
+      "/auth/challenge",
+      "/sso-identity",
+      "/auth/challenge",
+      "/generate-url",
+    ],
+  );
+  assert.strictEqual(fixture.identities.length, 0);
+  assert.strictEqual(fixture.createdTabs.length, 0);
 });
 
 test("a helper rejection returns to settings without opening a console tab", async () => {
@@ -1463,11 +2050,21 @@ test("a later helper trust failure leaves discovered roles and containers untouc
   );
   assert.strictEqual(fixture.createdTabs.length, 0);
   assert.strictEqual(fixture.identities.length, 0);
-  assert.deepStrictEqual(fixture.storageData, storageBefore);
+  assert.deepStrictEqual(fixture.storageData, {
+    ...storageBefore,
+    backendSsoIdentityKey: TEST_SSO_IDENTITY,
+  });
   assert.deepStrictEqual(fixture.cookieWrites, cookiesBefore);
   assert.deepStrictEqual(
     requests.map((request) => new URL(request.url).pathname),
-    ["/auth/challenge", "/roles", "/auth/challenge", "/generate-url"],
+    [
+      "/auth/challenge",
+      "/sso-identity",
+      "/auth/challenge",
+      "/roles",
+      "/auth/challenge",
+      "/generate-url",
+    ],
   );
   for (const request of requests) {
     assertNoRawHelperToken(request.url, request.options);
@@ -1505,11 +2102,19 @@ test("a signed helper 401 is classified before parsing its response body", async
   );
   assert.strictEqual(fixture.createdTabs.length, 0);
   assert.strictEqual(fixture.identities.length, 0);
-  assert.deepStrictEqual(fixture.storageData, storageBefore);
+  assert.deepStrictEqual(fixture.storageData, {
+    ...storageBefore,
+    backendSsoIdentityKey: TEST_SSO_IDENTITY,
+  });
   assert.deepStrictEqual(fixture.cookieWrites, cookiesBefore);
   assert.deepStrictEqual(
     requests.map((request) => new URL(request.url).pathname),
-    ["/auth/challenge", "/generate-url"],
+    [
+      "/auth/challenge",
+      "/sso-identity",
+      "/auth/challenge",
+      "/generate-url",
+    ],
   );
   for (const request of requests) {
     assertNoRawHelperToken(request.url, request.options);
@@ -1531,6 +2136,8 @@ test("backend session reuse never overrides an explicit role choice", async () =
   });
   fixture.storageData[`accountContainer/${ACCOUNT_ID}`] = storeId;
   fixture.storageData[`containerAccount/${storeId}`] = ACCOUNT_ID;
+  fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] =
+    TEST_SSO_IDENTITY;
   fixture.addTargetPortalCookie(storeId, {
     name: "noflush_Region",
     value: "eu-west-1",
@@ -1549,22 +2156,6 @@ test("backend session reuse never overrides an explicit role choice", async () =
     expirationDate: Math.ceil(Date.now() / 1000) + 3600,
   });
   const onMessage = await loadBackground(fixture);
-
-  delete fixture.storageData.backendAuthToken;
-
-  const reused = await onMessage({
-    type: "launch",
-    accountId: ACCOUNT_ID,
-    mode: "backend",
-  }, {});
-  assert.strictEqual(reused.ok, true);
-  assert.strictEqual(
-    fixture.createdTabs[0].url,
-    "https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1"
-  );
-  const cookieReadCount = fixture.cookieReads.length;
-  fixture.storageData.backendAuthToken = TEST_HELPER_TOKEN;
-
   const signinUrl = BACKEND_SIGNIN_URL;
   let backendUrl = null;
   let backendOptions = null;
@@ -1572,7 +2163,7 @@ test("backend session reuse never overrides an explicit role choice", async () =
   globalThis.fetch = authenticatedBackendFetch({
     onRequest(url, options) {
       backendRequests.push({ url, options });
-      if (new URL(url).pathname !== "/auth/challenge") {
+      if (new URL(url).pathname === "/generate-url") {
         backendUrl = url;
         backendOptions = options;
       }
@@ -1586,6 +2177,22 @@ test("backend session reuse never overrides an explicit role choice", async () =
       };
     },
   });
+
+  const reused = await onMessage({
+    type: "launch",
+    accountId: ACCOUNT_ID,
+    mode: "backend",
+  }, {});
+  assert.strictEqual(reused.ok, true);
+  assert.strictEqual(
+    fixture.createdTabs[0].url,
+    "https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1"
+  );
+  assert.deepStrictEqual(
+    backendRequests.map((request) => new URL(request.url).pathname),
+    ["/auth/challenge", "/sso-identity"],
+  );
+  const cookieReadCount = fixture.cookieReads.length;
   const explicit = await onMessage({
     type: "launch",
     accountId: ACCOUNT_ID,
@@ -1597,7 +2204,14 @@ test("backend session reuse never overrides an explicit role choice", async () =
   assert.strictEqual(new URL(backendUrl).searchParams.get("role"), TEST_HELPER_ROLE);
   assert.deepStrictEqual(
     backendRequests.map((request) => new URL(request.url).pathname),
-    ["/auth/challenge", "/generate-url"],
+    [
+      "/auth/challenge",
+      "/sso-identity",
+      "/auth/challenge",
+      "/sso-identity",
+      "/auth/challenge",
+      "/generate-url",
+    ],
   );
   for (const request of backendRequests) {
     assertNoRawHelperToken(request.url, request.options);
@@ -1610,7 +2224,9 @@ test("backend session reuse never overrides an explicit role choice", async () =
     "an explicit backend role must bypass the live-session cookie check"
   );
   assert.strictEqual(
-    fixture.storageData[`backendRoleChoice/${ACCOUNT_ID}`],
+    fixture.storageData[
+      `backendRoleChoice/${TEST_SSO_IDENTITY}/${ACCOUNT_ID}`
+    ],
     TEST_HELPER_ROLE
   );
 });

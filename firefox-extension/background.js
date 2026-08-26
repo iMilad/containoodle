@@ -27,9 +27,13 @@ import {
 import { automaticGroupTitle } from "./shared/group-naming.js";
 import {
   BACKEND_AUTH_TOKEN_KEY,
+  BACKEND_SSO_IDENTITY_KEY,
+  BACKEND_SSO_PROFILE_KEY,
   DEFAULT_BACKEND_URL,
   backendFetch,
   isBackendAuthenticationError,
+  normalizeBackendSsoIdentityKey,
+  normalizeBackendSsoProfile,
   normalizeBackendToken,
   safeBackendUrl,
   validateBackendSigninUrl,
@@ -108,6 +112,161 @@ function backendAuthRejectedError() {
 function rethrowBackendAuthenticationError(err) {
   if (isBackendAuthenticationError(err)) throw backendAuthRejectedError();
   throw err;
+}
+
+function backendIdentityChangedError() {
+  const err = new Error("Backend identity changed — try again");
+  err.cancelled = true;
+  return err;
+}
+
+function backendIdentityUrl(config, profile) {
+  const url = new URL("/sso-identity", `${config.backendUrl}/`);
+  if (profile) url.searchParams.set("profile", profile);
+  return url.href;
+}
+
+function backendIdentityQuery(identity) {
+  const query = new URLSearchParams();
+  if (identity.profile) query.set("profile", identity.profile);
+  query.set("identity", identity.identityKey);
+  return query;
+}
+
+/* Authenticate the helper-selected SSO identity before any operation that
+   can consume or reuse an AWS session. The returned key is opaque to the
+   extension and scopes backend-only role/reuse state. */
+async function authenticateBackendIdentity(config) {
+  const stored = await browser.storage.local.get([
+    BACKEND_AUTH_TOKEN_KEY,
+    BACKEND_SSO_PROFILE_KEY,
+    BACKEND_SSO_IDENTITY_KEY,
+  ]);
+  let token;
+  let profile;
+  try {
+    token = normalizeBackendToken(stored[BACKEND_AUTH_TOKEN_KEY]);
+  } catch {
+    const missing = new Error("Local helper access token is missing or invalid");
+    missing.needsOptions = true;
+    throw missing;
+  }
+  try {
+    profile = normalizeBackendSsoProfile(stored[BACKEND_SSO_PROFILE_KEY]);
+  } catch (err) {
+    const invalidProfile = new Error(err.message || "AWS CLI profile is invalid");
+    invalidProfile.needsOptions = true;
+    throw invalidProfile;
+  }
+
+  let res;
+  try {
+    res = await backendFetch(backendIdentityUrl(config, profile), token);
+  } catch (err) {
+    rethrowBackendAuthenticationError(err);
+  }
+  if (res.status === 401) throw backendAuthRejectedError();
+
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error(`Backend error (HTTP ${res.status})`);
+  }
+  if (!res.ok) {
+    throw new Error(data?.error || `Backend error (HTTP ${res.status})`);
+  }
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data) ||
+    Object.keys(data).sort().join("\n") !== "identityKey\nok" ||
+    data.ok !== true
+  ) {
+    throw new Error("Local helper returned an invalid SSO identity");
+  }
+
+  let identityKey;
+  try {
+    identityKey = normalizeBackendSsoIdentityKey(data.identityKey);
+  } catch {
+    throw new Error("Local helper returned an invalid SSO identity");
+  }
+
+  // Do not publish a response that belongs to credentials or a profile that
+  // changed while the authenticated request was in flight.
+  const latest = await browser.storage.local.get([
+    "config",
+    BACKEND_AUTH_TOKEN_KEY,
+    BACKEND_SSO_PROFILE_KEY,
+  ]);
+  let latestToken;
+  let latestProfile;
+  try {
+    latestToken = normalizeBackendToken(latest[BACKEND_AUTH_TOKEN_KEY]);
+    latestProfile = normalizeBackendSsoProfile(latest[BACKEND_SSO_PROFILE_KEY]);
+  } catch {
+    throw backendIdentityChangedError();
+  }
+  const latestConfig = {
+    ...DEFAULT_CONFIG,
+    ...(latest.config || {}),
+  };
+  latestConfig.backendUrl = safeBackendUrl(latestConfig.backendUrl);
+  if (
+    latestConfig.mode !== "backend" ||
+    latestConfig.backendUrl !== config.backendUrl ||
+    latestToken !== token ||
+    latestProfile !== profile
+  ) {
+    throw backendIdentityChangedError();
+  }
+
+  let previousIdentity = null;
+  try {
+    previousIdentity = normalizeBackendSsoIdentityKey(
+      stored[BACKEND_SSO_IDENTITY_KEY]
+    );
+  } catch {
+    // Missing/legacy state is replaced only after a trusted response.
+  }
+  if (previousIdentity !== identityKey) {
+    await browser.storage.local.set({
+      [BACKEND_SSO_IDENTITY_KEY]: identityKey,
+    });
+  }
+  return {
+    backendUrl: config.backendUrl,
+    profile,
+    identityKey,
+    token,
+  };
+}
+
+async function backendIdentityIsCurrent(identity) {
+  const stored = await browser.storage.local.get([
+    "config",
+    BACKEND_AUTH_TOKEN_KEY,
+    BACKEND_SSO_PROFILE_KEY,
+    BACKEND_SSO_IDENTITY_KEY,
+  ]);
+  try {
+    const config = {
+      ...DEFAULT_CONFIG,
+      ...(stored.config || {}),
+    };
+    config.backendUrl = safeBackendUrl(config.backendUrl);
+    return (
+      config.mode === "backend" &&
+      config.backendUrl === identity.backendUrl &&
+      normalizeBackendToken(stored[BACKEND_AUTH_TOKEN_KEY]) === identity.token &&
+      normalizeBackendSsoProfile(stored[BACKEND_SSO_PROFILE_KEY]) === identity.profile &&
+      normalizeBackendSsoIdentityKey(stored[BACKEND_SSO_IDENTITY_KEY]) ===
+        identity.identityKey
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function getPortalPinnedAccounts() {
@@ -615,8 +774,8 @@ async function fetchJson(url, opts) {
   return res.json();
 }
 
-async function fetchBackendJson(url, opts) {
-  const token = await getBackendAuthToken();
+async function fetchBackendJson(url, opts, trustedToken = null) {
+  const token = trustedToken || await getBackendAuthToken();
   let res;
   try {
     res = await backendFetch(url, token, opts);
@@ -683,27 +842,33 @@ async function portalDiscoverRoles(config, account) {
 
 /* Backend variant — GET /roles (server runs aws sso
    list-account-roles). Old servers 404 here; caller falls back. */
-async function backendDiscoverRoles(config, account) {
+async function backendDiscoverRoles(config, account, backendIdentity) {
+  const query = backendIdentityQuery(backendIdentity);
+  query.set("account", account.accountId);
   const data = await fetchBackendJson(
-    `${config.backendUrl}/roles?account=${encodeURIComponent(account.accountId)}`
+    `${config.backendUrl}/roles?${query}`,
+    undefined,
+    backendIdentity.token
   );
   if (!data.ok || !Array.isArray(data.roles)) throw new Error(data.error || "Bad /roles response");
   return data.roles;
 }
 
-async function discoverRolesFor(config, account) {
+async function discoverRolesFor(config, account, backendIdentity = null) {
   return config.mode === "portal"
     ? portalDiscoverRoles(config, account)
-    : backendDiscoverRoles(config, account);
+    : backendDiscoverRoles(config, account, backendIdentity);
 }
 
-function rememberedRoleKey(mode, accountId) {
-  return `${mode === "portal" ? "portal" : "backend"}RoleChoice/${accountId}`;
+function rememberedRoleKey(mode, accountId, backendIdentity = null) {
+  if (mode === "portal") return `portalRoleChoice/${accountId}`;
+  if (!backendIdentity) throw new Error("Backend identity is required");
+  return `backendRoleChoice/${backendIdentity.identityKey}/${accountId}`;
 }
 
-async function rememberRole(config, accountId, role) {
+async function rememberRole(config, accountId, role, backendIdentity = null) {
   await browser.storage.local.set({
-    [rememberedRoleKey(config.mode, accountId)]: role,
+    [rememberedRoleKey(config.mode, accountId, backendIdentity)]: role,
   });
 }
 
@@ -713,13 +878,17 @@ async function rememberRole(config, accountId, role) {
 async function resolveRole(config, account, explicitRole, options = {}) {
   if (explicitRole) return explicitRole;
   if (account.role) return account.role;
-  const key = rememberedRoleKey(config.mode, account.accountId);
+  const key = rememberedRoleKey(
+    config.mode,
+    account.accountId,
+    options.backendIdentity
+  );
   const { [key]: remembered } = await browser.storage.local.get(key);
   if (remembered) return remembered;
 
   let roles = null;
   try {
-    roles = await discoverRolesFor(config, account);
+    roles = await discoverRolesFor(config, account, options.backendIdentity);
   } catch (err) {
     if (err && (err.needsLogin || err.needsOptions)) throw err;
     roles = null; // discovery unavailable — fall through to defaults
@@ -728,7 +897,12 @@ async function resolveRole(config, account, explicitRole, options = {}) {
     if (typeof options.onDiscoveredRole === "function") {
       options.onDiscoveredRole(roles[0]);
     } else {
-      await rememberRole(config, account.accountId, roles[0]);
+      await rememberRole(
+        config,
+        account.accountId,
+        roles[0],
+        options.backendIdentity
+      );
     }
     return roles[0];
   }
@@ -764,7 +938,16 @@ async function discoverRoles(accountId, expectedMode) {
     };
   }
   try {
-    const roles = await discoverRolesFor(config, account);
+    const backendIdentity = config.mode === "backend"
+      ? await authenticateBackendIdentity(config)
+      : null;
+    const roles = await discoverRolesFor(config, account, backendIdentity);
+    if (
+      backendIdentity &&
+      !(await backendIdentityIsCurrent(backendIdentity))
+    ) {
+      throw backendIdentityChangedError();
+    }
     if (!roles || roles.length === 0) return { ok: false, error: "No roles found for this account" };
     return { ok: true, roles };
   } catch (err) {
@@ -822,14 +1005,113 @@ async function openPortal(expectedMode) {
 
 /* ─── Backend mode ───────────────────────────────────────────────── */
 
-async function backendSigninUrl(backendUrl, account, role) {
-  const roleParam = role ? `&role=${encodeURIComponent(role)}` : "";
-  const token = await getBackendAuthToken();
+const BACKEND_REUSE_BIND_TIMEOUT_MS = 120_000;
+const pendingBackendReuseBindings = new Map();
+
+function clearPendingBackendReuseBinding(tabId) {
+  const pending = pendingBackendReuseBindings.get(tabId);
+  if (!pending) return null;
+  pendingBackendReuseBindings.delete(tabId);
+  clearTimeout(pending.timer);
+  return pending;
+}
+
+function isAwsConsoleUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  const hostname = url.hostname.toLowerCase();
+  return (
+    url.protocol === "https:" &&
+    !url.username &&
+    !url.password &&
+    !url.port &&
+    (
+      hostname === "console.aws.amazon.com" ||
+      hostname.endsWith(".console.aws.amazon.com")
+    )
+  );
+}
+
+async function verifyPendingBackendReuseBinding(tabId) {
+  const candidate = pendingBackendReuseBindings.get(tabId);
+  if (!candidate) return;
+
+  let tab;
+  try {
+    tab = await browser.tabs.get(tabId);
+  } catch {
+    clearPendingBackendReuseBinding(tabId);
+    return;
+  }
+  if (tab.status !== "complete") return;
+
+  // A completed non-console navigation is a failed federation attempt. Take
+  // this exact pending launch once so later browsing cannot retroactively bind
+  // it as a reusable session.
+  const pending = clearPendingBackendReuseBinding(tabId);
+  if (
+    !pending ||
+    tab.cookieStoreId !== pending.cookieStoreId ||
+    !isAwsConsoleUrl(tab.url)
+  ) return;
+
+  const mappingKey = `accountContainer/${pending.accountId}`;
+  const ownerKey = `containerAccount/${pending.cookieStoreId}`;
+  try {
+    if (!(await backendIdentityIsCurrent(pending.backendIdentity))) return;
+    const config = await getConfig();
+    if (config.mode !== "backend") return;
+    const stored = await browser.storage.local.get([mappingKey, ownerKey]);
+    if (
+      stored[mappingKey] !== pending.cookieStoreId ||
+      stored[ownerKey] !== pending.accountId
+    ) return;
+    if (!(await backendIdentityIsCurrent(pending.backendIdentity))) return;
+    if ((await getConfig()).mode !== "backend") return;
+    await browser.storage.local.set({
+      [`backendContainerIdentity/${pending.accountId}`]:
+        pending.backendIdentity.identityKey,
+    });
+  } catch {
+    // Verification is deliberately fail-closed. The previous marker remains.
+  }
+}
+
+function scheduleBackendReuseBinding(tab, accountId, backendIdentity) {
+  if (!Number.isInteger(tab.id) || typeof tab.cookieStoreId !== "string") return;
+  clearPendingBackendReuseBinding(tab.id);
+  const pending = {
+    accountId,
+    cookieStoreId: tab.cookieStoreId,
+    backendIdentity,
+    timer: null,
+  };
+  pending.timer = setTimeout(() => {
+    if (pendingBackendReuseBindings.get(tab.id) === pending) {
+      clearPendingBackendReuseBinding(tab.id);
+    }
+  }, BACKEND_REUSE_BIND_TIMEOUT_MS);
+  pending.timer?.unref?.();
+  pendingBackendReuseBindings.set(tab.id, pending);
+
+  // The redirect may complete before tabs.create() resolves or before the
+  // listener observes its update. Inspect the exact created tab once now too.
+  void verifyPendingBackendReuseBinding(tab.id);
+}
+
+async function backendSigninUrl(backendUrl, account, role, backendIdentity) {
+  const query = backendIdentityQuery(backendIdentity);
+  query.set("account", account.accountId);
+  if (role) query.set("role", role);
   let res;
   try {
     res = await backendFetch(
-      `${backendUrl}/generate-url?account=${encodeURIComponent(account.accountId)}${roleParam}`,
-      token
+      `${backendUrl}/generate-url?${query}`,
+      backendIdentity.token
     );
   } catch (err) {
     rethrowBackendAuthenticationError(err);
@@ -1125,17 +1407,46 @@ async function launch(accountId, explicitRole, options = {}) {
   let container;
   let url;
   let resolvedRole = null;
+  let backendIdentity = null;
+  let freshBackendSignin = false;
 
   if (config.mode === "backend") {
-    // Reuse may inspect an already-owned container without contacting the
-    // helper. When helper generation is required, authenticate and validate
-    // the sign-in URL before creating/repairing any container state.
-    const mappedContainer = explicitRole
-      ? null
-      : await getMappedContainer(account.accountId);
-    const liveRegion = mappedContainer
-      ? await liveConsoleRegion(mappedContainer.cookieStoreId)
+    try {
+      backendIdentity = await authenticateBackendIdentity(config);
+    } catch (err) {
+      if (err && err.cancelled) return cancelled();
+      if (err && err.needsOptions) {
+        return { ok: false, needsOptions: true, error: err.message };
+      }
+      if (err instanceof TypeError) {
+        return {
+          ok: false,
+          needsOptions: true,
+          error: `Backend unreachable at ${config.backendUrl} — is server.py running? Or switch to portal mode`,
+        };
+      }
+      return { ok: false, error: err.message || "Backend identity error" };
+    }
+    if (
+      !(await modeIsCurrent()) ||
+      !(await backendIdentityIsCurrent(backendIdentity))
+    ) return cancelled();
+
+    // A live console session is reusable only when it was created for this
+    // authenticated SSO identity. Legacy/unscoped metadata is preserved but
+    // deliberately ignored.
+    const reuseKey = `backendContainerIdentity/${account.accountId}`;
+    const { [reuseKey]: boundIdentity } = await browser.storage.local.get(
+      reuseKey
+    );
+    const reusableContainer = !explicitRole && boundIdentity === backendIdentity.identityKey
+      ? await getMappedContainer(account.accountId)
       : null;
+    if (!(await backendIdentityIsCurrent(backendIdentity))) return cancelled();
+    const liveRegion = reusableContainer
+      ? await liveConsoleRegion(reusableContainer.cookieStoreId)
+      : null;
+    if (!(await backendIdentityIsCurrent(backendIdentity))) return cancelled();
     if (liveRegion) {
       if (!(await modeIsCurrent())) return cancelled();
       container = await findOrCreateContainer(
@@ -1151,6 +1462,7 @@ async function launch(accountId, explicitRole, options = {}) {
       let discoveredRole = null;
       try {
         role = await resolveRole(config, account, explicitRole, {
+          backendIdentity,
           onDiscoveredRole(value) {
             discoveredRole = value;
           },
@@ -1164,10 +1476,19 @@ async function launch(accountId, explicitRole, options = {}) {
       }
       resolvedRole = role;
       try {
-        if (!(await modeIsCurrent())) return cancelled();
+        if (
+          !(await modeIsCurrent()) ||
+          !(await backendIdentityIsCurrent(backendIdentity))
+        ) return cancelled();
         // role may be null — the server then resolves it from
         // accounts.json / CONTAINOODLE_DEFAULT_ROLE as before.
-        url = await backendSigninUrl(config.backendUrl, account, role);
+        url = await backendSigninUrl(
+          config.backendUrl,
+          account,
+          role,
+          backendIdentity
+        );
+        freshBackendSignin = true;
       } catch (err) {
         if (err && err.needsOptions) {
           return { ok: false, needsOptions: true, error: err.message };
@@ -1182,14 +1503,25 @@ async function launch(accountId, explicitRole, options = {}) {
         }
         return { ok: false, error: err.message || "Backend error" };
       }
-      if (!(await modeIsCurrent())) return cancelled();
+      if (
+        !(await modeIsCurrent()) ||
+        !(await backendIdentityIsCurrent(backendIdentity))
+      ) return cancelled();
       if (discoveredRole) {
         try {
-          await rememberRole(config, account.accountId, discoveredRole);
+          await rememberRole(
+            config,
+            account.accountId,
+            discoveredRole,
+            backendIdentity
+          );
         } catch (err) {
           return { ok: false, error: err.message || "Role resolution failed" };
         }
-        if (!(await modeIsCurrent())) return cancelled();
+        if (
+          !(await modeIsCurrent()) ||
+          !(await backendIdentityIsCurrent(backendIdentity))
+        ) return cancelled();
       }
       container = await findOrCreateContainer(
         account.accountId,
@@ -1247,10 +1579,19 @@ async function launch(accountId, explicitRole, options = {}) {
       : consoleDeepLink(config.portalStartUrl, account.accountId, role);
   }
 
-  if (!(await modeIsCurrent())) return cancelled();
+  if (
+    !(await modeIsCurrent()) ||
+    (
+      config.mode === "backend" &&
+      !(await backendIdentityIsCurrent(backendIdentity))
+    )
+  ) return cancelled();
   const createProperties = { url, cookieStoreId: container.cookieStoreId };
   if (Number.isInteger(options.windowId)) createProperties.windowId = options.windowId;
   const tab = await browser.tabs.create(createProperties);
+  if (config.mode === "backend" && freshBackendSignin) {
+    scheduleBackendReuseBinding(tab, account.accountId, backendIdentity);
+  }
   await addToGroup(tab, account, env);
   try {
     if (config.mode === "portal") {
@@ -1259,8 +1600,25 @@ async function launch(accountId, explicitRole, options = {}) {
         resolvedRole,
         Boolean(portalLaunch || explicitRole)
       );
-    } else if (explicitRole && resolvedRole) {
-      await rememberRole(config, account.accountId, resolvedRole);
+    } else {
+      const identityStillCurrent = await backendIdentityIsCurrent(
+        backendIdentity
+      );
+      if (identityStillCurrent) {
+        const successfulState = {};
+        if (explicitRole && resolvedRole) {
+          successfulState[
+            rememberedRoleKey(
+              config.mode,
+              account.accountId,
+              backendIdentity
+            )
+          ] = resolvedRole;
+        }
+        if (Object.keys(successfulState).length > 0) {
+          await browser.storage.local.set(successfulState);
+        }
+      }
     }
   } catch {
     // Launch history and pinned-shortcut updates must never fail a
@@ -1908,6 +2266,9 @@ browser.tabs.onCreated.addListener((tab) => {
 });
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (pendingBackendReuseBindings.has(tabId)) {
+    void verifyPendingBackendReuseBinding(tabId);
+  }
   if (!changeInfo.url) return;
   if (consumeNewTabFallback({ ...tab, id: tabId }, changeInfo.url)) return;
   const nativeFallback = portalNativeFallbacks.get(tabId);
@@ -1922,6 +2283,7 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {
+  clearPendingBackendReuseBinding(tabId);
   portalHandoffPending.delete(tabId);
   clearNativeFallback(tabId);
   clearNewTabFallback(portalNewTabFallbacks.get(tabId));
