@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
 const TEST_HELPER_TOKEN = "A".repeat(43);
 const TEST_HELPER_ROLE = "__CONTAINOODLE_TEST_ROLE__";
+const TEST_SSO_IDENTITY = "a".repeat(64);
+const TEST_OTHER_SSO_IDENTITY = "b".repeat(64);
 
 function decodeBase64Url(value) {
   const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=");
@@ -690,6 +692,61 @@ test("portal rows never display a backend-only remembered role", async () => {
     assert.equal(list.querySelector(".account-name").textContent, "Payments DEV");
     assert.equal(list.querySelector(".role-chip"), null);
     assert.doesNotMatch(list.textContent, /BackendOnlyRole/);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend rows display remembered roles only for the current SSO identity", async () => {
+  const accountId = "000000000000";
+  const accounts = [{
+    accountId,
+    accountName: "__CONTAINOODLE_TEST_ACCOUNT__",
+  }];
+  const fixture = createSidebarFixture({
+    storage: {
+      config: {
+        mode: "backend",
+        backendUrl: "http://127.0.0.1:8421",
+        portalStartUrl: "",
+      },
+      backendSsoProfile: "__containoodle_test_profile__",
+      backendSsoIdentityKey: TEST_SSO_IDENTITY,
+      backendPinnedAccountIds: [accountId],
+      [`backendRoleChoice/${accountId}`]:
+        "__CONTAINOODLE_TEST_LEGACY_ROLE__",
+      [`backendRoleChoice/${TEST_SSO_IDENTITY}/${accountId}`]:
+        TEST_HELPER_ROLE,
+      [`backendRoleChoice/${TEST_OTHER_SSO_IDENTITY}/${accountId}`]:
+        "__CONTAINOODLE_TEST_OTHER_IDENTITY_ROLE__",
+    },
+    fetchImpl: backendResponse(accounts),
+  });
+
+  try {
+    await loadSidebar(fixture);
+    let chip = fixture.ids.get("account-list").querySelector(".role-chip");
+    assert.ok(chip);
+    assert.strictEqual(chip.textContent, TEST_HELPER_ROLE);
+
+    await fixture.browser.storage.local.set({
+      backendSsoProfile: "__containoodle_test_other_profile__",
+      backendSsoIdentityKey: TEST_OTHER_SSO_IDENTITY,
+    });
+    await waitFor(
+      () => fixture.ids.get("account-list").querySelector(".role-chip")
+        ?.textContent === "__CONTAINOODLE_TEST_OTHER_IDENTITY_ROLE__",
+      "sidebar did not switch to the replacement identity's role",
+    );
+    chip = fixture.ids.get("account-list").querySelector(".role-chip");
+    assert.strictEqual(
+      chip.textContent,
+      "__CONTAINOODLE_TEST_OTHER_IDENTITY_ROLE__",
+    );
+    assert.doesNotMatch(
+      fixture.ids.get("account-list").textContent,
+      /__CONTAINOODLE_TEST_LEGACY_ROLE__/,
+    );
   } finally {
     cleanupGlobals();
   }

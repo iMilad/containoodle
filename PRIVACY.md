@@ -1,6 +1,6 @@
 # Containoodle privacy policy
 
-Effective date: 20 August 2026
+Effective date: 25 August 2026
 
 Containoodle has no advertising, analytics, telemetry, or hosted service. The
 developer does not receive your configuration, account information, browsing
@@ -22,6 +22,8 @@ activity, and website content.
   Firefox container.
 - The local helper access token used to authenticate this Firefox profile to
   `server.py` in local-helper mode.
+- The optional local AWS CLI profile alias and an opaque helper-derived SSO
+  identity key used to keep backend sessions and role choices separated.
 - Local preferences such as connection mode, pins, remembered role choices,
   account-to-container mappings, and tab-group naming rules.
 
@@ -36,7 +38,8 @@ cookie stores on the same device. If you enable role discovery, Containoodle sen
 cookie directly to the AWS portal API as an authentication value. Account and role
 details are also sent to AWS when Firefox opens the selected console session.
 
-In local-helper mode, the extension sends the selected account and role to
+In local-helper mode, the extension sends the selected account, role, optional
+local AWS CLI profile alias, and opaque SSO identity key to
 `http://127.0.0.1:<port>` on the same device. The saved helper access token itself
 is not transmitted. It is used locally on both sides to authenticate a
 short-lived challenge, a one-time proof for the exact request, and a proof over
@@ -54,8 +57,9 @@ Extension preferences and account metadata remain in this Firefox profile in
 `browser.storage.local` until changed or until the add-on's local data is removed.
 Containoodle does not use browser sync.
 
-The extension's helper access token also remains in `browser.storage.local`; it is
-not browser-synced or redisplayed by the extension after saving. The helper stores its matching
+The extension's helper access token, optional AWS CLI profile alias, and opaque SSO
+identity key also remain in `browser.storage.local`; they are not browser-synced.
+The token is not redisplayed by the extension after saving. The helper stores its matching
 copy outside the repository at `~/.containoodle/helper-token` by default. On POSIX
 systems it requires a user-only directory and file. Normal helper startup,
 responses, and access logs do not print the token; `server.py --show-token` is the

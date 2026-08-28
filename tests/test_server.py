@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import runpy
 import tempfile
 import threading
 import unittest
@@ -24,6 +25,14 @@ TEST_ROLE_ALPHA = "__CONTAINOODLE_TEST_ROLE_ALPHA__"
 TEST_ROLE_BETA = "__CONTAINOODLE_TEST_ROLE_BETA__"
 TEST_ROLE_QUERY = "__CONTAINOODLE_TEST_ROLE_QUERY__"
 TEST_ROLE_DEFAULT = "__CONTAINOODLE_TEST_ROLE_DEFAULT__"
+TEST_PROFILE_ALPHA = "__CONTAINOODLE_TEST_PROFILE_ALPHA__"
+TEST_PROFILE_BETA = "__CONTAINOODLE_TEST_PROFILE_BETA__"
+TEST_SESSION_ALPHA = "__CONTAINOODLE_TEST_SESSION_ALPHA__"
+TEST_SESSION_BETA = "__CONTAINOODLE_TEST_SESSION_BETA__"
+TEST_START_URL_ALPHA = "https://__containoodle_test_alpha__.invalid/start"
+TEST_START_URL_BETA = "https://__containoodle_test_beta__.invalid/start"
+TEST_ACCESS_TOKEN_ALPHA = "__CONTAINOODLE_TEST_ACCESS_TOKEN_ALPHA__"
+TEST_ACCESS_TOKEN_BETA = "__CONTAINOODLE_TEST_ACCESS_TOKEN_BETA__"
 
 
 def _test_base64url(value: bytes) -> str:
@@ -52,6 +61,7 @@ def setUpModule():
     safe_root = Path(_GUARD_DIRECTORY.name)
     _GUARD_PATCHERS.extend([
         patch.object(server, "ACCOUNTS_FILE", safe_root / "accounts.json"),
+        patch.object(server, "AWS_CONFIG_FILE", safe_root / "config"),
         patch.object(server, "SSO_CACHE_DIR", safe_root / "sso-cache"),
         patch.object(server, "HELPER_TOKEN", TEST_HELPER_TOKEN),
         patch.object(
@@ -459,6 +469,9 @@ class TokenExpiryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "expires within 5 minutes"):
             self.check(FixedDateTime.current + timedelta(minutes=4))
 
+        with self.assertRaisesRegex(RuntimeError, "expires within 5 minutes"):
+            self.check(FixedDateTime.current + timedelta(minutes=5))
+
     def test_accepts_an_expiry_with_an_explicit_utc_offset(self):
         expires_at = FixedDateTime.current + timedelta(minutes=6)
         with patch.object(server, "datetime", FixedDateTime):
@@ -469,46 +482,228 @@ class TokenExpiryTests(unittest.TestCase):
             with patch.object(server, "datetime", FixedDateTime):
                 server._check_token_expiry({"accessToken": "synthetic-token"})
 
+    def test_rejects_malformed_or_timezone_free_expiry_values(self):
+        for expires_at in (
+            "not-a-time",
+            " 2030-01-01T00:00:00Z",
+            "2030-01-01T00:00:00",
+            123,
+        ):
+            with self.subTest(expires_at=expires_at):
+                with (
+                    patch.object(server, "datetime", FixedDateTime),
+                    self.assertRaisesRegex(RuntimeError, "expiresAt"),
+                ):
+                    server._check_token_expiry({"expiresAt": expires_at})
+
 
 class SsoCacheSelectionTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
-        self.cache_directory = Path(self.temporary_directory.name)
+        self.root = Path(self.temporary_directory.name)
+        self.cache_directory = self.root / "sso-cache"
+        self.cache_directory.mkdir()
+        self.config_file = self.root / "config"
 
-    def write_json(self, name, data, modified_at):
+    def write_json(self, name, data):
         path = self.cache_directory / name
         path.write_text(json.dumps(data))
-        os.utime(path, (modified_at, modified_at))
         return path
 
-    def test_selects_the_most_recent_token_file_and_skips_other_json(self):
-        self.write_json(
-            "older-token.json",
-            {"accessToken": "synthetic-older", "expiresAt": "2030-01-01T00:00:00Z"},
-            100,
-        )
-        expected = {
-            "accessToken": "synthetic-newer",
-            "expiresAt": "2030-01-02T00:00:00Z",
+    def write_namespace_cache(self, namespace, data):
+        cache_key = hashlib.sha1(
+            namespace.encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()
+        return self.write_json(f"{cache_key}.json", data)
+
+    def usable_cache(
+        self,
+        token=TEST_ACCESS_TOKEN_ALPHA,
+        start_url=TEST_START_URL_ALPHA,
+        region="eu-west-1",
+        expires_at="2030-01-01T00:00:00Z",
+    ):
+        return {
+            "accessToken": token,
+            "startUrl": start_url,
+            "region": region,
+            "expiresAt": expires_at,
         }
-        self.write_json("newer-token.json", expected, 200)
-        self.write_json("newest-without-token.json", {"clientId": "synthetic"}, 400)
-        invalid = self.cache_directory / "invalid.json"
-        invalid.write_text("{")
-        os.utime(invalid, (500, 500))
 
-        with patch.object(server, "SSO_CACHE_DIR", self.cache_directory):
-            self.assertEqual(server._find_sso_cache_file(), expected)
+    def select(self, profile=None):
+        with (
+            patch.object(server, "AWS_CONFIG_FILE", self.config_file),
+            patch.object(server, "SSO_CACHE_DIR", self.cache_directory),
+            patch.object(server, "datetime", FixedDateTime),
+        ):
+            return server._select_sso_identity(profile)
 
-    def test_skips_an_unreadable_candidate(self):
-        unreadable = self.write_json(
-            "unreadable.json",
-            {"accessToken": "must-not-be-returned"},
-            300,
+    def test_standard_aws_config_file_override_is_honored(self):
+        configured_path = self.root / "__containoodle_test_aws_config__"
+        with patch.dict(
+            os.environ,
+            {"AWS_CONFIG_FILE": str(configured_path)},
+        ):
+            namespace = runpy.run_path(
+                server.__file__,
+                run_name="__containoodle_test_server_import__",
+            )
+
+        self.assertEqual(namespace["AWS_CONFIG_FILE"], configured_path)
+
+    def test_resolves_modern_profile_to_the_session_cache_namespace(self):
+        self.config_file.write_text(
+            f"""
+[profile {TEST_PROFILE_ALPHA}]
+sso_session = {TEST_SESSION_ALPHA}
+
+[sso-session {TEST_SESSION_ALPHA}]
+sso_start_url = {TEST_START_URL_ALPHA}
+sso_region = eu-west-1
+""".strip()
         )
-        expected = {"accessToken": "synthetic-readable"}
-        self.write_json("readable.json", expected, 200)
+        expected = self.usable_cache()
+        self.write_namespace_cache(TEST_SESSION_ALPHA, expected)
+        self.write_namespace_cache(
+            TEST_START_URL_ALPHA,
+            self.usable_cache(token=TEST_ACCESS_TOKEN_BETA),
+        )
+
+        selected = self.select(TEST_PROFILE_ALPHA)
+
+        self.assertEqual(selected["cache"], expected)
+        self.assertEqual(selected["accessToken"], TEST_ACCESS_TOKEN_ALPHA)
+        self.assertRegex(selected["identityKey"], r"^[0-9a-f]{64}$")
+
+    def test_resolves_default_and_named_legacy_profiles_by_start_url(self):
+        self.config_file.write_text(
+            f"""
+[default]
+sso_start_url = {TEST_START_URL_ALPHA}
+sso_region = eu-west-1
+
+[profile {TEST_PROFILE_BETA}]
+sso_start_url = {TEST_START_URL_BETA}
+sso_region = eu-central-1
+""".strip()
+        )
+        alpha = self.usable_cache()
+        beta = self.usable_cache(
+            token=TEST_ACCESS_TOKEN_BETA,
+            start_url=TEST_START_URL_BETA,
+            region="eu-central-1",
+        )
+        self.write_namespace_cache(TEST_START_URL_ALPHA, alpha)
+        self.write_namespace_cache(TEST_START_URL_BETA, beta)
+
+        self.assertEqual(self.select("default")["cache"], alpha)
+        self.assertEqual(self.select(TEST_PROFILE_BETA)["cache"], beta)
+
+    def test_explicit_profile_never_falls_back_to_another_cache(self):
+        self.config_file.write_text(
+            f"""
+[profile {TEST_PROFILE_ALPHA}]
+sso_session = {TEST_SESSION_ALPHA}
+
+[sso-session {TEST_SESSION_ALPHA}]
+sso_start_url = {TEST_START_URL_ALPHA}
+sso_region = eu-west-1
+""".strip()
+        )
+        self.write_json("unrelated.json", self.usable_cache())
+
+        with self.assertRaisesRegex(
+            server.SsoSelectionError,
+            "selected AWS SSO login is unavailable",
+        ):
+            self.select(TEST_PROFILE_ALPHA)
+
+    def test_explicit_profile_rejects_mismatched_or_unusable_exact_cache(self):
+        self.config_file.write_text(
+            f"""
+[profile {TEST_PROFILE_ALPHA}]
+sso_session = {TEST_SESSION_ALPHA}
+
+[sso-session {TEST_SESSION_ALPHA}]
+sso_start_url = {TEST_START_URL_ALPHA}
+sso_region = eu-west-1
+""".strip()
+        )
+        cases = (
+            self.usable_cache(start_url=TEST_START_URL_BETA),
+            self.usable_cache(region="eu-central-1"),
+            self.usable_cache(token="   "),
+            self.usable_cache(token=f" {TEST_ACCESS_TOKEN_ALPHA}"),
+            self.usable_cache(start_url="not-an-https-url"),
+            self.usable_cache(region="not-a-region"),
+            self.usable_cache(expires_at="2020-01-01T00:00:00Z"),
+            ["__CONTAINOODLE_TEST_NOT_AN_OBJECT__"],
+        )
+        cache_path = self.write_namespace_cache(TEST_SESSION_ALPHA, cases[0])
+
+        for cache_data in cases:
+            with self.subTest(cache_data=cache_data):
+                cache_path.write_text(json.dumps(cache_data))
+                with self.assertRaisesRegex(
+                    server.SsoSelectionError,
+                    "invalid or expiring soon",
+                ):
+                    self.select(TEST_PROFILE_ALPHA)
+
+    def test_missing_or_invalid_profile_configuration_fails_closed(self):
+        cases = (
+            "",
+            f"[profile {TEST_PROFILE_ALPHA}]\nsso_session = ",
+            f"[profile {TEST_PROFILE_ALPHA}]\nsso_start_url = {TEST_START_URL_ALPHA}",
+            "[profile broken",
+        )
+        for config_text in cases:
+            with self.subTest(config_text=config_text):
+                self.config_file.write_text(config_text)
+                with self.assertRaises(server.SsoSelectionError):
+                    self.select(TEST_PROFILE_ALPHA)
+
+    def test_automatic_selection_ignores_invalid_entries_and_file_recency(self):
+        expected = self.usable_cache()
+        usable_path = self.write_json("usable.json", expected)
+        os.utime(usable_path, (100, 100))
+        expired_path = self.write_json("expired.json", self.usable_cache(
+            token=TEST_ACCESS_TOKEN_BETA,
+            start_url=TEST_START_URL_BETA,
+            expires_at="2020-01-01T00:00:00Z",
+        ))
+        os.utime(expired_path, (500, 500))
+        self.write_json("near-expiry.json", self.usable_cache(
+            token="__CONTAINOODLE_TEST_NEAR_EXPIRY_TOKEN__",
+            start_url="https://__containoodle_test_near__.invalid/start",
+            expires_at="2026-07-24T10:04:00Z",
+        ))
+        self.write_json("registration.json", {
+            "clientId": "__CONTAINOODLE_TEST_CLIENT_REGISTRATION__",
+        })
+        self.write_json("not-an-object.json", ["__CONTAINOODLE_TEST_VALUE__"])
+        self.write_json("missing-start-url.json", {
+            "accessToken": "__CONTAINOODLE_TEST_MISSING_START_URL_TOKEN__",
+            "region": "eu-west-1",
+            "expiresAt": "2030-01-01T00:00:00Z",
+        })
+        self.write_json("missing-region.json", {
+            "accessToken": "__CONTAINOODLE_TEST_MISSING_REGION_TOKEN__",
+            "startUrl": "https://__containoodle_test_missing_region__.invalid/start",
+            "expiresAt": "2030-01-01T00:00:00Z",
+        })
+        self.write_json("malformed-identity.json", self.usable_cache(
+            token=" __CONTAINOODLE_TEST_PADDED_TOKEN__",
+            start_url="not-an-https-url",
+            region="not-a-region",
+        ))
+        (self.cache_directory / "malformed.json").write_text("{")
+        unreadable = self.write_json("unreadable.json", self.usable_cache(
+            token="__CONTAINOODLE_TEST_UNREADABLE_TOKEN__",
+            start_url="https://__containoodle_test_unreadable__.invalid/start",
+        ))
         original_read_text = Path.read_text
 
         def controlled_read_text(path, *args, **kwargs):
@@ -517,19 +712,77 @@ class SsoCacheSelectionTests(unittest.TestCase):
             return original_read_text(path, *args, **kwargs)
 
         with (
+            patch.object(server, "AWS_CONFIG_FILE", self.config_file),
             patch.object(server, "SSO_CACHE_DIR", self.cache_directory),
+            patch.object(server, "datetime", FixedDateTime),
             patch.object(Path, "read_text", controlled_read_text),
         ):
-            self.assertEqual(server._find_sso_cache_file(), expected)
+            selected = server._select_sso_identity()
 
-    def test_raises_when_no_token_candidate_exists(self):
-        self.write_json("client-registration.json", {"clientId": "synthetic"}, 100)
+        self.assertEqual(selected["cache"], expected)
 
-        with (
-            patch.object(server, "SSO_CACHE_DIR", self.cache_directory),
-            self.assertRaisesRegex(RuntimeError, "aws sso login"),
+    def test_duplicate_files_for_the_exact_same_token_are_not_ambiguous(self):
+        duplicate = self.usable_cache()
+        self.write_json("duplicate-alpha.json", duplicate)
+        self.write_json("duplicate-beta.json", duplicate)
+
+        self.assertEqual(self.select()["cache"], duplicate)
+
+    def test_selection_never_modifies_or_deletes_cache_files(self):
+        cache_path = self.write_json("usable.json", self.usable_cache())
+        before_bytes = cache_path.read_bytes()
+        before_mtime = cache_path.stat().st_mtime_ns
+
+        self.select()
+
+        self.assertTrue(cache_path.exists())
+        self.assertEqual(cache_path.read_bytes(), before_bytes)
+        self.assertEqual(cache_path.stat().st_mtime_ns, before_mtime)
+
+    def test_multiple_distinct_usable_tokens_fail_closed(self):
+        self.write_json("alpha.json", self.usable_cache())
+        self.write_json("beta.json", self.usable_cache(
+            token=TEST_ACCESS_TOKEN_BETA,
+            start_url=TEST_START_URL_BETA,
+        ))
+
+        with self.assertRaisesRegex(
+            server.SsoSelectionError,
+            "Multiple AWS SSO logins",
         ):
-            server._find_sso_cache_file()
+            self.select()
+
+    def test_no_usable_token_fails_closed(self):
+        self.write_json("registration.json", {
+            "clientId": "__CONTAINOODLE_TEST_CLIENT_REGISTRATION__",
+        })
+
+        with self.assertRaisesRegex(
+            server.SsoSelectionError,
+            "Run aws sso login",
+        ):
+            self.select()
+
+    def test_identity_key_is_opaque_domain_separated_and_verified(self):
+        selection = {
+            "identityKey": server._sso_identity_key(
+                TEST_START_URL_ALPHA,
+                TEST_ACCESS_TOKEN_ALPHA,
+            ),
+        }
+        self.assertRegex(selection["identityKey"], r"^[0-9a-f]{64}$")
+        self.assertNotIn(TEST_ACCESS_TOKEN_ALPHA, selection["identityKey"])
+        self.assertNotEqual(
+            selection["identityKey"],
+            server._hmac_hex(
+                "containoodle-request-v1",
+                TEST_START_URL_ALPHA,
+                TEST_ACCESS_TOKEN_ALPHA,
+            ),
+        )
+        server._verify_sso_identity(selection, selection["identityKey"])
+        with self.assertRaisesRegex(server.SsoSelectionError, "login changed"):
+            server._verify_sso_identity(selection, "0" * 64)
 
 
 class AwsCliContractTests(unittest.TestCase):
@@ -764,9 +1017,9 @@ class FederationUrlTests(unittest.TestCase):
             )
 
     def test_generate_signin_url_runs_the_complete_pipeline(self):
-        cache = {
-            "accessToken": "synthetic-access-token",
-            "expiresAt": "2030-01-01T00:00:00Z",
+        selection = {
+            "accessToken": TEST_ACCESS_TOKEN_ALPHA,
+            "identityKey": "a" * 64,
         }
         credentials = {
             "sessionId": "SYNTHETIC-ID",
@@ -775,8 +1028,12 @@ class FederationUrlTests(unittest.TestCase):
         }
 
         with (
-            patch.object(server, "_find_sso_cache_file", return_value=cache) as find_cache,
-            patch.object(server, "_check_token_expiry") as check_expiry,
+            patch.object(
+                server,
+                "_select_sso_identity",
+                return_value=selection,
+            ) as select_identity,
+            patch.object(server, "_verify_sso_identity") as verify_identity,
             patch.object(
                 server,
                 "_get_role_credentials",
@@ -792,35 +1049,36 @@ class FederationUrlTests(unittest.TestCase):
                 TEST_ACCOUNT_ID,
                 TEST_ROLE_ALPHA,
                 "eu-west-1",
+                TEST_PROFILE_ALPHA,
+                "a" * 64,
             )
 
         self.assertEqual(result, "https://signin.aws.amazon.com/synthetic-login")
-        find_cache.assert_called_once_with()
-        check_expiry.assert_called_once_with(cache)
+        select_identity.assert_called_once_with(TEST_PROFILE_ALPHA)
+        verify_identity.assert_called_once_with(selection, "a" * 64)
         get_credentials.assert_called_once_with(
-            "synthetic-access-token",
+            TEST_ACCESS_TOKEN_ALPHA,
             TEST_ACCOUNT_ID,
             TEST_ROLE_ALPHA,
             "eu-west-1",
         )
         build_url.assert_called_once_with(credentials, "eu-west-1")
 
-    def test_generate_signin_url_stops_when_expiry_validation_fails(self):
-        cache = {
-            "accessToken": "synthetic-access-token",
-            "expiresAt": "2020-01-01T00:00:00Z",
-        }
-
+    def test_generate_signin_url_stops_when_selection_fails(self):
         with (
-            patch.object(server, "_find_sso_cache_file", return_value=cache),
             patch.object(
                 server,
-                "_check_token_expiry",
-                side_effect=RuntimeError("synthetic expired token"),
+                "_select_sso_identity",
+                side_effect=server.SsoSelectionError(
+                    "__CONTAINOODLE_TEST_SELECTION_FAILURE__"
+                ),
             ),
             patch.object(server, "_get_role_credentials") as get_credentials,
             patch.object(server, "_build_signin_url") as build_url,
-            self.assertRaisesRegex(RuntimeError, "synthetic expired token"),
+            self.assertRaisesRegex(
+                server.SsoSelectionError,
+                "__CONTAINOODLE_TEST_SELECTION_FAILURE__",
+            ),
         ):
             server.generate_signin_url(
                 TEST_ACCOUNT_ID,
@@ -1220,7 +1478,7 @@ class HelperHmacProtocolTests(unittest.TestCase):
             patch.object(server.secrets, "token_urlsafe", return_value=TEST_CHALLENGE),
             patch.object(server.time, "time", return_value=2_000_000_000.0),
             patch.object(server.time, "monotonic", return_value=100.0),
-            patch.object(server, "_find_sso_cache_file") as find_cache,
+            patch.object(server, "_select_sso_identity") as select_identity,
             patch.object(server, "generate_signin_url") as generate_url,
         ):
             handler.do_GET()
@@ -1243,7 +1501,7 @@ class HelperHmacProtocolTests(unittest.TestCase):
         rendered = handler.wfile.getvalue().decode() + str(headers)
         self.assertNotIn(TEST_HELPER_TOKEN, rendered)
         accounts_file.read_text.assert_not_called()
-        find_cache.assert_not_called()
+        select_identity.assert_not_called()
         generate_url.assert_not_called()
         self.assertIn(TEST_CHALLENGE, server._AUTH_CHALLENGES)
 
@@ -1510,6 +1768,7 @@ class HandlerRouteTests(unittest.TestCase):
     def test_every_supported_get_route_rejects_a_foreign_origin_first(self):
         for path in (
             "/accounts",
+            "/sso-identity",
             f"/roles?account={TEST_ACCOUNT_ID}",
             f"/generate-url?account={TEST_ACCOUNT_ID}",
         ):
@@ -1537,6 +1796,7 @@ class HandlerRouteTests(unittest.TestCase):
         for auth_case in ("missing", "malformed", "wrong"):
             for path in (
                 "/accounts",
+                "/sso-identity",
                 f"/roles?account={TEST_ACCOUNT_ID}",
                 f"/generate-url?account={TEST_ACCOUNT_ID}",
             ):
@@ -1566,7 +1826,10 @@ class HandlerRouteTests(unittest.TestCase):
                             server.ContainoodleHandler,
                             "_get_account_meta",
                         ) as get_account_meta,
-                        patch.object(server, "_find_sso_cache_file") as find_cache,
+                        patch.object(
+                            server,
+                            "_select_sso_identity",
+                        ) as select_identity,
                         patch.object(server, "generate_signin_url") as generate_url,
                     ):
                         handler.do_GET()
@@ -1578,7 +1841,7 @@ class HandlerRouteTests(unittest.TestCase):
                     )
                     accounts_file.read_text.assert_not_called()
                     get_account_meta.assert_not_called()
-                    find_cache.assert_not_called()
+                    select_identity.assert_not_called()
                     generate_url.assert_not_called()
                     self.assertNotIn(
                         server._RESPONSE_PROOF_HEADER,
@@ -1613,7 +1876,7 @@ class HandlerRouteTests(unittest.TestCase):
         ]
         self.accounts_file.write_text(json.dumps(accounts))
         handler = RecordingHandler(
-            path="/accounts?ignored=1",
+            path="/accounts",
             origin="moz-extension://synthetic-extension-id",
         )
 
@@ -1665,6 +1928,135 @@ class HandlerRouteTests(unittest.TestCase):
                 {"error": "accounts.json is invalid"},
             )
 
+    def test_sso_identity_route_returns_only_the_opaque_identity_key(self):
+        identity_key = "a" * 64
+        target = "/sso-identity?" + urllib.parse.urlencode({
+            "profile": TEST_PROFILE_ALPHA,
+        })
+        handler = RecordingHandler(path=target)
+        selection = {
+            "accessToken": TEST_ACCESS_TOKEN_ALPHA,
+            "identityKey": identity_key,
+            "cache": {
+                "startUrl": TEST_START_URL_ALPHA,
+                "region": "eu-west-1",
+            },
+        }
+
+        with patch.object(
+            server,
+            "_select_sso_identity",
+            return_value=selection,
+        ) as select_identity:
+            handler.do_GET()
+
+        self.assert_json_response(handler, 200, {
+            "ok": True,
+            "identityKey": identity_key,
+        })
+        select_identity.assert_called_once_with(TEST_PROFILE_ALPHA)
+        rendered = handler.wfile.getvalue().decode()
+        self.assertNotIn(TEST_PROFILE_ALPHA, rendered)
+        self.assertNotIn(TEST_ACCESS_TOKEN_ALPHA, rendered)
+        self.assertNotIn(TEST_START_URL_ALPHA, rendered)
+
+    def test_sso_identity_route_rejects_bad_profile_values_before_selection(self):
+        cases = (
+            ("profile=", "Invalid AWS CLI profile selection"),
+            ("profile=alpha&profile=beta", "Invalid request parameters"),
+            ("profile=%0A", "Invalid AWS CLI profile selection"),
+        )
+        for query, public_message in cases:
+            with self.subTest(query=query):
+                handler = RecordingHandler(path=f"/sso-identity?{query}")
+                with patch.object(
+                    server,
+                    "_select_sso_identity",
+                ) as select_identity:
+                    handler.do_GET()
+
+                self.assert_json_response(
+                    handler,
+                    400,
+                    {"error": public_message},
+                )
+                select_identity.assert_not_called()
+
+    def test_routes_reject_unknown_or_duplicate_parameters_before_route_work(self):
+        cases = (
+            "/accounts?profile=__CONTAINOODLE_TEST_PROFILE__",
+            "/sso-identity?unknown=__CONTAINOODLE_TEST_VALUE__",
+            (
+                f"/roles?account={TEST_ACCOUNT_ID}"
+                f"&account={TEST_OTHER_ACCOUNT_ID}"
+            ),
+            (
+                f"/generate-url?account={TEST_ACCOUNT_ID}"
+                f"&role={TEST_ROLE_ALPHA}&role={TEST_ROLE_BETA}"
+            ),
+        )
+        for path in cases:
+            with self.subTest(path=path):
+                handler = RecordingHandler(path=path)
+                with (
+                    patch.object(server, "ACCOUNTS_FILE") as accounts_file,
+                    patch.object(
+                        server.ContainoodleHandler,
+                        "_get_account_meta",
+                    ) as get_account_meta,
+                    patch.object(
+                        server,
+                        "_select_sso_identity",
+                    ) as select_identity,
+                    patch.object(server, "generate_signin_url") as generate_url,
+                ):
+                    handler.do_GET()
+
+                self.assert_json_response(
+                    handler,
+                    400,
+                    {"error": "Invalid request parameters"},
+                )
+                accounts_file.read_text.assert_not_called()
+                get_account_meta.assert_not_called()
+                select_identity.assert_not_called()
+                generate_url.assert_not_called()
+
+    def test_sso_identity_route_returns_sanitized_selection_failures(self):
+        cases = (
+            (
+                server.SsoSelectionError(
+                    "Multiple AWS SSO logins were found. Choose an AWS CLI profile."
+                ),
+                409,
+                "Multiple AWS SSO logins were found. Choose an AWS CLI profile.",
+            ),
+            (
+                TypeError("__CONTAINOODLE_TEST_PRIVATE_FAILURE__"),
+                500,
+                "Unexpected error selecting AWS SSO login",
+            ),
+        )
+        for error, status, public_message in cases:
+            with self.subTest(error=type(error).__name__):
+                handler = RecordingHandler(path="/sso-identity")
+                with patch.object(
+                    server,
+                    "_select_sso_identity",
+                    side_effect=error,
+                ):
+                    handler.do_GET()
+
+                self.assert_json_response(
+                    handler,
+                    status,
+                    {"error": public_message},
+                )
+                self.assertNotIn(
+                    "__CONTAINOODLE_TEST_PRIVATE_FAILURE__",
+                    handler.wfile.getvalue().decode(),
+                )
+
     def test_roles_route_rejects_missing_or_invalid_account_ids(self):
         for path in (
             "/roles",
@@ -1712,7 +2104,7 @@ class HandlerRouteTests(unittest.TestCase):
                         "region": "invalid-region",
                     },
                 ),
-                patch.object(server, "_find_sso_cache_file") as find_cache,
+                patch.object(server, "_select_sso_identity") as select_identity,
             ):
                 handler.do_GET()
             self.assert_json_response(
@@ -1720,12 +2112,12 @@ class HandlerRouteTests(unittest.TestCase):
                 400,
                 {"error": "Invalid region in account config"},
             )
-            find_cache.assert_not_called()
+            select_identity.assert_not_called()
 
     def test_roles_route_lists_roles_with_account_or_default_region(self):
-        cache = {
-            "accessToken": "synthetic-access-token",
-            "expiresAt": "2030-01-01T00:00:00Z",
+        selection = {
+            "accessToken": TEST_ACCESS_TOKEN_ALPHA,
+            "identityKey": "a" * 64,
         }
         cases = (
             (
@@ -1745,8 +2137,15 @@ class HandlerRouteTests(unittest.TestCase):
                         return_value=account_meta,
                     ),
                     patch.object(server, "DEFAULT_REGION", "ap-southeast-2"),
-                    patch.object(server, "_find_sso_cache_file", return_value=cache),
-                    patch.object(server, "_check_token_expiry") as check_expiry,
+                    patch.object(
+                        server,
+                        "_select_sso_identity",
+                        return_value=selection,
+                    ) as select_identity,
+                    patch.object(
+                        server,
+                        "_verify_sso_identity",
+                    ) as verify_identity,
                     patch.object(
                         server,
                         "_list_account_roles",
@@ -1759,12 +2158,133 @@ class HandlerRouteTests(unittest.TestCase):
                     "ok": True,
                     "roles": [TEST_ROLE_ALPHA, TEST_ROLE_BETA],
                 })
-                check_expiry.assert_called_once_with(cache)
+                select_identity.assert_called_once_with(None)
+                verify_identity.assert_called_once_with(selection, None)
                 list_roles.assert_called_once_with(
-                    "synthetic-access-token",
+                    TEST_ACCESS_TOKEN_ALPHA,
                     TEST_ACCOUNT_ID,
                     expected_region,
                 )
+
+    def test_roles_route_binds_profile_and_expected_identity_before_aws_work(self):
+        identity_key = "a" * 64
+        target = "/roles?" + urllib.parse.urlencode({
+            "account": TEST_ACCOUNT_ID,
+            "profile": TEST_PROFILE_ALPHA,
+            "identity": identity_key,
+        })
+        selection = {
+            "accessToken": TEST_ACCESS_TOKEN_ALPHA,
+            "identityKey": identity_key,
+        }
+        handler = RecordingHandler(path=target)
+        with (
+            patch.object(
+                server.ContainoodleHandler,
+                "_get_account_meta",
+                return_value={"accountId": TEST_ACCOUNT_ID},
+            ),
+            patch.object(
+                server,
+                "_select_sso_identity",
+                return_value=selection,
+            ) as select_identity,
+            patch.object(
+                server,
+                "_verify_sso_identity",
+                wraps=server._verify_sso_identity,
+            ) as verify_identity,
+            patch.object(
+                server,
+                "_list_account_roles",
+                return_value=[TEST_ROLE_ALPHA],
+            ) as list_roles,
+        ):
+            handler.do_GET()
+
+        self.assert_json_response(handler, 200, {
+            "ok": True,
+            "roles": [TEST_ROLE_ALPHA],
+        })
+        select_identity.assert_called_once_with(TEST_PROFILE_ALPHA)
+        verify_identity.assert_called_once_with(selection, identity_key)
+        list_roles.assert_called_once_with(
+            TEST_ACCESS_TOKEN_ALPHA,
+            TEST_ACCOUNT_ID,
+            server.DEFAULT_REGION,
+        )
+
+    def test_roles_route_stops_before_aws_work_when_identity_changed(self):
+        expected_identity = "a" * 64
+        selection = {
+            "accessToken": TEST_ACCESS_TOKEN_ALPHA,
+            "identityKey": "b" * 64,
+        }
+        target = "/roles?" + urllib.parse.urlencode({
+            "account": TEST_ACCOUNT_ID,
+            "identity": expected_identity,
+        })
+        handler = RecordingHandler(path=target)
+        with (
+            patch.object(
+                server.ContainoodleHandler,
+                "_get_account_meta",
+                return_value={"accountId": TEST_ACCOUNT_ID},
+            ),
+            patch.object(
+                server,
+                "_select_sso_identity",
+                return_value=selection,
+            ),
+            patch.object(server, "_list_account_roles") as list_roles,
+        ):
+            handler.do_GET()
+
+        self.assert_json_response(handler, 409, {
+            "error": (
+                "The AWS SSO login changed. Refresh the selected identity "
+                "and try again."
+            ),
+        })
+        list_roles.assert_not_called()
+
+    def test_roles_route_rejects_malformed_selectors_before_account_or_aws_work(self):
+        cases = (
+            (
+                f"/roles?account={TEST_ACCOUNT_ID}&profile=",
+                "Invalid AWS SSO selection",
+            ),
+            (
+                f"/roles?account={TEST_ACCOUNT_ID}&identity=not-an-identity",
+                "Invalid AWS SSO selection",
+            ),
+            ((
+                f"/roles?account={TEST_ACCOUNT_ID}"
+                f"&profile={TEST_PROFILE_ALPHA}&profile={TEST_PROFILE_BETA}"
+            ), "Invalid request parameters"),
+        )
+        for path, public_message in cases:
+            with self.subTest(path=path):
+                handler = RecordingHandler(path=path)
+                with (
+                    patch.object(
+                        server.ContainoodleHandler,
+                        "_get_account_meta",
+                    ) as get_account_meta,
+                    patch.object(
+                        server,
+                        "_select_sso_identity",
+                    ) as select_identity,
+                ):
+                    handler.do_GET()
+
+                self.assert_json_response(
+                    handler,
+                    400,
+                    {"error": public_message},
+                )
+                get_account_meta.assert_not_called()
+                select_identity.assert_not_called()
 
     def test_roles_route_sanitizes_expected_and_unexpected_failures(self):
         cases = (
@@ -1786,7 +2306,7 @@ class HandlerRouteTests(unittest.TestCase):
                         "_get_account_meta",
                         return_value={"accountId": TEST_ACCOUNT_ID},
                     ),
-                    patch.object(server, "_find_sso_cache_file", side_effect=error),
+                    patch.object(server, "_select_sso_identity", side_effect=error),
                 ):
                     handler.do_GET()
 
@@ -1930,6 +2450,8 @@ class HandlerRouteTests(unittest.TestCase):
                     TEST_ACCOUNT_ID,
                     case["expected_role"],
                     case["expected_region"],
+                    None,
+                    None,
                 )
                 build_container.assert_called_once_with(
                     case["expected_name"],
@@ -1940,6 +2462,82 @@ class HandlerRouteTests(unittest.TestCase):
                     "containerUrl": "ext+container:synthetic",
                     "account": case["expected_name"],
                 })
+
+    def test_generate_url_route_forwards_profile_and_expected_identity(self):
+        identity_key = "a" * 64
+        target = "/generate-url?" + urllib.parse.urlencode({
+            "account": TEST_ACCOUNT_ID,
+            "role": TEST_ROLE_QUERY,
+            "profile": TEST_PROFILE_ALPHA,
+            "identity": identity_key,
+        })
+        handler = RecordingHandler(path=target)
+        with (
+            patch.object(
+                server.ContainoodleHandler,
+                "_get_account_meta",
+                return_value={
+                    "accountId": TEST_ACCOUNT_ID,
+                    "accountName": "__CONTAINOODLE_TEST_ACCOUNT_NAME__",
+                    "region": "eu-west-1",
+                },
+            ),
+            patch.object(
+                server,
+                "generate_signin_url",
+                return_value="https://signin.aws.amazon.com/synthetic-login",
+            ) as generate_url,
+            patch.object(
+                server,
+                "_build_container_url",
+                return_value="ext+container:synthetic",
+            ),
+        ):
+            handler.do_GET()
+
+        generate_url.assert_called_once_with(
+            TEST_ACCOUNT_ID,
+            TEST_ROLE_QUERY,
+            "eu-west-1",
+            TEST_PROFILE_ALPHA,
+            identity_key,
+        )
+        self.assert_json_response(handler, 200, {
+            "ok": True,
+            "containerUrl": "ext+container:synthetic",
+            "account": "__CONTAINOODLE_TEST_ACCOUNT_NAME__",
+        })
+
+    def test_generate_url_route_returns_actionable_selection_failure(self):
+        handler = RecordingHandler(
+            path=f"/generate-url?account={TEST_ACCOUNT_ID}",
+        )
+        public_message = (
+            "Multiple AWS SSO logins were found. Choose an AWS CLI profile."
+        )
+        with (
+            patch.object(
+                server.ContainoodleHandler,
+                "_get_account_meta",
+                return_value={
+                    "accountId": TEST_ACCOUNT_ID,
+                    "role": TEST_ROLE_ALPHA,
+                    "region": "eu-west-1",
+                },
+            ),
+            patch.object(
+                server,
+                "generate_signin_url",
+                side_effect=server.SsoSelectionError(public_message),
+            ),
+        ):
+            handler.do_GET()
+
+        self.assert_json_response(
+            handler,
+            409,
+            {"error": public_message},
+        )
 
     def test_generate_url_route_sanitizes_expected_and_unexpected_failures(self):
         cases = (

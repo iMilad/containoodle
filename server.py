@@ -8,6 +8,7 @@ Binds to 127.0.0.1 only. Never logs session URLs to disk.
 
 import argparse
 import base64
+import configparser
 import hashlib
 import hmac
 import http.server
@@ -31,6 +32,9 @@ HOST = "127.0.0.1"
 DEFAULT_ROLE = os.environ.get("CONTAINOODLE_DEFAULT_ROLE", "AdministratorAccess")
 DEFAULT_REGION = "eu-west-1"
 ACCOUNTS_FILE = Path.home() / ".aws" / "accounts.json"
+AWS_CONFIG_FILE = Path(
+    os.environ.get("AWS_CONFIG_FILE", Path.home() / ".aws" / "config")
+).expanduser()
 SSO_CACHE_DIR = Path.home() / ".aws" / "sso" / "cache"
 HELPER_TOKEN_FILE = Path(
     os.environ.get(
@@ -42,10 +46,11 @@ HELPER_TOKEN = None
 
 import re
 _ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
-_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d$")
+_REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
 _ROLE_RE = re.compile(r"^[\w+=,.@-]{1,64}$")
 _HELPER_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _HELPER_PROOF_RE = re.compile(r"^[0-9a-f]{64}$")
+_IDENTITY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 _EXTENSION_ORIGIN_RE = re.compile(r"^moz-extension://[A-Za-z0-9._-]+$")
 
 _AUTH_CHALLENGE_PATH = "/auth/challenge"
@@ -59,6 +64,13 @@ _REQUEST_PROOF_HEADER = "X-Containoodle-Request-Proof"
 _RESPONSE_PROOF_HEADER = "X-Containoodle-Response-Proof"
 _INVALID_CHALLENGE = "A" * 43
 _INVALID_PROOF = "0" * 64
+
+_ROUTE_QUERY_KEYS = {
+    "/accounts": set(),
+    "/sso-identity": {"profile"},
+    "/roles": {"account", "identity", "profile"},
+    "/generate-url": {"account", "identity", "profile", "role"},
+}
 
 
 # ─── Helper authentication ──────────────────────────────────────────────────
@@ -371,44 +383,304 @@ def _consume_auth_challenge(
 
 # ─── SSO helpers ─────────────────────────────────────────────────────────────
 
-def _find_sso_cache_file() -> dict:
-    """Find the SSO cache JSON data containing an accessToken (most recent)."""
-    candidates = []
-    for path in SSO_CACHE_DIR.glob("*.json"):
-        try:
-            data = json.loads(path.read_text())
-            if "accessToken" in data:
-                candidates.append((path.stat().st_mtime, data))
-        except (json.JSONDecodeError, OSError):
-            continue
-    if not candidates:
-        raise RuntimeError(
-            "No SSO cache file found. Run: aws sso login"
+class SsoSelectionError(RuntimeError):
+    """An expected, sanitized SSO-selection failure safe for API clients."""
+
+    def __init__(self, public_message: str, status: int = 409):
+        super().__init__(public_message)
+        self.public_message = public_message
+        self.status = status
+
+
+def _nonblank_string(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_profile_name(profile: str) -> str:
+    """Accept a bounded CLI profile alias without allowing control characters."""
+    if (
+        not _nonblank_string(profile)
+        or profile != profile.strip()
+        or len(profile) > 128
+        or any(
+            ord(character) < 32 or 127 <= ord(character) <= 159
+            for character in profile
         )
-    candidates.sort(key=lambda c: c[0], reverse=True)
-    return candidates[0][1]
+    ):
+        raise ValueError("Invalid AWS CLI profile selection")
+    return profile
+
+
+def _load_aws_config() -> configparser.RawConfigParser:
+    """Read the AWS shared config without interpolation or implicit defaults."""
+    parser = configparser.RawConfigParser(
+        default_section="__CONTAINOODLE_UNUSED_DEFAULT__",
+        interpolation=None,
+        strict=True,
+    )
+    try:
+        with AWS_CONFIG_FILE.open(encoding="utf-8") as config_file:
+            parser.read_file(config_file)
+    except (OSError, UnicodeError, configparser.Error) as error:
+        raise SsoSelectionError(
+            "AWS CLI configuration is unavailable or invalid."
+        ) from error
+    return parser
+
+
+def _required_config_value(
+    parser: configparser.RawConfigParser,
+    section: str,
+    option: str,
+) -> str:
+    if not parser.has_section(section):
+        raise SsoSelectionError(
+            "The selected AWS CLI profile is not configured for SSO."
+        )
+    value = parser.get(section, option, raw=True, fallback=None)
+    if not _nonblank_string(value):
+        raise SsoSelectionError(
+            "The selected AWS CLI profile is not configured for SSO."
+        )
+    return value.strip()
+
+
+def _resolve_sso_profile(profile: str) -> dict:
+    """Resolve a CLI profile to its exact modern or legacy cache namespace."""
+    profile = _validate_profile_name(profile)
+    parser = _load_aws_config()
+    profile_section = "default" if profile == "default" else f"profile {profile}"
+    if not parser.has_section(profile_section):
+        raise SsoSelectionError(
+            "The selected AWS CLI profile is not configured for SSO."
+        )
+
+    session_name = parser.get(
+        profile_section,
+        "sso_session",
+        raw=True,
+        fallback=None,
+    )
+    if session_name is not None:
+        if not _nonblank_string(session_name):
+            raise SsoSelectionError(
+                "The selected AWS CLI profile is not configured for SSO."
+            )
+        session_name = session_name.strip()
+        session_section = f"sso-session {session_name}"
+        start_url = _required_config_value(
+            parser,
+            session_section,
+            "sso_start_url",
+        )
+        region = _required_config_value(parser, session_section, "sso_region")
+        return {
+            "cacheNamespace": session_name,
+            "identityNamespace": session_name,
+            "startUrl": start_url,
+            "region": region,
+        }
+
+    start_url = _required_config_value(parser, profile_section, "sso_start_url")
+    region = _required_config_value(parser, profile_section, "sso_region")
+    return {
+        "cacheNamespace": start_url,
+        "identityNamespace": start_url,
+        "startUrl": start_url,
+        "region": region,
+    }
 
 
 def _check_token_expiry(cache_data: dict) -> None:
     """Raise if the SSO token has expired or will within 5 minutes."""
     expires_str = cache_data.get("expiresAt", "")
-    if not expires_str:
+    if not _canonical_cache_string(expires_str):
         raise RuntimeError("SSO cache has no expiresAt field")
     # Handle both formats: with and without trailing Z
-    expires_str = expires_str.replace("Z", "+00:00")
-    expires_at = datetime.fromisoformat(expires_str)
+    if expires_str.endswith("Z"):
+        expires_str = f"{expires_str[:-1]}+00:00"
+    try:
+        expires_at = datetime.fromisoformat(expires_str)
+    except ValueError as error:
+        raise RuntimeError("SSO cache has an invalid expiresAt field") from error
+    if expires_at.tzinfo is None:
+        raise RuntimeError("SSO cache has an invalid expiresAt field")
     now = datetime.now(timezone.utc)
 
-    if expires_at < now:
+    if expires_at <= now:
         raise RuntimeError(
             "SSO token expired. Run: aws sso login"
         )
 
     # Do not move, delete, or otherwise mutate the user's AWS CLI cache.
     # A fresh interactive login is the reliable way to renew the SSO token.
-    if expires_at < now + timedelta(minutes=5):
+    if expires_at <= now + timedelta(minutes=5):
         raise RuntimeError(
             "SSO token expires within 5 minutes. Run: aws sso login"
+        )
+
+
+def _canonical_cache_string(value) -> bool:
+    """Accept only nonempty printable ASCII without surrounding whitespace."""
+    return bool(
+        isinstance(value, str)
+        and value
+        and value == value.strip()
+        and value.isascii()
+        and all(32 < ord(character) < 127 for character in value)
+    )
+
+
+def _valid_sso_start_url(value) -> bool:
+    if not _canonical_cache_string(value):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and parsed.hostname
+        and not parsed.username
+        and not parsed.password
+        and not parsed.fragment
+    )
+
+
+def _validate_sso_cache(
+    cache_data,
+    *,
+    expected_start_url: str | None = None,
+    expected_region: str | None = None,
+) -> tuple[str, str, str]:
+    """Validate one usable cached token and its identity metadata."""
+    if not isinstance(cache_data, dict):
+        raise RuntimeError("SSO cache entry is invalid")
+    access_token = cache_data.get("accessToken")
+    start_url = cache_data.get("startUrl")
+    region = cache_data.get("region")
+    if not _canonical_cache_string(access_token):
+        raise RuntimeError("SSO cache entry has no usable access token")
+    if not _valid_sso_start_url(start_url) or not (
+        _canonical_cache_string(region) and _REGION_RE.fullmatch(region)
+    ):
+        raise RuntimeError("SSO cache entry has invalid identity metadata")
+    if expected_start_url is not None and start_url != expected_start_url:
+        raise RuntimeError("SSO cache entry does not match the selected profile")
+    if expected_region is not None and region != expected_region:
+        raise RuntimeError("SSO cache entry does not match the selected profile")
+    _check_token_expiry(cache_data)
+    return access_token, start_url, region
+
+
+def _sso_identity_key(namespace: str, access_token: str) -> str:
+    """Create a helper-local opaque identity binding without exposing metadata."""
+    return _hmac_hex(
+        "containoodle-sso-identity-v1",
+        namespace,
+        access_token,
+    )
+
+
+def _select_profile_sso_identity(profile: str) -> dict:
+    resolved = _resolve_sso_profile(profile)
+    cache_key = hashlib.sha1(
+        resolved["cacheNamespace"].encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()
+    cache_path = SSO_CACHE_DIR / f"{cache_key}.json"
+    try:
+        cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise SsoSelectionError(
+            "The selected AWS SSO login is unavailable. "
+            "Run aws sso login for the selected profile."
+        ) from error
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SsoSelectionError(
+            "The selected AWS SSO login is invalid. "
+            "Run aws sso login for the selected profile."
+        ) from error
+
+    try:
+        access_token, _, _ = _validate_sso_cache(
+            cache_data,
+            expected_start_url=resolved["startUrl"],
+            expected_region=resolved["region"],
+        )
+    except (RuntimeError, TypeError) as error:
+        raise SsoSelectionError(
+            "The selected AWS SSO login is invalid or expiring soon. "
+            "Run aws sso login for the selected profile."
+        ) from error
+    return {
+        "cache": cache_data,
+        "accessToken": access_token,
+        "identityKey": _sso_identity_key(
+            resolved["identityNamespace"],
+            access_token,
+        ),
+    }
+
+
+def _select_automatic_sso_identity() -> dict:
+    """Select only when exactly one distinct usable cached token exists."""
+    candidates = {}
+    try:
+        cache_paths = list(SSO_CACHE_DIR.glob("*.json"))
+    except OSError:
+        cache_paths = []
+
+    for cache_path in cache_paths:
+        try:
+            cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
+            access_token, start_url, region = _validate_sso_cache(cache_data)
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            RuntimeError,
+            TypeError,
+        ):
+            continue
+        identity = (access_token, start_url, region)
+        candidates.setdefault(identity, cache_data)
+
+    if not candidates:
+        raise SsoSelectionError(
+            "No usable AWS SSO login was found. Run aws sso login."
+        )
+    if len(candidates) != 1:
+        raise SsoSelectionError(
+            "Multiple AWS SSO logins were found. Choose an AWS CLI profile."
+        )
+
+    (access_token, start_url, _), cache_data = next(iter(candidates.items()))
+    return {
+        "cache": cache_data,
+        "accessToken": access_token,
+        "identityKey": _sso_identity_key(
+            start_url,
+            access_token,
+        ),
+    }
+
+
+def _select_sso_identity(profile: str | None = None) -> dict:
+    """Select one usable SSO identity deterministically and fail closed."""
+    if profile is None:
+        return _select_automatic_sso_identity()
+    return _select_profile_sso_identity(profile)
+
+
+def _verify_sso_identity(selection: dict, expected_identity: str | None) -> None:
+    if expected_identity is None:
+        return
+    if not _IDENTITY_KEY_RE.fullmatch(expected_identity):
+        raise ValueError("Invalid AWS SSO identity selection")
+    if not hmac.compare_digest(selection["identityKey"], expected_identity):
+        raise SsoSelectionError(
+            "The AWS SSO login changed. Refresh the selected identity and try again."
         )
 
 
@@ -484,13 +756,22 @@ def _build_signin_url(session_creds: dict, region: str) -> str:
     return login_url
 
 
-def generate_signin_url(account_id: str, role: str = DEFAULT_ROLE,
-                        region: str = DEFAULT_REGION) -> str:
+def generate_signin_url(
+    account_id: str,
+    role: str = DEFAULT_ROLE,
+    region: str = DEFAULT_REGION,
+    profile: str | None = None,
+    expected_identity: str | None = None,
+) -> str:
     """Full pipeline: cache → expiry check → credentials → sign-in URL."""
-    cache_data = _find_sso_cache_file()
-    _check_token_expiry(cache_data)
-    access_token = cache_data["accessToken"]
-    creds = _get_role_credentials(access_token, account_id, role, region)
+    selection = _select_sso_identity(profile)
+    _verify_sso_identity(selection, expected_identity)
+    creds = _get_role_credentials(
+        selection["accessToken"],
+        account_id,
+        role,
+        region,
+    )
     url = _build_signin_url(creds, region)
     return url
 
@@ -504,6 +785,25 @@ def _build_container_url(container_name: str, signin_url: str) -> str:
         f"ext+container:name={urllib.parse.quote(container_name)}"
         f"&url={urllib.parse.quote(signin_url, safe='')}"
     )
+
+
+def _optional_query_value(query: dict, name: str) -> str | None:
+    values = query.get(name)
+    if values is None:
+        return None
+    if len(values) != 1 or not values[0]:
+        raise ValueError(f"Invalid {name} selection")
+    return values[0]
+
+
+def _sso_query_values(query: dict) -> tuple[str | None, str | None]:
+    profile = _optional_query_value(query, "profile")
+    identity = _optional_query_value(query, "identity")
+    if profile is not None:
+        _validate_profile_name(profile)
+    if identity is not None and not _IDENTITY_KEY_RE.fullmatch(identity):
+        raise ValueError("Invalid AWS SSO identity selection")
+    return profile, identity
 
 
 # ─── HTTP server ──────────────────────────────────────────────────────────────
@@ -693,7 +993,12 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
             return
         path = parsed.path
 
-        protected_route = path in {"/accounts", "/roles", "/generate-url"}
+        protected_route = path in {
+            "/accounts",
+            "/sso-identity",
+            "/roles",
+            "/generate-url",
+        }
         challenge_route = path == _AUTH_CHALLENGE_PATH and not parsed.query
         if not (protected_route or challenge_route):
             self.send_error(404)
@@ -717,7 +1022,14 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
 
         # Query parsing and all filesystem/AWS work happen only after a valid
         # proof has been atomically consumed.
-        qs = urllib.parse.parse_qs(parsed.query)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        allowed_query_keys = _ROUTE_QUERY_KEYS[path]
+        if any(
+            key not in allowed_query_keys or len(values) != 1
+            for key, values in qs.items()
+        ):
+            self._send_json({"error": "Invalid request parameters"}, 400)
+            return
 
         # ── /accounts → return accounts list ──
         if path == "/accounts":
@@ -730,8 +1042,40 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "accounts.json is invalid"}, 500)
             return
 
+        # ── /sso-identity[?profile=...] → opaque selected identity key ──
+        if path == "/sso-identity":
+            try:
+                profile = _optional_query_value(qs, "profile")
+                if profile is not None:
+                    _validate_profile_name(profile)
+                selection = _select_sso_identity(profile)
+                identity_key = selection.get("identityKey")
+                if not isinstance(identity_key, str) or not _IDENTITY_KEY_RE.fullmatch(
+                    identity_key
+                ):
+                    raise RuntimeError("Invalid internal SSO identity")
+            except ValueError:
+                self._send_json({"error": "Invalid AWS CLI profile selection"}, 400)
+                return
+            except SsoSelectionError as error:
+                self._send_json({"error": error.public_message}, error.status)
+                return
+            except Exception:
+                self._send_json({"error": "Unexpected error selecting AWS SSO login"}, 500)
+                return
+            self._send_json({
+                "ok": True,
+                "identityKey": identity_key,
+            })
+            return
+
         # ── /roles?account=... → list SSO roles available on the account ──
         if path == "/roles":
+            try:
+                profile, expected_identity = _sso_query_values(qs)
+            except ValueError:
+                self._send_json({"error": "Invalid AWS SSO selection"}, 400)
+                return
             account_id = qs.get("account", [None])[0]
             if not account_id or not _ACCOUNT_ID_RE.match(account_id):
                 self._send_json({"error": "Invalid or missing account ID (expected 12-digit number)"}, 400)
@@ -745,9 +1089,16 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "Invalid region in account config"}, 400)
                 return
             try:
-                cache_data = _find_sso_cache_file()
-                _check_token_expiry(cache_data)
-                roles = _list_account_roles(cache_data["accessToken"], account_id, region)
+                selection = _select_sso_identity(profile)
+                _verify_sso_identity(selection, expected_identity)
+                roles = _list_account_roles(
+                    selection["accessToken"],
+                    account_id,
+                    region,
+                )
+            except SsoSelectionError as error:
+                self._send_json({"error": error.public_message}, error.status)
+                return
             except RuntimeError:
                 self._send_json({"error": "Failed to list roles. Is your SSO token valid?"}, 500)
                 return
@@ -759,6 +1110,11 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
 
         # ── /generate-url?account=...[&role=...] → return container URL ──
         if path == "/generate-url":
+            try:
+                profile, expected_identity = _sso_query_values(qs)
+            except ValueError:
+                self._send_json({"error": "Invalid AWS SSO selection"}, 400)
+                return
             account_id = qs.get("account", [None])[0]
             if not account_id or not _ACCOUNT_ID_RE.match(account_id):
                 self._send_json({"error": "Invalid or missing account ID (expected 12-digit number)"}, 400)
@@ -783,7 +1139,16 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             try:
-                signin_url = generate_signin_url(account_id, role, region)
+                signin_url = generate_signin_url(
+                    account_id,
+                    role,
+                    region,
+                    profile,
+                    expected_identity,
+                )
+            except SsoSelectionError as error:
+                self._send_json({"error": error.public_message}, error.status)
+                return
             except RuntimeError:
                 self._send_json({"error": "Failed to generate session. Is your SSO token valid?"}, 500)
                 return

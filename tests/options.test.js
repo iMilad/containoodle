@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { BACKEND_AUTH_TOKEN_KEY } from "../firefox-extension/shared/backend.js";
+import {
+  BACKEND_AUTH_TOKEN_KEY,
+  BACKEND_SSO_IDENTITY_KEY,
+  BACKEND_SSO_PROFILE_KEY,
+} from "../firefox-extension/shared/backend.js";
 
 const OPTIONS_MODULE = new URL(
   "../firefox-extension/options/options.js",
@@ -15,6 +19,9 @@ const BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY =
 const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
 const SYNTHETIC_HELPER_TOKEN = `__CONTAINOODLE_TEST_${"0".repeat(23)}`;
 const REPLACEMENT_SYNTHETIC_HELPER_TOKEN = `__CONTAINOODLE_TEST_${"4".repeat(23)}`;
+const SYNTHETIC_PROFILE = "__CONTAINOODLE_TEST_PROFILE__";
+const SYNTHETIC_IDENTITY_KEY = "0".repeat(64);
+const PREVIOUS_SYNTHETIC_IDENTITY_KEY = "4".repeat(64);
 
 function decodeBase64Url(value) {
   const base64 = value.replace(/-/g, "+").replace(/_/g, "/") + "=";
@@ -134,6 +141,7 @@ function createDocument() {
     "backend-url",
     "backend-token",
     "backend-token-status",
+    "backend-sso-profile",
     "backend-save",
     "backend-refresh",
     "backend-status",
@@ -172,6 +180,7 @@ function createDocument() {
   backendPanel.controls = [
     "backend-url",
     "backend-token",
+    "backend-sso-profile",
     "backend-save",
     "backend-refresh",
     "console-grant",
@@ -215,6 +224,7 @@ function createFixture({
   const permissionRemovals = [];
   const runtimeMessages = [];
   const fetchCalls = [];
+  const storageSetCalls = [];
   const onAdded = createEvent();
   const onRemoved = createEvent();
   const cookiesChanged = createEvent();
@@ -232,6 +242,8 @@ function createFixture({
       ...config,
     },
     [BACKEND_AUTH_TOKEN_KEY]: SYNTHETIC_HELPER_TOKEN,
+    [BACKEND_SSO_PROFILE_KEY]: "",
+    [BACKEND_SSO_IDENTITY_KEY]: PREVIOUS_SYNTHETIC_IDENTITY_KEY,
     [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: true,
     ...storage,
   };
@@ -248,6 +260,11 @@ function createFixture({
   let resetGroupTitlesResult = { ok: true };
   let backendFetchStatus = 200;
   let backendFetchPayload = [];
+  let backendIdentityStatus = 200;
+  let backendIdentityPayload = {
+    ok: true,
+    identityKey: SYNTHETIC_IDENTITY_KEY,
+  };
   let backendFetchError = null;
   let backendAuthFailure = null;
   let challengeSequence = 0;
@@ -303,6 +320,7 @@ function createFixture({
             failNextConfigWrite = false;
             throw new Error("simulated config write failure");
           }
+          storageSetCalls.push(structuredClone(values));
           Object.assign(storageData, values);
         },
         async remove(keys) {
@@ -389,7 +407,14 @@ function createFixture({
       });
     }
     if (!deferBackendFetch) {
-      const body = JSON.stringify(structuredClone(backendFetchPayload));
+      const isIdentityRequest = requestUrl.pathname === "/sso-identity";
+      const responseStatus = isIdentityRequest
+        ? backendIdentityStatus
+        : backendFetchStatus;
+      const responsePayload = isIdentityRequest
+        ? backendIdentityPayload
+        : backendFetchPayload;
+      const body = JSON.stringify(structuredClone(responsePayload));
       const challenge = new Headers(options.headers).get(
         "X-Containoodle-Challenge",
       );
@@ -397,7 +422,7 @@ function createFixture({
       const canonical = [
         "containoodle-response-v1",
         challenge,
-        String(backendFetchStatus),
+        String(responseStatus),
         target,
         await sha256Hex(body),
         requestUrl.host,
@@ -407,7 +432,7 @@ function createFixture({
         ? "0".repeat(64)
         : await hmacHex(helperToken, canonical);
       return new Response(body, {
-        status: backendFetchStatus,
+        status: responseStatus,
         headers: {
           "Content-Type": "application/json",
           "X-Containoodle-Response-Proof": responseProof,
@@ -451,6 +476,7 @@ function createFixture({
     runtimeMessages,
     fetch,
     fetchCalls,
+    storageSetCalls,
     fakeWindow,
     cookiesChanged,
     storageChanged,
@@ -489,6 +515,10 @@ function createFixture({
     setBackendFetchResponse(status, payload = []) {
       backendFetchStatus = status;
       backendFetchPayload = payload;
+    },
+    setBackendIdentityResponse(status, payload) {
+      backendIdentityStatus = status;
+      backendIdentityPayload = structuredClone(payload);
     },
     setBackendFetchError(error) {
       backendFetchError = error;
@@ -702,12 +732,19 @@ test("backend save tests a replacement token before storing URL and token", asyn
     fixture.setHelperToken(REPLACEMENT_SYNTHETIC_HELPER_TOKEN);
     fixture.elements.get("backend-url").value = nextUrl;
     fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
+    fixture.elements.get("backend-sso-profile").value = `  ${SYNTHETIC_PROFILE}  `;
     await fixture.elements.get("backend-save").dispatch("click");
     await waitForBackendRequest(fixture);
 
-    assert.equal(fixture.fetchCalls.length, 2);
-    const [protectedCall] = protectedFetchCalls(fixture);
-    assert.equal(protectedCall.url, `${nextUrl}/accounts`);
+    assert.equal(fixture.fetchCalls.length, 4);
+    const protectedCalls = protectedFetchCalls(fixture);
+    assert.deepEqual(
+      protectedCalls.map((call) => call.url),
+      [
+        `${nextUrl}/sso-identity?profile=${SYNTHETIC_PROFILE}`,
+        `${nextUrl}/accounts`,
+      ],
+    );
     for (const call of fixture.fetchCalls) {
       assertNoRawHelperToken(
         call,
@@ -721,7 +758,36 @@ test("backend save tests a replacement token before storing URL and token", asyn
       fixture.storageData[BACKEND_AUTH_TOKEN_KEY],
       REPLACEMENT_SYNTHETIC_HELPER_TOKEN,
     );
+    assert.equal(
+      fixture.storageData[BACKEND_SSO_PROFILE_KEY],
+      SYNTHETIC_PROFILE,
+    );
+    assert.equal(
+      fixture.storageData[BACKEND_SSO_IDENTITY_KEY],
+      SYNTHETIC_IDENTITY_KEY,
+    );
+    const [connectionWrite] = fixture.storageSetCalls.filter(
+      (values) => Object.hasOwn(values, BACKEND_SSO_IDENTITY_KEY),
+    );
+    assert.ok(connectionWrite);
+    assert.deepEqual(
+      Object.keys(connectionWrite).sort(),
+      [
+        BACKEND_AUTH_TOKEN_KEY,
+        BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY,
+        BACKEND_SSO_IDENTITY_KEY,
+        BACKEND_SSO_PROFILE_KEY,
+        "accountsCache",
+        "accountsCacheAt",
+        "accountsCacheSource",
+        "config",
+      ].sort(),
+    );
     assert.equal(fixture.elements.get("backend-token").value, "");
+    assert.equal(
+      fixture.elements.get("backend-sso-profile").value,
+      SYNTHETIC_PROFILE,
+    );
     assert.equal(
       fixture.elements.get("backend-token").getAttribute("aria-invalid"),
       "false",
@@ -739,12 +805,222 @@ test("backend save tests a replacement token before storing URL and token", asyn
   }
 });
 
+test("backend save can explicitly replace a stored profile with automatic selection", async () => {
+  const fixture = createFixture({
+    storage: { [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE },
+  });
+  try {
+    await loadOptions(fixture);
+    assert.equal(
+      fixture.elements.get("backend-sso-profile").value,
+      SYNTHETIC_PROFILE,
+    );
+
+    fixture.elements.get("backend-sso-profile").value = "   ";
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.deepEqual(
+      protectedFetchCalls(fixture).map((call) => call.url),
+      [
+        "http://127.0.0.1:8765/sso-identity",
+        "http://127.0.0.1:8765/accounts",
+      ],
+    );
+    assert.equal(fixture.storageData[BACKEND_SSO_PROFILE_KEY], "");
+    assert.equal(
+      fixture.storageData[BACKEND_SSO_IDENTITY_KEY],
+      SYNTHETIC_IDENTITY_KEY,
+    );
+    assert.equal(fixture.elements.get("backend-sso-profile").value, "");
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend save rejects an invalid profile locally and preserves saved state", async () => {
+  const fixture = createFixture({
+    storage: { [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE },
+  });
+  const before = structuredClone(fixture.storageData);
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+    fixture.elements.get("backend-sso-profile").value = `${SYNTHETIC_PROFILE}\n`;
+    await fixture.elements.get("backend-save").dispatch("click");
+
+    assert.deepEqual(fixture.fetchCalls, []);
+    assert.deepEqual(fixture.storageData, before);
+    assert.equal(
+      fixture.elements.get("backend-sso-profile").getAttribute("aria-invalid"),
+      "true",
+    );
+    assert.match(
+      fixture.elements.get("backend-status").textContent,
+      /AWS CLI profile/,
+    );
+    assert.doesNotMatch(
+      fixture.elements.get("backend-status").textContent,
+      /__CONTAINOODLE_TEST_PROFILE__/,
+    );
+
+    await fixture.elements.get("backend-sso-profile").dispatch("input");
+    assert.equal(
+      fixture.elements.get("backend-sso-profile").getAttribute("aria-invalid"),
+      "false",
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("backend save accepts only the exact safe SSO identity payload", async () => {
+  const malformedPayloads = [
+    null,
+    [],
+    { ok: false, identityKey: SYNTHETIC_IDENTITY_KEY },
+    { ok: true, identityKey: "A".repeat(64) },
+    { ok: true, identityKey: SYNTHETIC_IDENTITY_KEY, extra: true },
+    { identityKey: SYNTHETIC_IDENTITY_KEY },
+  ];
+
+  for (const payload of malformedPayloads) {
+    const fixture = createFixture({
+      storage: {
+        [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE,
+        accountsCache: [],
+        accountsCacheAt: 1,
+        accountsCacheSource: "backend",
+      },
+    });
+    const before = structuredClone(fixture.storageData);
+    try {
+      fixture.setBackendIdentityResponse(200, payload);
+      await loadOptions(fixture);
+      fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+      await fixture.elements.get("backend-save").dispatch("click");
+      await waitForBackendRequest(fixture);
+
+      assert.deepEqual(fixture.storageData, before);
+      assert.deepEqual(
+        protectedFetchCalls(fixture).map((call) => call.url),
+        [
+          `http://127.0.0.1:8877/sso-identity?profile=${SYNTHETIC_PROFILE}`,
+        ],
+      );
+      assert.equal(
+        fixture.elements.get("backend-status").textContent,
+        "Local helper returned an unexpected response",
+      );
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
+
+test("backend save shows only a simple actionable SSO identity error", async () => {
+  const actionableError =
+    "Multiple valid SSO sessions are available; enter an AWS CLI profile";
+  const fixture = createFixture({
+    storage: { [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE },
+  });
+  const before = structuredClone(fixture.storageData);
+  fixture.setBackendIdentityResponse(409, { error: actionableError });
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.deepEqual(fixture.storageData, before);
+    assert.equal(
+      fixture.elements.get("backend-status").textContent,
+      actionableError,
+    );
+    assert.deepEqual(
+      protectedFetchCalls(fixture).map((call) => call.url),
+      [
+        `http://127.0.0.1:8877/sso-identity?profile=${SYNTHETIC_PROFILE}`,
+      ],
+    );
+  } finally {
+    cleanupGlobals();
+  }
+
+  const malformed = createFixture();
+  malformed.setBackendIdentityResponse(409, {
+    error: "synthetic line one\nsynthetic line two",
+    extra: true,
+  });
+  try {
+    await loadOptions(malformed);
+    await malformed.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(malformed);
+
+    assert.equal(
+      malformed.elements.get("backend-status").textContent,
+      "Local helper returned HTTP 409",
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("an accounts failure after identity authentication preserves every saved connection value", async () => {
+  const previousAccounts = [{
+    accountId: "000000000000",
+    accountName: "__CONTAINOODLE_TEST_ACCOUNT__",
+  }];
+  const fixture = createFixture({
+    storage: {
+      [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE,
+      accountsCache: previousAccounts,
+      accountsCacheAt: 1,
+      accountsCacheSource: "backend",
+    },
+  });
+  const before = structuredClone(fixture.storageData);
+  fixture.setBackendFetchResponse(503, { error: "__CONTAINOODLE_TEST_ERROR__" });
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+    fixture.elements.get("backend-sso-profile").value = "";
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.deepEqual(fixture.storageData, before);
+    assert.deepEqual(
+      protectedFetchCalls(fixture).map((call) => call.url),
+      [
+        "http://127.0.0.1:8877/sso-identity",
+        "http://127.0.0.1:8877/accounts",
+      ],
+    );
+    assert.equal(
+      fixture.elements.get("backend-status").textContent,
+      "Local helper returned HTTP 503",
+    );
+    assert.doesNotMatch(
+      fixture.elements.get("backend-status").textContent,
+      /__CONTAINOODLE_TEST_/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
 test("backend setup reports a stored token without copying it into the page", async () => {
-  const fixture = createFixture();
+  const fixture = createFixture({
+    storage: { [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE },
+  });
   try {
     await loadOptions(fixture);
 
     assert.equal(fixture.elements.get("backend-token").value, "");
+    assert.equal(
+      fixture.elements.get("backend-sso-profile").value,
+      SYNTHETIC_PROFILE,
+    );
     assert.equal(
       fixture.elements.get("backend-token-status").textContent,
       "A helper access token is stored",
@@ -758,7 +1034,7 @@ test("backend setup reports a stored token without copying it into the page", as
 
     await fixture.elements.get("backend-save").dispatch("click");
     await waitForBackendRequest(fixture);
-    assert.equal(protectedFetchCalls(fixture).length, 1);
+    assert.equal(protectedFetchCalls(fixture).length, 2);
     for (const call of fixture.fetchCalls) {
       assertNoRawHelperToken(call, SYNTHETIC_HELPER_TOKEN);
     }
@@ -1664,10 +1940,14 @@ test("options markup separates portal pins from backend session reuse", async ()
     backendPanel[0].indexOf('id="backend-url"') <
       backendPanel[0].indexOf('id="backend-token"') &&
       backendPanel[0].indexOf('id="backend-token"') <
+      backendPanel[0].indexOf('id="backend-sso-profile"') &&
+      backendPanel[0].indexOf('id="backend-sso-profile"') <
       backendPanel[0].indexOf('id="backend-save"'),
-    "keyboard order must be helper URL, helper token, then Save & test",
+    "keyboard order must be helper URL, helper token, profile, then Save & test",
   );
   assert.doesNotMatch(backendPanel[0], /id="backend-token"[^>]*\svalue=/);
+  assert.match(backendPanel[0], /id="backend-sso-profile"/);
+  assert.match(backendPanel[0], /placeholder="__CONTAINOODLE_TEST_PROFILE__"/);
   assert.doesNotMatch(portalPanel[0], /id="console-permissions"/);
   assert.doesNotMatch(portalPanel[0], /id="backend-token"/);
   assert.match(portalPanel[0], /id="portal-pins-status"/);

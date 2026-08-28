@@ -11,9 +11,13 @@ import { REGION_RE } from "../shared/accounts.js";
 import { validateGroupNameRule } from "../shared/group-naming.js";
 import {
   BACKEND_AUTH_TOKEN_KEY,
+  BACKEND_SSO_IDENTITY_KEY,
+  BACKEND_SSO_PROFILE_KEY,
   DEFAULT_BACKEND_URL,
   backendFetch,
   isBackendAuthenticationError,
+  normalizeBackendSsoIdentityKey,
+  normalizeBackendSsoProfile,
   normalizeBackendToken,
   normalizeBackendUrl,
   safeBackendUrl,
@@ -38,6 +42,7 @@ const el = (id) => document.getElementById(id);
 let config = { ...DEFAULT_CONFIG };
 let configSaveQueue = Promise.resolve();
 let backendRequestController = null;
+let backendSsoProfile = "";
 let backendSessionReuseAutoOfferHandled = false;
 let consolePermissionGranted = false;
 
@@ -49,6 +54,13 @@ function setStatus(id, message, ok) {
 
 function setBackendTokenInvalid(invalid) {
   el("backend-token").setAttribute("aria-invalid", String(Boolean(invalid)));
+}
+
+function setBackendSsoProfileInvalid(invalid) {
+  el("backend-sso-profile").setAttribute(
+    "aria-invalid",
+    String(Boolean(invalid)),
+  );
 }
 
 function saveConfig(patch) {
@@ -109,6 +121,10 @@ function bindMode() {
 
 function backendInputUrl() {
   return normalizeBackendUrl(el("backend-url").value);
+}
+
+function backendInputSsoProfile() {
+  return normalizeBackendSsoProfile(el("backend-sso-profile").value);
 }
 
 function formatCacheSummary({ accountsCache, accountsCacheAt }) {
@@ -199,19 +215,45 @@ function backendAccountState(accounts) {
   };
 }
 
-function commitBackendConnection(url, token, accounts) {
+async function backendIdentityErrorMessage(response) {
+  const fallback = `Local helper returned HTTP ${response.status}`;
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    return fallback;
+  }
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    Object.keys(payload).join("\n") !== "error" ||
+    typeof payload.error !== "string" ||
+    !payload.error ||
+    payload.error.length > 256 ||
+    /[\u0000-\u001f\u007f-\u009f]/u.test(payload.error)
+  ) {
+    return fallback;
+  }
+  return payload.error;
+}
+
+function commitBackendConnection(url, token, profile, identityKey, accounts) {
   const operation = async () => {
     if (config.mode !== "backend") return false;
     const nextConfig = { ...config, backendUrl: url };
     await browser.storage.local.set({
       config: nextConfig,
       [BACKEND_AUTH_TOKEN_KEY]: token,
+      [BACKEND_SSO_PROFILE_KEY]: profile,
+      [BACKEND_SSO_IDENTITY_KEY]: identityKey,
       ...backendAccountState(accounts),
       ...(backendSessionReuseAutoOfferHandled
         ? { [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: true }
         : {}),
     });
     config = nextConfig;
+    backendSsoProfile = profile;
     return true;
   };
   const result = configSaveQueue.then(operation, operation);
@@ -224,11 +266,22 @@ async function refreshBackendAccounts({ saveUrl }) {
   if (config.mode !== "backend") return;
 
   let url;
+  let profile = null;
   try {
     url = saveUrl ? backendInputUrl() : normalizeBackendUrl(config.backendUrl);
   } catch (err) {
     setStatus("backend-status", err.message, false);
     return;
+  }
+  if (saveUrl) {
+    try {
+      profile = backendInputSsoProfile();
+      setBackendSsoProfileInvalid(false);
+    } catch (err) {
+      setBackendSsoProfileInvalid(true);
+      setStatus("backend-status", err.message, false);
+      return;
+    }
   }
   if (backendRequestController) backendRequestController.abort();
   const controller = new AbortController();
@@ -241,6 +294,52 @@ async function refreshBackendAccounts({ saveUrl }) {
     const token = await tokenForBackendRequest({ allowEnteredToken: saveUrl });
     if (!token) return;
     if (controller.signal.aborted || config.mode !== "backend") return;
+
+    let identityKey = null;
+    if (saveUrl) {
+      const identityUrl = new URL(`${url}/sso-identity`);
+      if (profile) identityUrl.searchParams.set("profile", profile);
+      const identityResponse = await backendFetch(identityUrl.href, token, {
+        signal: controller.signal,
+      });
+      if (identityResponse.status === 401) {
+        setBackendTokenInvalid(true);
+        setStatus("backend-token-status", "The helper access token was rejected", false);
+        setStatus(
+          "backend-status",
+          await backendIdentityErrorMessage(identityResponse),
+          false,
+        );
+        return;
+      }
+      if (!identityResponse.ok) {
+        setStatus(
+          "backend-status",
+          await backendIdentityErrorMessage(identityResponse),
+          false,
+        );
+        return;
+      }
+
+      let identity;
+      try {
+        identity = await identityResponse.json();
+        if (
+          !identity ||
+          typeof identity !== "object" ||
+          Array.isArray(identity) ||
+          Object.keys(identity).sort().join("\n") !== "identityKey\nok" ||
+          identity.ok !== true
+        ) {
+          throw new Error("invalid identity response");
+        }
+        identityKey = normalizeBackendSsoIdentityKey(identity.identityKey);
+      } catch {
+        setStatus("backend-status", "Local helper returned an unexpected response", false);
+        return;
+      }
+      if (controller.signal.aborted || config.mode !== "backend") return;
+    }
 
     const response = await backendFetch(`${url}/accounts`, token, {
       signal: controller.signal,
@@ -277,7 +376,13 @@ async function refreshBackendAccounts({ saveUrl }) {
     if (saveUrl) {
       let committed;
       try {
-        committed = await commitBackendConnection(url, token, accounts);
+        committed = await commitBackendConnection(
+          url,
+          token,
+          profile,
+          identityKey,
+          accounts,
+        );
       } catch {
         setStatus("backend-status", "Helper connected, but settings could not be saved", false);
         return;
@@ -285,6 +390,7 @@ async function refreshBackendAccounts({ saveUrl }) {
       if (!committed) return;
       el("backend-url").value = url;
       el("backend-token").value = "";
+      el("backend-sso-profile").value = profile;
       await refreshBackendTokenStatus();
     } else {
       try {
@@ -317,9 +423,14 @@ function bindBackend() {
   el("backend-url").value = config.backendUrl;
   // A stored authentication value is deliberately never copied into the DOM.
   el("backend-token").value = "";
+  el("backend-sso-profile").value = backendSsoProfile;
   setBackendTokenInvalid(false);
+  setBackendSsoProfileInvalid(false);
   el("backend-token").addEventListener("input", () => {
     setBackendTokenInvalid(false);
+  });
+  el("backend-sso-profile").addEventListener("input", () => {
+    setBackendSsoProfileInvalid(false);
   });
   el("backend-save").addEventListener("click", () => {
     if (config.mode !== "backend") return;
@@ -662,11 +773,19 @@ async function refreshPermissionStatuses() {
 async function init() {
   const storedState = await browser.storage.local.get([
     "config",
+    BACKEND_SSO_PROFILE_KEY,
     BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY,
   ]);
   const stored = storedState.config;
   config = { ...DEFAULT_CONFIG, ...(stored || {}) };
   config.backendUrl = safeBackendUrl(config.backendUrl);
+  try {
+    backendSsoProfile = normalizeBackendSsoProfile(
+      storedState[BACKEND_SSO_PROFILE_KEY],
+    );
+  } catch {
+    backendSsoProfile = "";
+  }
   backendSessionReuseAutoOfferHandled =
     storedState[BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY] === true;
 

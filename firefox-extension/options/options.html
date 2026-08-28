@@ -63,7 +63,7 @@
             aria-describedby="backend-url-help"
           >
         </div>
-        <p class="hint" id="backend-url-help">The URL and token are replaced only after a successful test, which also refreshes the account list.</p>
+        <p class="hint" id="backend-url-help">The URL, token, and profile are replaced only after a successful test, which also refreshes the account list.</p>
       </div>
 
       <div class="field">
@@ -80,6 +80,21 @@
         >
         <p class="hint" id="backend-token-help">Run <code>python3 server.py --show-token</code>, then paste its 43-character result here. It is stored only in this Firefox profile; the extension never redisplays it after saving. Leave this field blank to test with the token already stored.</p>
         <p class="status" id="backend-token-status" role="status" aria-live="polite">Checking saved token…</p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="backend-sso-profile">AWS CLI profile</label>
+        <input
+          type="text"
+          id="backend-sso-profile"
+          placeholder="__CONTAINOODLE_TEST_PROFILE__"
+          autocomplete="off"
+          autocapitalize="off"
+          maxlength="128"
+          spellcheck="false"
+          aria-describedby="backend-sso-profile-help"
+        >
+        <p class="hint" id="backend-sso-profile-help">Optional. Enter the local profile alias used with <code>aws sso login --profile …</code>. Leave it blank only when the helper can identify one valid SSO login.</p>
       </div>
       <div class="actions">
         <button type="button" id="backend-save">Save &amp; test</button>

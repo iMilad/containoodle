@@ -4,9 +4,13 @@ import test from "node:test";
 
 import {
   BACKEND_AUTH_TOKEN_KEY,
+  BACKEND_SSO_IDENTITY_KEY,
+  BACKEND_SSO_PROFILE_KEY,
   DEFAULT_BACKEND_URL,
   backendFetch,
   isBackendAuthenticationError,
+  normalizeBackendSsoIdentityKey,
+  normalizeBackendSsoProfile,
   normalizeBackendUrl,
   normalizeBackendToken,
   safeBackendUrl,
@@ -15,6 +19,8 @@ import {
 
 const TEST_ACCOUNT_ID = "0".repeat(12);
 const TEST_ROLE = "__CONTAINOODLE_TEST_ROLE__";
+const TEST_PROFILE = "__CONTAINOODLE_TEST_PROFILE__";
+const TEST_IDENTITY_KEY = "0".repeat(64);
 
 function testBase64Url(bytes) {
   return Buffer.from(bytes).toString("base64url");
@@ -244,6 +250,46 @@ test("helper tokens use a separate key and canonical 256-bit base64url", () => {
   }
 });
 
+test("helper SSO profile and identity storage values are strictly normalized", () => {
+  assert.equal(BACKEND_SSO_PROFILE_KEY, "backendSsoProfile");
+  assert.equal(BACKEND_SSO_IDENTITY_KEY, "backendSsoIdentityKey");
+  assert.equal(normalizeBackendSsoProfile(undefined), "");
+  assert.equal(normalizeBackendSsoProfile(null), "");
+  assert.equal(normalizeBackendSsoProfile("   "), "");
+  assert.equal(
+    normalizeBackendSsoProfile(`  ${TEST_PROFILE}  `),
+    TEST_PROFILE,
+  );
+  assert.equal(normalizeBackendSsoProfile("x".repeat(128)), "x".repeat(128));
+  assert.equal(normalizeBackendSsoIdentityKey(TEST_IDENTITY_KEY), TEST_IDENTITY_KEY);
+
+  for (const value of [
+    false,
+    0,
+    {},
+    `${TEST_PROFILE}\n`,
+    `${TEST_PROFILE}\u0000`,
+    "x".repeat(129),
+  ]) {
+    assert.throws(() => normalizeBackendSsoProfile(value), /AWS CLI profile/);
+  }
+
+  for (const value of [
+    undefined,
+    null,
+    "",
+    "0".repeat(63),
+    "0".repeat(65),
+    "A".repeat(64),
+    `${TEST_IDENTITY_KEY} `,
+  ]) {
+    assert.throws(
+      () => normalizeBackendSsoIdentityKey(value),
+      /invalid SSO identity/,
+    );
+  }
+});
+
 test("mutual HMAC exchange matches the shared v1 vector without sending the token", async () => {
   assert.equal(serverProof(), KNOWN_SERVER_PROOF);
   assert.equal(requestProof(), KNOWN_REQUEST_PROOF);
@@ -318,8 +364,16 @@ test("mutual HMAC exchange matches the shared v1 vector without sending the toke
 test("all protected routes use a fresh challenge and exact target proof", async () => {
   const urls = [
     `${DEFAULT_BACKEND_URL}/accounts`,
-    `${DEFAULT_BACKEND_URL}/roles?account=${TEST_ACCOUNT_ID}`,
-    TEST_REQUEST_URL,
+    `${DEFAULT_BACKEND_URL}/sso-identity`,
+    `${DEFAULT_BACKEND_URL}/sso-identity?profile=${TEST_PROFILE}`,
+    (
+      `${DEFAULT_BACKEND_URL}/roles?account=${TEST_ACCOUNT_ID}` +
+      `&profile=${TEST_PROFILE}&identity=${TEST_IDENTITY_KEY}`
+    ),
+    (
+      `${TEST_REQUEST_URL}&profile=${TEST_PROFILE}` +
+      `&identity=${TEST_IDENTITY_KEY}`
+    ),
   ];
   const calls = [];
 
@@ -344,7 +398,7 @@ test("all protected routes use a fresh challenge and exact target proof", async 
     }
   });
 
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, urls.length * 2);
 });
 
 test("malformed, stale, and fake challenges fail before the protected GET", async () => {
@@ -543,6 +597,13 @@ test("unsafe inputs and caller-controlled security headers reject synchronously"
         `&account=${TEST_ACCOUNT_ID}`
       ),
       `${DEFAULT_BACKEND_URL}/roles?account=${TEST_TOKEN}`,
+      `${DEFAULT_BACKEND_URL}/sso-identity?unknown=value`,
+      `${DEFAULT_BACKEND_URL}/sso-identity?profile=`,
+      `${DEFAULT_BACKEND_URL}/sso-identity?profile=%20${TEST_PROFILE}`,
+      `${DEFAULT_BACKEND_URL}/sso-identity?profile=${TEST_PROFILE}%0A`,
+      `${DEFAULT_BACKEND_URL}/sso-identity?profile=${"x".repeat(129)}`,
+      `${DEFAULT_BACKEND_URL}/roles?identity=${"A".repeat(64)}`,
+      `${DEFAULT_BACKEND_URL}/generate-url?identity=${"0".repeat(63)}`,
     ];
     for (const url of unsafeUrls) {
       assert.throws(

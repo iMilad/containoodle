@@ -255,12 +255,14 @@ Python standard library; no third-party Python packages are required.
 3. Create or refresh the intended IAM Identity Center session:
 
    ```bash
-   aws sso login --profile PROFILE_NAME
+   aws sso login --profile __CONTAINOODLE_TEST_PROFILE__
    ```
 
-   The helper is not bound to the profile name. It selects the most recently modified
-   file in `~/.aws/sso/cache` that contains an `accessToken`. If several identities are
-   cached, log in to the intended profile last.
+   Replace the unmistakable placeholder with your local AWS CLI profile alias.
+   Containoodle resolves modern `sso_session` profiles and legacy inline SSO
+   profiles to the same cache entry the AWS CLI uses; it never chooses an identity
+   by file modification time. If no profile is configured, the helper continues
+   only when exactly one distinct, valid SSO login is cached.
 
 4. Create or display the helper access token:
 
@@ -281,8 +283,10 @@ Python standard library; no third-party Python packages are required.
    ```
 
 6. In Containoodle options select **Local AWS CLI helper**, paste the token into
-   **Helper access token**, keep or change the helper URL, then choose **Save &
-   test**. If this Firefox profile has not already handled the session-reuse
+   **Helper access token**, enter the same local alias under **AWS CLI profile**,
+   keep or change the helper URL, then choose **Save & test**. The profile field
+   may stay blank only when one valid SSO login is cached. If this Firefox profile
+   has not already handled the session-reuse
    choice, that click immediately starts Firefox's one-time optional AWS console
    permission request, before and in parallel with helper validation. Accept to
    enable reuse, or decline to continue with normal helper-generated launches.
@@ -293,9 +297,10 @@ This strict helper protocol is not compatible with the earlier unauthenticated
 helper: the extension and `server.py` must be updated together. After updating,
 all helper-backed refresh, role discovery, and new session generation fail closed
 until **Save & test** succeeds with the new token; there is no unauthenticated
-helper fallback. An already mapped, still-signed-in Firefox container can continue
-through the separately granted session-reuse path without calling the helper.
-Portal mode does not require this token.
+helper fallback. An already mapped, still-signed-in Firefox container can avoid
+minting a new federation URL through the separately granted session-reuse path,
+but the helper must still be running so the extension can verify that the saved
+SSO identity has not changed. Portal mode does not require this token.
 
 #### Updating from v1.0.3 local-helper mode
 
@@ -304,7 +309,9 @@ Portal mode does not require this token.
    `server.py` use the same strict protocol.
 3. Run `python3 server.py --show-token`.
 4. Start the updated helper with `python3 server.py`.
-5. Paste the token into Containoodle Options and choose **Save & test**.
+5. Paste the token into Containoodle Options. Also enter the same AWS CLI profile
+   alias used for `aws sso login --profile ...`; leave it blank only when exactly
+   one usable SSO login is cached. Then choose **Save & test**.
 
 An existing session-reuse grant remains granted during an in-place update. A
 missing grant remains absent during update and startup; if the profile has not
@@ -340,7 +347,10 @@ role must match a permission set you actually have; otherwise AWS CLI
 Optional **Reuse an existing console session** access makes repeated backend launches
 faster by opening a still-signed-in account container directly and suppressing the
 AWS cookie banner in new backend containers. Normal helper launches work without it,
-and an explicit role choice always bypasses reuse so the selected role wins. The
+and an explicit role choice always bypasses reuse so the selected role wins. Reuse
+and backend-only remembered roles are scoped to the helper's opaque SSO identity
+key; a changed profile or cached login cannot reuse the previous identity's state.
+The identity key contains no profile name, portal URL, cache path, or AWS token. The
 first backend **Save & test** offers this optional permission once;
 after a decline or revocation, only the manual **Allow session reuse** control asks
 again.
@@ -351,7 +361,8 @@ again.
 - **Options says the helper access token is required:** run `python3 server.py --show-token`, paste the result into **Helper access token**, then choose **Save & test**.
 - **Options says the helper access token was rejected:** make sure `--show-token` and the running helper use the same user and `CONTAINOODLE_HELPER_TOKEN_FILE`, then save and test that token again.
 - **The helper rejects its token file permissions:** keep `~/.containoodle` user-only and the token file readable only by its owner. Do not move the token into the repository.
-- **The helper reports an expired or wrong SSO session:** run `aws sso login` again; with several cached identities, log in to the intended profile last.
+- **Options reports several cached SSO logins:** enter the same local alias used with `aws sso login --profile ...` under **AWS CLI profile**, then choose **Save & test**.
+- **The selected SSO login is missing or expired:** run `aws sso login` for the selected profile, then retry. The helper never falls back to another cached identity.
 - **The helper reports that the AWS SSO token expires within five minutes:** run `aws sso login` again. Containoodle never moves or deletes the AWS CLI cache to refresh it.
 - **AWS CLI rejects a backend role:** select a permission set available to that account, or correct the role in `~/.aws/accounts.json` / `CONTAINOODLE_DEFAULT_ROLE`.
 - **A pinned portal shortcut has the wrong role:** allow portal role choices, then click the role chip on that pin and select the intended role.
@@ -377,6 +388,7 @@ hosted service. See the [privacy policy](PRIVACY.md) for the complete details.
 - The backend binds to `127.0.0.1`, validates the exact loopback `Host`, enforces Firefox extension origins for browser requests, and requires a fresh challenge-bound HMAC proof on every account and session endpoint. A protocol-capable diagnostic without an `Origin` must produce the same host- and target-bound proofs. Keep the port local and never expose or forward it.
 - The helper secret is generated with Python's `secrets` module, stored outside the repository, and never accepted through a URL, request header, request body, or command-line argument. Only short-lived challenges and one-time proofs cross the connection, and proofs are compared in constant time. `python3 server.py --show-token` is the only intentional display path; normal startup, responses, and access logs omit it.
 - The helper builds session sign-in URLs in memory. It does not write them to Containoodle files or include query strings in its access log; Firefox may retain navigated URLs according to its own history and session policies.
+- The optional AWS CLI profile is a local alias used only to resolve the exact modern or legacy SSO cache namespace. Cache candidates are validated before use, multiple identities fail closed, and Containoodle never moves, rewrites, or deletes AWS CLI cache files.
 - No real account IDs, credentials, or internal account names are baked into the project. Runtime account metadata comes from `~/.aws`, the clicked AWS Access Portal page, or extension-local storage. Synthetic account IDs remain in examples and tests.
 - Container ownership is stored by AWS account ID and Firefox cookie-store ID. A pre-existing Firefox container with the same display name is not reused, so labels cannot merge two account sessions.
 - Host permissions are **opt-in at runtime and independently revocable**: core portal setup asks only for the exact configured portal origin. Portal API access is optional and used only for role choices on portal pins. AWS console-cookie access is optional and used only for backend session reuse/banner suppression; the first backend **Save & test** offers it once, but declining or revoking it leaves helper mode functional and stops automatic re-prompts. Containoodle has no hosted backend and sends no analytics or telemetry to a Containoodle service.

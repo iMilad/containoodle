@@ -10,9 +10,12 @@
 import { accountEnv } from "./env.js";
 import {
   BACKEND_AUTH_TOKEN_KEY,
+  BACKEND_SSO_IDENTITY_KEY,
+  BACKEND_SSO_PROFILE_KEY,
   DEFAULT_BACKEND_URL,
   backendFetch,
   isBackendAuthenticationError,
+  normalizeBackendSsoIdentityKey,
   normalizeBackendToken,
   safeBackendUrl,
 } from "../shared/backend.js";
@@ -45,7 +48,7 @@ let backendRequestController = null;
 // Tab ids Firefox reported removed — tabs.query() can still return a
 // closing tab briefly after onRemoved, leaving ghosts in Active
 const removedTabIds = new Set();
-// accountId → backend-only remembered role (backendRoleChoice/* in storage)
+// accountId → backend-only remembered role for the current SSO identity
 let rememberedRoles = {};
 // accountId → last role handed off from the AWS portal (display only)
 let portalRoles = {};
@@ -137,9 +140,24 @@ async function readStoredMetadata(activeMode) {
   };
   try {
     const all = await browser.storage.local.get(null);
+    let backendRolePrefix = null;
+    if (activeMode === "backend") {
+      try {
+        const identityKey = normalizeBackendSsoIdentityKey(
+          all[BACKEND_SSO_IDENTITY_KEY]
+        );
+        backendRolePrefix = `backendRoleChoice/${identityKey}/`;
+      } catch {
+        // No trusted identity means legacy/unscoped backend roles stay hidden.
+      }
+    }
     for (const [key, value] of Object.entries(all)) {
-      if (activeMode === "backend" && key.startsWith("backendRoleChoice/")) {
-        next.rememberedRoles[key.slice("backendRoleChoice/".length)] = value;
+      if (
+        backendRolePrefix &&
+        key.startsWith(backendRolePrefix) &&
+        /^\d{12}$/.test(key.slice(backendRolePrefix.length))
+      ) {
+        next.rememberedRoles[key.slice(backendRolePrefix.length)] = value;
       } else if (activeMode === "portal" && key.startsWith("portalRoleChoice/")) {
         next.portalRoles[key.slice("portalRoleChoice/".length)] = value;
       } else if (
@@ -1074,6 +1092,8 @@ browser.storage.onChanged.addListener((changes, area) => {
   if (
     keys.includes("config") ||
     (config.mode === "backend" && keys.includes(BACKEND_AUTH_TOKEN_KEY)) ||
+    (config.mode === "backend" && keys.includes(BACKEND_SSO_PROFILE_KEY)) ||
+    (config.mode === "backend" && keys.includes(BACKEND_SSO_IDENTITY_KEY)) ||
     (config.mode === "backend" && keys.includes("accountsCache")) ||
     (config.mode === "portal" && keys.includes("portalPinnedAccounts"))
   ) {
@@ -1087,8 +1107,8 @@ browser.storage.onChanged.addListener((changes, area) => {
     );
     scheduleRender();
   } else if (keys.some((k) =>
-    k.startsWith("backendRoleChoice/") ||
-    k.startsWith("portalRoleChoice/") ||
+    (config.mode === "backend" && k.startsWith("backendRoleChoice/")) ||
+    (config.mode === "portal" && k.startsWith("portalRoleChoice/")) ||
     k.startsWith("portalAccountOriginalName/") ||
     k.startsWith("accountContainer/") ||
     k.startsWith("containerAccount/")

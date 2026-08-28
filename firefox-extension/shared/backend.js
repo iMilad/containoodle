@@ -1,14 +1,20 @@
 export const DEFAULT_BACKEND_URL = "http://127.0.0.1:8421";
 export const BACKEND_AUTH_TOKEN_KEY = "backendAuthToken";
+export const BACKEND_SSO_PROFILE_KEY = "backendSsoProfile";
+export const BACKEND_SSO_IDENTITY_KEY = "backendSsoIdentityKey";
 
 const BASE64URL_32_RE = /^[A-Za-z0-9_-]{43}$/;
 const BACKEND_PROOF_RE = /^[0-9a-f]{64}$/;
+const BACKEND_SSO_IDENTITY_RE = /^[0-9a-f]{64}$/;
+const CONTROL_CHARACTER_RE = /[\u0000-\u001f\u007f-\u009f]/u;
+const BACKEND_SSO_PROFILE_MAX_LENGTH = 128;
 const EXTENSION_ORIGIN_RE = /^moz-extension:\/\/[A-Za-z0-9-]+$/;
 const CHALLENGE_MAX_FUTURE_MS = 35_000;
 const BACKEND_REQUEST_PATHS = new Map([
   ["/accounts", new Set()],
-  ["/roles", new Set(["account"])],
-  ["/generate-url", new Set(["account", "role"])],
+  ["/sso-identity", new Set(["profile"])],
+  ["/roles", new Set(["account", "identity", "profile"])],
+  ["/generate-url", new Set(["account", "identity", "profile", "role"])],
 ]);
 const CALLER_FORBIDDEN_HEADERS = [
   "Authorization",
@@ -113,6 +119,28 @@ export function normalizeBackendToken(value) {
   return normalizedBackendToken(value).token;
 }
 
+export function normalizeBackendSsoProfile(value) {
+  if (value == null) return "";
+  if (typeof value !== "string" || CONTROL_CHARACTER_RE.test(value)) {
+    throw new Error(
+      "AWS CLI profile must be a local alias without control characters",
+    );
+  }
+
+  const profile = value.trim();
+  if (profile.length > BACKEND_SSO_PROFILE_MAX_LENGTH) {
+    throw new Error("AWS CLI profile must be at most 128 characters");
+  }
+  return profile;
+}
+
+export function normalizeBackendSsoIdentityKey(value) {
+  if (typeof value !== "string" || !BACKEND_SSO_IDENTITY_RE.test(value)) {
+    throw new Error("Local helper returned an invalid SSO identity");
+  }
+  return value;
+}
+
 function validateBackendRequestUrl(value, token) {
   if (typeof value !== "string" || value !== value.trim()) {
     throw invalidBackendRequest();
@@ -150,6 +178,20 @@ function validateBackendRequestUrl(value, token) {
       seenQueryKeys.has(key) ||
       queryValue.includes(token)
     ) {
+      throw invalidBackendRequest();
+    }
+    let queryValueIsValid = true;
+    try {
+      if (key === "profile") {
+        queryValueIsValid = Boolean(queryValue) &&
+          normalizeBackendSsoProfile(queryValue) === queryValue;
+      } else if (key === "identity") {
+        queryValueIsValid = normalizeBackendSsoIdentityKey(queryValue) === queryValue;
+      }
+    } catch {
+      queryValueIsValid = false;
+    }
+    if (!queryValueIsValid) {
       throw invalidBackendRequest();
     }
     seenQueryKeys.add(key);

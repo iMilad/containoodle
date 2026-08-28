@@ -110,6 +110,30 @@ intentionally incompatible, so both pieces must be updated together. Portal mode
 remains usable: portal-specific paths must not look up the helper token by its
 storage key, call the helper, or attach that token to any request.
 
+Phase 4 replaces filesystem-recency SSO selection with one deterministic,
+backend-only identity contract. An optional AWS CLI profile resolves either the
+modern `sso_session` cache namespace or the legacy inline `sso_start_url`
+namespace; the helper reads the exact corresponding token and never falls back
+to another identity. With no profile, compatibility remains only when exactly
+one distinct usable cached login exists. Multiple identities, malformed cache
+metadata, an expired or near-expiry token, or a changed opaque identity key fail
+before AWS CLI or federation work. The helper honors `AWS_CONFIG_FILE` and never
+moves, rewrites, or deletes AWS CLI cache files.
+
+The extension stores the profile alias and opaque token-bound identity key under
+separate backend-only keys. Remembered backend roles are scoped to that key. A
+live container is reusable only after the exact helper-generated federation tab
+finishes on an AWS Console page in the expected container and the helper URL,
+token, profile, identity, and account/container mappings still match. A failed,
+removed, timed-out, or stale navigation leaves the previous reuse marker intact.
+Portal mode, permissions, `accounts.json`, pins, and the six shared `config`
+fields are unchanged.
+
+The Phase 4 candidate suite reports 161 JavaScript tests and 91 Python tests,
+clean extension lint, and a successful deterministic XPI build. These remain
+mocked safety/contract checks; live profile selection and completed-console reuse
+still require the sequential non-production smoke gate below.
+
 ## Stored-state compatibility contract
 
 Unless a future change has an explicit, tested migration, an in-place upgrade
@@ -132,6 +156,14 @@ snapshots, logs, screenshots, issues, and test fixtures.
 `backendSessionReuseAutoOfferHandled` records only that the one-time permission
 offer was handled; Firefox's optional host permission remains the authoritative
 session-reuse enabled state.
+
+After Phase 4 setup, `backendSsoProfile` and `backendSsoIdentityKey` are also
+stable local state. The profile is only a local AWS CLI alias; the identity key
+is an opaque HMAC value and must not be decoded or treated as AWS metadata.
+Identity-scoped `backendRoleChoice/<identityKey>/*` and
+`backendContainerIdentity/*` values must survive startup and updates. Older
+unscoped backend-role values are preserved but ignored while a trusted identity
+key is active.
 
 `tabGroups/<accountId>/<windowId>` is the deliberate exception: the numeric
 Firefox group IDs are transient and v1.0.3 removes these storage entries on
@@ -210,6 +242,13 @@ upgrade-only checks are explicitly identified below.
   bytes/status are rejected before JSON parsing or browser action.
 - [ ] Confirm every extension helper call uses the central authenticated fetch
   path, while portal-mode tests perform no helper-token lookup or helper request.
+- [ ] Confirm the Phase 4 tests resolve modern, legacy, default, and
+  `AWS_CONFIG_FILE`-overridden profiles from synthetic files; reject ambiguous,
+  malformed, expiring, mismatched, and changed identities before AWS work; and
+  never modify the synthetic cache files.
+- [ ] Confirm helper URL/profile/identity races cancel before browser mutation,
+  remembered backend roles are identity-scoped, and reuse binding occurs only
+  after the exact new sign-in tab completes on an AWS Console URL.
 
 ### In-place upgrade hard gate
 
@@ -312,6 +351,13 @@ v1.0.3 baseline and is expected to require a later implementation change.
   A failed replacement must preserve the last working URL, token, and cache.
 - [ ] Confirm the Options password field is empty after reload and a stored-token
   status is shown without displaying the value.
+- [ ] Enter the same local alias used for the dedicated non-production
+  `aws sso login --profile ...`, choose **Save & test**, and confirm the alias is
+  retained without displaying any token, cache path, start URL, or identity
+  metadata. Do not record the real alias in QA output.
+- [ ] With exactly one usable cached login, confirm a blank profile still works.
+  With more than one, confirm setup fails clearly until a profile is selected;
+  it must never use whichever cache file was touched most recently.
 - [ ] If a protocol-capable no-Origin diagnostic is exercised, confirm it fails
   without a fresh valid challenge/request proof and succeeds with one. The saved
   helper secret itself must never appear in the URL, headers, or body.
@@ -323,8 +369,13 @@ v1.0.3 baseline and is expected to require a later implementation change.
 - [ ] Pin and unpin accounts; names, roles, regions, and launch data must still
   come from the helper.
 - [ ] With a controlled helper request counter, confirm an implicit-role repeat
-  launch that reuses a live session makes no `/generate-url` request. An
-  explicit-role launch must call `/generate-url` with that selected role.
+  launch authenticates `/sso-identity` but makes no `/generate-url` request once
+  that exact identity's completed sign-in is eligible for reuse. An explicit-role
+  launch must call `/generate-url` with that selected role.
+- [ ] Change the selected profile or cached login. The previous identity's live
+  session and remembered role must be ignored. If the replacement federation
+  navigation fails, closes, times out, or lands outside AWS Console, the next
+  launch must generate another sign-in rather than trusting the old container.
 - [ ] Revoke session-reuse permission and confirm a normal helper launch still
   succeeds.
 - [ ] Stop the helper. Cached accounts, pins, and roles must remain; launch must
