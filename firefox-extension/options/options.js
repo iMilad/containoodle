@@ -22,6 +22,15 @@ import {
   normalizeBackendUrl,
   safeBackendUrl,
 } from "../shared/backend.js";
+import {
+  backendSessionReuseOriginsForRevoke,
+  beginExplicitPermissionTransaction,
+  classifyBackendSessionReusePermission,
+  classifyRoleDiscoveryPermission,
+  roleDiscoveryOrigin,
+  roleDiscoveryOriginsForRevoke,
+  settleExplicitPermissionTransaction,
+} from "../shared/permissions.js";
 
 const DEFAULT_CONFIG = {
   mode: "backend",
@@ -32,8 +41,6 @@ const DEFAULT_CONFIG = {
   groupNameReplacement: "",
 };
 
-const PORTAL_API_ORIGINS = ["https://*.amazonaws.com/*"];
-const CONSOLE_ORIGINS = ["https://*.amazon.com/*"];
 const BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY =
   "backendSessionReuseAutoOfferHandled";
 
@@ -45,6 +52,15 @@ let backendRequestController = null;
 let backendSsoProfile = "";
 let backendSessionReuseAutoOfferHandled = false;
 let consolePermissionGranted = false;
+// Advances whenever the active mode or a mode-specific permission target
+// changes, so an older prompt cannot clean up grants for the new context.
+let permissionModeRevision = 0;
+let backendSessionReuseClassification = null;
+let roleDiscoveryRegion = null;
+let roleDiscoveryPermissionTarget = null;
+let roleDiscoveryClassification = null;
+let lastValidatedRoleDiscoveryPermissionTarget = null;
+let portalReadinessSequence = 0;
 
 function setStatus(id, message, ok) {
   const node = el(id);
@@ -74,9 +90,25 @@ function saveConfig(patch) {
   return result;
 }
 
-function setPermissionButtons(grantId, revokeId, granted) {
-  el(grantId).disabled = granted;
-  el(revokeId).disabled = !granted;
+function invalidateRoleDiscoveryTarget() {
+  roleDiscoveryRegion = null;
+  roleDiscoveryPermissionTarget = null;
+  roleDiscoveryClassification = null;
+}
+
+function replaceRoleDiscoveryPermissionContext(target) {
+  const normalizedTarget = typeof target === "string" ? target : null;
+  if (normalizedTarget !== lastValidatedRoleDiscoveryPermissionTarget) {
+    permissionModeRevision += 1;
+    lastValidatedRoleDiscoveryPermissionTarget = normalizedTarget;
+  }
+}
+
+function resetRoleDiscoveryPermissionContext() {
+  permissionModeRevision += 1;
+  portalReadinessSequence += 1;
+  lastValidatedRoleDiscoveryPermissionTarget = null;
+  invalidateRoleDiscoveryTarget();
 }
 
 function renderMode() {
@@ -101,6 +133,7 @@ function bindMode() {
   for (const id of ["mode-backend", "mode-portal"]) {
     el(id).addEventListener("change", async (event) => {
       if (!event.target.checked) return;
+      resetRoleDiscoveryPermissionContext();
       if (event.target.value === "portal" && backendRequestController) {
         backendRequestController.abort();
       }
@@ -442,26 +475,203 @@ function bindBackend() {
   });
 }
 
-function renderRoleDiscoveryStatus(granted) {
-  setPermissionButtons("role-discovery-grant", "role-discovery-revoke", granted);
-  setStatus(
-    "role-discovery-status",
-    granted
-      ? "Allowed — Containoodle can load role choices for pinned accounts"
-      : "Not allowed — pinning and normal portal clicks still work",
-    granted || undefined
+function hasManagedGrant(classification) {
+  return Boolean(
+    classification && (
+      classification.targetGranted ||
+      classification.legacyGranted ||
+      classification.staleOrigins.length > 0
+    )
   );
 }
 
-function renderConsoleStatus(granted) {
-  setPermissionButtons("console-grant", "console-revoke", granted);
-  setStatus(
-    "console-status",
-    granted
-      ? "Enabled — repeated backend launches can reuse a signed-in session"
-      : "Disabled — normal backend launches still work",
-    granted || undefined
+function renderRoleDiscoveryStatus(classification, { managedWithoutTarget = false } = {}) {
+  const targetReady = Boolean(roleDiscoveryPermissionTarget && classification);
+  const grant = el("role-discovery-grant");
+  const revoke = el("role-discovery-revoke");
+  const cleanupPending = Boolean(classification && classification.cleanupPending);
+  const legacyOnly = Boolean(
+    classification && classification.legacyGranted && !classification.targetGranted
   );
+  grant.textContent = cleanupPending
+    ? "Finish tightening"
+    : legacyOnly
+      ? "Tighten access"
+      : "Allow role choices";
+  grant.disabled = !targetReady || Boolean(
+    classification.targetGranted && !cleanupPending
+  );
+  revoke.disabled = !(hasManagedGrant(classification) || managedWithoutTarget);
+
+  if (!targetReady) {
+    setStatus(
+      "role-discovery-status",
+      managedWithoutTarget
+        ? "Existing role access is still granted · sign in and refresh to tighten it, or revoke it now"
+        : "Sign in and refresh readiness before allowing role choices",
+      managedWithoutTarget || undefined,
+    );
+  } else if (cleanupPending) {
+    setStatus(
+      "role-discovery-status",
+      "Allowed · finish tightening to remove older broad access",
+      true,
+    );
+  } else if (legacyOnly) {
+    setStatus(
+      "role-discovery-status",
+      "Allowed with older broad access · tighten it without affecting portal clicks",
+      true,
+    );
+  } else {
+    setStatus(
+      "role-discovery-status",
+      classification.effectiveGranted
+        ? "Allowed — Containoodle can load role choices for pinned accounts"
+        : "Not allowed — pinning and normal portal clicks still work",
+      classification.effectiveGranted || undefined,
+    );
+  }
+}
+
+function renderConsoleStatus(classification) {
+  const grant = el("console-grant");
+  const revoke = el("console-revoke");
+  const cleanupPending = Boolean(classification && classification.cleanupPending);
+  const legacyOnly = Boolean(
+    classification && classification.legacyGranted && !classification.targetGranted
+  );
+  grant.textContent = cleanupPending
+    ? "Finish tightening"
+    : legacyOnly
+      ? "Tighten access"
+      : "Allow session reuse";
+  grant.disabled = !classification || Boolean(
+    classification.targetGranted && !cleanupPending
+  );
+  revoke.disabled = !hasManagedGrant(classification);
+
+  if (cleanupPending) {
+    setStatus(
+      "console-status",
+      "Enabled · finish tightening to remove older broad access",
+      true,
+    );
+  } else if (legacyOnly) {
+    setStatus(
+      "console-status",
+      "Enabled with older broad access · tighten it without blocking normal launches",
+      true,
+    );
+  } else {
+    setStatus(
+      "console-status",
+      classification && classification.effectiveGranted
+        ? "Enabled — repeated backend launches can reuse a signed-in session"
+        : "Disabled — normal backend launches still work",
+      classification && classification.effectiveGranted || undefined,
+    );
+  }
+}
+
+async function grantedPermissionOrigins() {
+  const granted = await browser.permissions.getAll();
+  return Array.isArray(granted && granted.origins) ? granted.origins : [];
+}
+
+function beginPermissionGrant({ feature, mode, classification, classify, statusId }) {
+  let transaction;
+  try {
+    transaction = beginExplicitPermissionTransaction({
+      trigger: "user-action",
+      feature,
+      mode,
+      modeRevision: permissionModeRevision,
+      classification,
+    });
+  } catch (err) {
+    setStatus(statusId, err.message || "Permission change failed", false);
+    return;
+  }
+
+  // This call must remain in the direct click-handler stack. Do not await an
+  // inventory, storage read, or message before starting the Firefox prompt.
+  let request = null;
+  try {
+    if (transaction.requestOrigins.length > 0) {
+      request = browser.permissions.request({
+        origins: transaction.requestOrigins,
+      });
+    }
+  } catch (err) {
+    setStatus(statusId, err.message || "Permission change failed", false);
+    return;
+  }
+
+  void finishPermissionGrant({
+    transaction,
+    request,
+    classify,
+    statusId,
+  });
+}
+
+async function finishPermissionGrant({ transaction, request, classify, statusId }) {
+  let requestOutcome = "not-needed";
+  let requestError = null;
+  if (request) {
+    try {
+      requestOutcome = await request ? "accepted" : "declined";
+    } catch (err) {
+      requestOutcome = "error";
+      requestError = err;
+    }
+  }
+
+  let decision;
+  try {
+    const classification = classify(await grantedPermissionOrigins());
+    decision = settleExplicitPermissionTransaction(transaction, {
+      requestOutcome,
+      currentMode: config.mode,
+      currentModeRevision: permissionModeRevision,
+      classification,
+    });
+    if (decision.removeOrigins.length > 0) {
+      await browser.permissions.remove({ origins: decision.removeOrigins });
+    }
+  } catch (err) {
+    const message = err.message || "Permission change failed";
+    await refreshPermissionStatuses();
+    if (
+      config.mode === transaction.expectedMode &&
+      permissionModeRevision === transaction.expectedModeRevision
+    ) {
+      setStatus(statusId, message, false);
+    }
+    return;
+  }
+
+  await refreshPermissionStatuses();
+  if (
+    config.mode !== transaction.expectedMode ||
+    permissionModeRevision !== transaction.expectedModeRevision
+  ) return;
+  if (decision.state === "declined") {
+    setStatus(statusId, "Permission was declined", false);
+  } else if (decision.state === "request-error") {
+    setStatus(
+      statusId,
+      requestError && requestError.message || "Permission request failed",
+      false,
+    );
+  } else if (decision.state === "target-not-literal") {
+    setStatus(
+      statusId,
+      "Firefox kept the older broad grant · revoke, then allow again to finish tightening",
+      true,
+    );
+  }
 }
 
 function markBackendSessionReuseAutoOfferHandled() {
@@ -480,7 +690,8 @@ function beginBackendSessionReuseAutoOffer() {
   if (
     config.mode !== "backend" ||
     backendSessionReuseAutoOfferHandled ||
-    consolePermissionGranted
+    consolePermissionGranted ||
+    !backendSessionReuseClassification
   ) {
     return;
   }
@@ -489,38 +700,24 @@ function beginBackendSessionReuseAutoOffer() {
   // so Firefox recognizes the user gesture. This optional prompt must never
   // delay or determine the helper connection result.
   markBackendSessionReuseAutoOfferHandled();
-  let request;
-  try {
-    request = browser.permissions.request({ origins: CONSOLE_ORIGINS });
-  } catch (err) {
-    setStatus(
-      "console-status",
-      err.message || "Could not request session reuse permission",
-      false,
-    );
-    return;
-  }
-
-  void Promise.resolve(request).then((granted) => {
-    consolePermissionGranted = Boolean(granted);
-    if (config.mode === "backend") renderConsoleStatus(consolePermissionGranted);
-  }).catch((err) => {
-    if (config.mode === "backend") {
-      setStatus(
-        "console-status",
-        err.message || "Could not request session reuse permission",
-        false,
-      );
-    }
+  beginPermissionGrant({
+    feature: "backend-session-reuse",
+    mode: "backend",
+    classification: backendSessionReuseClassification,
+    classify: classifyBackendSessionReusePermission,
+    statusId: "console-status",
   });
 }
 
 async function refreshConsoleStatus() {
   try {
-    const granted = await browser.permissions.contains({ origins: CONSOLE_ORIGINS });
-    consolePermissionGranted = granted;
-    if (granted) markBackendSessionReuseAutoOfferHandled();
-    renderConsoleStatus(granted);
+    const classification = classifyBackendSessionReusePermission(
+      await grantedPermissionOrigins(),
+    );
+    backendSessionReuseClassification = classification;
+    consolePermissionGranted = classification.effectiveGranted;
+    if (consolePermissionGranted) markBackendSessionReuseAutoOfferHandled();
+    renderConsoleStatus(classification);
   } catch (err) {
     setStatus("console-status", err.message || "Could not inspect console permission", false);
   }
@@ -529,14 +726,60 @@ async function refreshConsoleStatus() {
 async function refreshPortalReadiness() {
   if (config.mode !== "portal") return;
 
+  const sequence = ++portalReadinessSequence;
+  const readinessRevision = permissionModeRevision;
+  invalidateRoleDiscoveryTarget();
   el("open-portal").disabled = !config.portalStartUrl;
   try {
     const ready = await browser.runtime.sendMessage({ type: "portal-readiness" });
     if (!ready || !ready.ok) {
       throw new Error((ready && ready.error) || "Could not inspect portal readiness");
     }
+    if (
+      config.mode !== "portal" ||
+      permissionModeRevision !== readinessRevision ||
+      portalReadinessSequence !== sequence
+    ) {
+      return;
+    }
 
-    renderRoleDiscoveryStatus(ready.roleDiscoveryAccess);
+    const grantedOrigins = await grantedPermissionOrigins();
+    let validTarget = null;
+    if (
+      typeof ready.roleDiscoveryRegion === "string" &&
+      typeof ready.roleDiscoveryPermissionOrigin === "string"
+    ) {
+      try {
+        const expected = roleDiscoveryOrigin(ready.roleDiscoveryRegion);
+        if (expected === ready.roleDiscoveryPermissionOrigin) {
+          validTarget = expected;
+        }
+      } catch {
+        validTarget = null;
+      }
+    }
+    if (
+      config.mode !== "portal" ||
+      permissionModeRevision !== readinessRevision ||
+      portalReadinessSequence !== sequence
+    ) {
+      return;
+    }
+    replaceRoleDiscoveryPermissionContext(validTarget);
+    if (validTarget) {
+      roleDiscoveryRegion = ready.roleDiscoveryRegion;
+      roleDiscoveryPermissionTarget = validTarget;
+      roleDiscoveryClassification = classifyRoleDiscoveryPermission(
+        grantedOrigins,
+        roleDiscoveryRegion,
+      );
+      renderRoleDiscoveryStatus(roleDiscoveryClassification);
+    } else {
+      renderRoleDiscoveryStatus(null, {
+        managedWithoutTarget:
+          roleDiscoveryOriginsForRevoke(grantedOrigins).length > 0,
+      });
+    }
 
     if (!ready.configured) {
       setStatus("portal-status", "Portal URL not configured");
@@ -552,7 +795,18 @@ async function refreshPortalReadiness() {
       );
     }
   } catch (err) {
-    setStatus("portal-status", err.message || "Could not inspect portal readiness", false);
+    if (
+      config.mode === "portal" &&
+      permissionModeRevision === readinessRevision &&
+      portalReadinessSequence === sequence
+    ) {
+      replaceRoleDiscoveryPermissionContext(null);
+      setStatus(
+        "portal-status",
+        err.message || "Could not inspect portal readiness",
+        false,
+      );
+    }
   }
 }
 
@@ -594,7 +848,12 @@ async function savePortal() {
 
     try {
       if (normalized !== previousStartUrl) {
+        resetRoleDiscoveryPermissionContext();
         await saveConfig({ portalStartUrl: normalized });
+        await browser.storage.local.remove([
+          "portalRegionCache",
+          "portalRegionCacheOrigin",
+        ]);
         if (previousPattern && previousPattern !== nextPattern) {
           await browser.permissions.remove({ origins: [previousPattern] });
         }
@@ -633,14 +892,13 @@ async function openPortal() {
   }
 }
 
-async function updatePermission({ origins, grant, statusId }) {
+async function revokeManagedPermission({ mode, originsForRevoke, statusId }) {
+  const revision = permissionModeRevision;
   try {
-    const changed = grant
-      ? await browser.permissions.request({ origins })
-      : await browser.permissions.remove({ origins });
-    if (grant && !changed) {
-      setStatus(statusId, "Permission was declined", false);
-      return;
+    const origins = originsForRevoke(await grantedPermissionOrigins());
+    if (config.mode !== mode || permissionModeRevision !== revision) return;
+    if (origins.length > 0) {
+      await browser.permissions.remove({ origins });
     }
   } catch (err) {
     setStatus(statusId, err.message || "Permission change failed", false);
@@ -664,17 +922,32 @@ function bindPortal() {
 
   el("role-discovery-grant").addEventListener("click", () => {
     if (config.mode !== "portal") return;
-    void updatePermission({
-      origins: PORTAL_API_ORIGINS,
-      grant: true,
+    const region = roleDiscoveryRegion;
+    const classification = roleDiscoveryClassification;
+    if (!roleDiscoveryPermissionTarget || !region || !classification) {
+      setStatus(
+        "role-discovery-status",
+        "Sign in and refresh readiness before allowing role choices",
+        false,
+      );
+      return;
+    }
+    beginPermissionGrant({
+      feature: "role-discovery",
+      mode: "portal",
+      classification,
+      classify: (origins) => classifyRoleDiscoveryPermission(
+        origins,
+        region,
+      ),
       statusId: "role-discovery-status",
     });
   });
   el("role-discovery-revoke").addEventListener("click", () => {
     if (config.mode !== "portal") return;
-    void updatePermission({
-      origins: PORTAL_API_ORIGINS,
-      grant: false,
+    void revokeManagedPermission({
+      mode: "portal",
+      originsForRevoke: roleDiscoveryOriginsForRevoke,
       statusId: "role-discovery-status",
     });
   });
@@ -686,8 +959,13 @@ function bindPortal() {
       setStatus("role-settings-status", "Invalid SSO region (expected e.g. eu-west-1)", false);
       return;
     }
+    resetRoleDiscoveryPermissionContext();
     await saveConfig({ ssoRegion });
-    await browser.storage.local.remove("portalRegionCache");
+    await browser.storage.local.remove([
+      "portalRegionCache",
+      "portalRegionCacheOrigin",
+    ]);
+    await refreshPortalReadiness();
     setStatus("role-settings-status", "SSO region override saved", true);
   });
 }
@@ -695,17 +973,20 @@ function bindPortal() {
 function bindConsole() {
   el("console-grant").addEventListener("click", () => {
     if (config.mode !== "backend") return;
-    void updatePermission({
-      origins: CONSOLE_ORIGINS,
-      grant: true,
+    if (!backendSessionReuseClassification) return;
+    beginPermissionGrant({
+      feature: "backend-session-reuse",
+      mode: "backend",
+      classification: backendSessionReuseClassification,
+      classify: classifyBackendSessionReusePermission,
       statusId: "console-status",
     });
   });
   el("console-revoke").addEventListener("click", () => {
     if (config.mode !== "backend") return;
-    void updatePermission({
-      origins: CONSOLE_ORIGINS,
-      grant: false,
+    void revokeManagedPermission({
+      mode: "backend",
+      originsForRevoke: backendSessionReuseOriginsForRevoke,
       statusId: "console-status",
     });
   });
@@ -788,15 +1069,6 @@ async function init() {
   }
   backendSessionReuseAutoOfferHandled =
     storedState[BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY] === true;
-
-  try {
-    consolePermissionGranted = await browser.permissions.contains({
-      origins: CONSOLE_ORIGINS,
-    });
-    if (consolePermissionGranted) markBackendSessionReuseAutoOfferHandled();
-  } catch {
-    // The normal status refresh below reports permission inspection failures.
-  }
 
   bindMode();
   bindBackend();

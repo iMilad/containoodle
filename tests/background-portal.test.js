@@ -13,6 +13,9 @@ const TEST_HELPER_ROLE = "__CONTAINOODLE_TEST_ROLE__";
 const TEST_PORTAL_ROLE = "__CONTAINOODLE_TEST_PORTAL_ROLE__";
 const TEST_BACKEND_ROLE = "__CONTAINOODLE_TEST_BACKEND_ROLE__";
 const TEST_LEGACY_ROLE = "__CONTAINOODLE_TEST_LEGACY_ROLE__";
+const TEST_PORTAL_REGION = "xx-test-1";
+const TEST_ROLE_DISCOVERY_ORIGIN =
+  "https://portal.sso.xx-test-1.amazonaws.com/*";
 const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
 const BACKEND_CONSOLE_URL =
   "https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1";
@@ -34,6 +37,21 @@ const SOURCE_TAB = {
   windowId: 7,
   incognito: false,
 };
+
+function matchPatternCovers(ceiling, requested) {
+  const parse = (pattern) => {
+    const match = /^https:\/\/(\*\.)?([^/]+)\/\*$/.exec(pattern);
+    return match && { wildcard: Boolean(match[1]), hostname: match[2] };
+  };
+  const allowed = parse(ceiling);
+  const candidate = parse(requested);
+  if (!allowed || !candidate) return ceiling === requested;
+  if (!allowed.wildcard) {
+    return !candidate.wildcard && candidate.hostname === allowed.hostname;
+  }
+  return candidate.hostname === allowed.hostname ||
+    candidate.hostname.endsWith(`.${allowed.hostname}`);
+}
 
 function decodeBase64Url(value) {
   const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=");
@@ -179,7 +197,7 @@ function makeBrowser(initialStorage = null) {
       portalStartUrl: START,
       backendUrl: "http://127.0.0.1:8421",
       defaultRole: "",
-      ssoRegion: "",
+      ssoRegion: TEST_PORTAL_REGION,
     },
     accountsCache: [{ accountId: ACCOUNT_ID, accountName: "backend-prod-data" }],
     accountsCacheSource: "backend",
@@ -251,8 +269,9 @@ function makeBrowser(initialStorage = null) {
   let beforeNextTabCreate = null;
   let registeredScripts = [];
   let portalPermission = true;
-  let roleDiscoveryPermission = true;
-  let consolePermission = true;
+  let roleDiscoveryOrigins = ["https://*.amazonaws.com/*"];
+  let consoleOrigins = ["https://*.amazon.com/*"];
+  const permissionContainsCalls = [];
   let registrationReadGate = null;
 
   const events = {
@@ -397,10 +416,19 @@ function makeBrowser(initialStorage = null) {
     },
     permissions: {
       async contains({ origins = [] }) {
+        permissionContainsCalls.push([...origins]);
         return origins.length > 0 && origins.every((origin) => {
           if (origin.includes("awsapps.com")) return portalPermission;
-          if (origin.includes("amazonaws.com")) return roleDiscoveryPermission;
-          if (origin.includes("amazon.com")) return consolePermission;
+          if (origin.includes("amazonaws.com")) {
+            return roleDiscoveryOrigins.some((granted) =>
+              matchPatternCovers(granted, origin)
+            );
+          }
+          if (origin.includes("amazon.com")) {
+            return consoleOrigins.some((granted) =>
+              matchPatternCovers(granted, origin)
+            );
+          }
           return false;
         });
       },
@@ -582,6 +610,7 @@ function makeBrowser(initialStorage = null) {
     cookieReads,
     cookieWrites,
     cookieRemovals,
+    permissionContainsCalls,
     setPortalCookie(value) {
       portalCookies = value === null
         ? []
@@ -603,10 +632,16 @@ function makeBrowser(initialStorage = null) {
       portalPermission = value;
     },
     setRoleDiscoveryPermission(value) {
-      roleDiscoveryPermission = value;
+      roleDiscoveryOrigins = value ? ["https://*.amazonaws.com/*"] : [];
+    },
+    setRoleDiscoveryOrigins(origins) {
+      roleDiscoveryOrigins = [...origins];
     },
     setConsolePermission(value) {
-      consolePermission = value;
+      consoleOrigins = value ? ["https://*.amazon.com/*"] : [];
+    },
+    setConsoleOrigins(origins) {
+      consoleOrigins = [...origins];
     },
     getRegisteredScripts() {
       return registeredScripts;
@@ -2231,6 +2266,104 @@ test("backend session reuse never overrides an explicit role choice", async () =
   );
 });
 
+test("legacy and narrow console grants both preserve reuse while absence falls back", async (t) => {
+  const cases = [
+    {
+      name: "legacy broad grant",
+      origins: ["https://*.amazon.com/*"],
+      reuses: true,
+    },
+    {
+      name: "narrow console grant",
+      origins: ["https://*.console.aws.amazon.com/*"],
+      reuses: true,
+    },
+    {
+      name: "unrelated AWS sibling grant",
+      origins: ["https://signin.aws.amazon.com/*"],
+      reuses: false,
+    },
+    { name: "no console grant", origins: [], reuses: false },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const fixture = makeBrowser();
+      fixture.storageData.config = {
+        ...fixture.storageData.config,
+        mode: "backend",
+      };
+      fixture.storageData.accountsCache[0].role = TEST_HELPER_ROLE;
+      fixture.setConsoleOrigins(entry.origins);
+      const storeId = `firefox-container-${entry.name.replaceAll(" ", "-")}`;
+      fixture.identities.push({
+        name: "backend-prod-data",
+        cookieStoreId: storeId,
+        color: "red",
+        icon: "briefcase",
+      });
+      fixture.storageData[`accountContainer/${ACCOUNT_ID}`] = storeId;
+      fixture.storageData[`containerAccount/${storeId}`] = ACCOUNT_ID;
+      fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] =
+        TEST_SSO_IDENTITY;
+      fixture.addTargetPortalCookie(storeId, {
+        name: "noflush_Region",
+        value: TEST_PORTAL_REGION,
+        domain: ".console.aws.amazon.com",
+        hostOnly: false,
+        path: "/",
+        secure: true,
+      });
+      fixture.addTargetPortalCookie(storeId, {
+        name: `aws-signer-token_${TEST_PORTAL_REGION}`,
+        value: "__CONTAINOODLE_TEST_LIVE_SESSION__",
+        domain: ".console.aws.amazon.com",
+        hostOnly: false,
+        path: "/",
+        secure: true,
+        expirationDate: Math.ceil(Date.now() / 1000) + 3600,
+      });
+      const onMessage = await loadBackground(fixture);
+      const requests = [];
+      globalThis.fetch = authenticatedBackendFetch({
+        onRequest(url, options) {
+          requests.push({ url, options });
+        },
+        async responseForRequest() {
+          return {
+            payload: {
+              ok: true,
+              containerUrl: `ext+container:name=Containoodle&url=${
+                encodeURIComponent(BACKEND_SIGNIN_URL)
+              }`,
+            },
+          };
+        },
+      });
+
+      const result = await onMessage({
+        type: "launch",
+        accountId: ACCOUNT_ID,
+        mode: "backend",
+      }, {});
+      assert.strictEqual(result.ok, true);
+      const paths = requests.map((request) => new URL(request.url).pathname);
+      assert.strictEqual(paths.includes("/generate-url"), !entry.reuses);
+      assert.strictEqual(
+        fixture.cookieReads.some((read) => read.name === "noflush_Region"),
+        entry.reuses,
+      );
+      assert.ok(fixture.permissionContainsCalls.some((origins) =>
+        origins.length === 1 &&
+        origins[0] === "https://*.console.aws.amazon.com/*"
+      ));
+      assert.ok(fixture.permissionContainsCalls.every((origins) =>
+        !origins.includes("https://*.amazon.com/*")
+      ));
+    });
+  }
+});
+
 test("a mode switch during backend work cancels the old-mode tab creation", async () => {
   const fixture = makeBrowser();
   const oldConfig = {
@@ -2651,6 +2784,8 @@ test("portal click handoff uses no backend and opens the exact shortcut in a con
       portalAccess: true,
       session: true,
       roleDiscoveryAccess: true,
+      roleDiscoveryRegion: TEST_PORTAL_REGION,
+      roleDiscoveryPermissionOrigin: TEST_ROLE_DISCOVERY_ORIGIN,
       consoleAccess: false,
     }
   );
@@ -2666,6 +2801,8 @@ test("portal click handoff uses no backend and opens the exact shortcut in a con
       portalAccess: true,
       session: true,
       roleDiscoveryAccess: false,
+      roleDiscoveryRegion: TEST_PORTAL_REGION,
+      roleDiscoveryPermissionOrigin: TEST_ROLE_DISCOVERY_ORIGIN,
       consoleAccess: false,
     }
   );
@@ -2902,6 +3039,8 @@ test("portal click handoff uses no backend and opens the exact shortcut in a con
       portalAccess: false,
       session: false,
       roleDiscoveryAccess: false,
+      roleDiscoveryRegion: null,
+      roleDiscoveryPermissionOrigin: null,
       consoleAccess: false,
     }
   );
@@ -2962,6 +3101,135 @@ test("startup replaces an older portal interceptor registration without duplicat
   assert.strictEqual(fixture.getRegisteredScripts()[0].id, "containoodle-portal-clicks");
 });
 
+test("role readiness queries only the exact regional target with legacy coverage", async () => {
+  const fixture = makeBrowser();
+  const onMessage = await loadBackground(fixture);
+  const cases = [
+    { origins: ["https://*.amazonaws.com/*"], access: true },
+    { origins: [TEST_ROLE_DISCOVERY_ORIGIN], access: true },
+    {
+      origins: ["https://portal.sso.yy-test-2.amazonaws.com/*"],
+      access: false,
+    },
+    { origins: [], access: false },
+  ];
+
+  for (const entry of cases) {
+    fixture.setRoleDiscoveryOrigins(entry.origins);
+    fixture.permissionContainsCalls.length = 0;
+    const readiness = await onMessage({ type: "portal-readiness" }, {});
+    assert.strictEqual(readiness.roleDiscoveryAccess, entry.access);
+    assert.strictEqual(
+      readiness.roleDiscoveryPermissionOrigin,
+      TEST_ROLE_DISCOVERY_ORIGIN,
+    );
+    assert.ok(fixture.permissionContainsCalls.some(
+      (origins) => origins.length === 1 && origins[0] === TEST_ROLE_DISCOVERY_ORIGIN
+    ));
+    assert.ok(fixture.permissionContainsCalls.every(
+      (origins) => !origins.includes("https://*.amazonaws.com/*")
+    ));
+  }
+});
+
+test("portal role discovery calls only the authorized synthetic regional API", async () => {
+  const fixture = makeBrowser();
+  const onMessage = await loadBackground(fixture);
+  const apiOrigin = "https://portal.sso.xx-test-1.amazonaws.com";
+  const syntheticAppId = "__CONTAINOODLE_TEST_APP__";
+  const allowedCases = [
+    ["https://*.amazonaws.com/*"],
+    [TEST_ROLE_DISCOVERY_ORIGIN],
+  ];
+
+  for (const origins of allowedCases) {
+    fixture.setRoleDiscoveryOrigins(origins);
+    const fetches = [];
+    globalThis.fetch = async (input, options = {}) => {
+      const url = new URL(input);
+      fetches.push({ url: url.href, options });
+      assert.strictEqual(url.origin, apiOrigin);
+      if (url.pathname === "/instance/appinstances") {
+        return new Response(JSON.stringify({
+          result: [{
+            id: syntheticAppId,
+            searchMetadata: { AccountId: ACCOUNT_ID },
+          }],
+        }), { status: 200 });
+      }
+      if (
+        url.pathname ===
+        `/instance/appinstance/${encodeURIComponent(syntheticAppId)}/profiles`
+      ) {
+        return new Response(JSON.stringify({
+          result: [{ name: TEST_PORTAL_ROLE }],
+        }), { status: 200 });
+      }
+      throw new Error(`Unexpected synthetic portal path: ${url.pathname}`);
+    };
+
+    assert.deepStrictEqual(
+      await onMessage({
+        type: "discover-roles",
+        accountId: ACCOUNT_ID,
+        mode: "portal",
+      }, {}),
+      { ok: true, roles: [TEST_PORTAL_ROLE] },
+    );
+    assert.deepStrictEqual(
+      fetches.map(({ url }) => new URL(url).pathname),
+      [
+        "/instance/appinstances",
+        `/instance/appinstance/${encodeURIComponent(syntheticAppId)}/profiles`,
+      ],
+    );
+  }
+
+  for (const origins of [
+    ["https://portal.sso.yy-test-2.amazonaws.com/*"],
+    [],
+  ]) {
+    fixture.setRoleDiscoveryOrigins(origins);
+    let fetchCount = 0;
+    globalThis.fetch = async () => {
+      fetchCount += 1;
+      throw new Error("regional API must remain unreachable");
+    };
+
+    assert.deepStrictEqual(
+      await onMessage({
+        type: "discover-roles",
+        accountId: ACCOUNT_ID,
+        mode: "portal",
+      }, {}),
+      {
+        ok: false,
+        needsOptions: true,
+        error: "Role choices are not allowed — enable them in Containoodle options",
+      },
+    );
+    assert.strictEqual(fetchCount, 0);
+  }
+});
+
+test("unbound or wrong-portal region caches never become permission targets", async () => {
+  for (const cachedOrigin of [undefined, "https://d-9999999999.awsapps.com"]) {
+    const fixture = makeBrowser();
+    fixture.storageData.config.ssoRegion = "";
+    fixture.storageData.portalRegionCache = "yy-test-2";
+    if (cachedOrigin) fixture.storageData.portalRegionCacheOrigin = cachedOrigin;
+    const onMessage = await loadBackground(fixture);
+
+    const readiness = await onMessage({ type: "portal-readiness" }, {});
+    assert.strictEqual(readiness.ok, true);
+    assert.strictEqual(readiness.portalAccess, true);
+    assert.strictEqual(readiness.session, true);
+    assert.strictEqual(readiness.roleDiscoveryAccess, false);
+    assert.strictEqual(readiness.roleDiscoveryRegion, null);
+    assert.strictEqual(readiness.roleDiscoveryPermissionOrigin, null);
+  }
+});
+
 test("tab-event fallback reuses a captured portal name for an unpinned account", async () => {
   const fixture = makeBrowser();
   fixture.storageData.portalPinnedAccounts = [];
@@ -3018,6 +3286,8 @@ test("portal handoff refuses to navigate when the copied cookie cannot be read b
       portalAccess: true,
       session: true,
       roleDiscoveryAccess: true,
+      roleDiscoveryRegion: TEST_PORTAL_REGION,
+      roleDiscoveryPermissionOrigin: TEST_ROLE_DISCOVERY_ORIGIN,
       consoleAccess: false,
     }
   );
@@ -3114,6 +3384,8 @@ test("portal handoff ignores a cross-site-ancestor cookie partition", async () =
       portalAccess: true,
       session: false,
       roleDiscoveryAccess: true,
+      roleDiscoveryRegion: TEST_PORTAL_REGION,
+      roleDiscoveryPermissionOrigin: TEST_ROLE_DISCOVERY_ORIGIN,
       consoleAccess: false,
     }
   );

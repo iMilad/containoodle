@@ -134,6 +134,37 @@ clean extension lint, and a successful deterministic XPI build. These remain
 mocked safety/contract checks; live profile selection and completed-console reuse
 still require the sequential non-production smoke gate below.
 
+Phase 5 tightens the two optional AWS host grants at runtime. Portal role
+discovery now requests only the exact detected or configured regional target,
+`https://portal.sso.<region>.amazonaws.com/*`. Backend session reuse now requests
+`https://*.console.aws.amazon.com/*`, excluding sibling `aws.amazon.com`
+services. The transitional manifest still declares the legacy broad optional-host
+ceilings so an existing installation can migrate; declaring an optional ceiling
+does not grant it. Runtime authorization uses only the narrow feature target.
+
+Existing `https://*.amazonaws.com/*` and `https://*.amazon.com/*` grants remain
+effective during migration. Phase 5 never changes them on startup, extension
+update, Options load, or a normal mode switch. A legacy grant is removed only
+as part of the user's corresponding **Allow**/**Tighten access** migration after
+a fresh literal-permission inventory proves Firefox stored the narrow replacement.
+The explicit **Revoke** action instead removes that feature's recognized grants
+directly. If Firefox treats the broad grant as coverage and does not add the
+narrow literal, Containoodle preserves the broad grant and tells the user to
+choose **Revoke**, then **Allow** again.
+
+A synthetic Firefox permission-scope gate passed in fresh temporary profiles on
+Firefox Release 149.0 and Firefox Developer Edition 155.0. With only
+`https://*.console.aws.amazon.com/*`, the production-shaped AWS Console cookie
+operations needed for reuse succeeded, including the parent-domain consent
+cookie, while a synthetic sibling `aws.amazon.com` service remained denied. The
+negative control denied every AWS cookie operation; the legacy broad grant also
+allowed the sibling, demonstrating why it is broader. The harness used only
+synthetic cookies and containers, made no AWS navigation or login, and used no
+account or role data. This gate verifies the tested Firefox versions' permission
+and cookie behavior; it is not evidence for Firefox 142 through 148. Real AWS
+portal and helper smoke testing remains deferred to the manual non-production
+acceptance gate below.
+
 ## Stored-state compatibility contract
 
 Unless a future change has an explicit, tested migration, an in-place upgrade
@@ -164,6 +195,11 @@ Identity-scoped `backendRoleChoice/<identityKey>/*` and
 `backendContainerIdentity/*` values must survive startup and updates. Older
 unscoped backend-role values are preserved but ignored while a trusted identity
 key is active.
+
+Phase 5 binds `portalRegionCache` to the exact saved portal origin with
+`portalRegionCacheOrigin`. An older unbound or wrong-origin cache is ignored and
+redetected rather than trusted as a permission target. This safe invalidation
+must not alter portal pins, roles, or the saved portal URL.
 
 `tabGroups/<accountId>/<windowId>` is the deliberate exception: the numeric
 Firefox group IDs are transient and v1.0.3 removes these storage entries on
@@ -203,12 +239,14 @@ upgrade-only checks are explicitly identified below.
   remove/reinstall cycle cannot prove restart or storage preservation.
 - [ ] Prepare one account available through both modes with different roles,
   one portal-only pinned account, and one helper-only pinned account.
-- [ ] Enable the exact portal origin, optional portal role discovery, and
-  optional backend session reuse in the test profile.
+- [ ] Enable the exact portal origin, the exact regional role-discovery target,
+  and the console-only backend session-reuse target in the test profile.
 - [ ] Make a second profile clone with the exact portal origin retained but
-  both optional broad host grants revoked. The candidate must preserve both
+  both optional host grants revoked. The candidate must preserve both
   granted and revoked states during update and startup without an unexpected
   permission prompt.
+- [ ] Keep one upgrade clone with the legacy broad role-discovery and
+  session-reuse grants so the explicit Phase 5 tightening flow can be tested.
 - [ ] Prepare two fresh candidate profiles with no console permission and no
   `backendSessionReuseAutoOfferHandled` key: one for accepting the one-time
   backend offer and one for declining it.
@@ -249,6 +287,11 @@ upgrade-only checks are explicitly identified below.
 - [ ] Confirm helper URL/profile/identity races cancel before browser mutation,
   remembered backend roles are identity-scoped, and reuse binding occurs only
   after the exact new sign-in tab completes on an AWS Console URL.
+- [ ] Confirm the Phase 5 permission tests distinguish literal grants from
+  wildcard coverage, request the exact feature target synchronously from the
+  user's click, preserve a broad grant when Firefox stores no narrow literal,
+  and roll back only a newly added narrow grant after a stale mode or target-context
+  revision.
 
 ### In-place upgrade hard gate
 
@@ -267,7 +310,7 @@ upgrade-only checks are explicitly identified below.
   the token once, and confirm subsequent update/startup cycles preserve it
   without placing it back into the password field.
 - [ ] In the granted upgrade clone, the first backend **Save & test** must retain
-  the existing session-reuse grant without showing a redundant prompt and must
+  the existing legacy session-reuse grant without showing a redundant prompt and must
   record `backendSessionReuseAutoOfferHandled` as `true`.
 - [ ] In the revoked upgrade clone, if
   `backendSessionReuseAutoOfferHandled` is absent, the first backend **Save &
@@ -275,6 +318,15 @@ upgrade-only checks are explicitly identified below.
   permission stays absent, the marker becomes `true`, and later **Save & test**
   operations do not prompt again. This user-triggered offer is not an
   update/startup permission mutation.
+- [ ] Without clicking a permission control, open Options, restart Firefox,
+  update the extension, and switch modes in both directions. The literal
+  permission inventory must remain unchanged and no prompt may appear.
+- [ ] In the legacy-grant clone, choose the backend and role-discovery
+  **Tighten access** actions separately. If Firefox stores the requested narrow
+  literal, confirm only that feature's recognized legacy broad grant is removed.
+  If Firefox reports coverage but leaves only the broad literal, confirm the
+  broad grant is preserved and the status instructs **Revoke**, then **Allow**
+  again. Declining or an API error must remove nothing.
 - [ ] Confirm existing tabs remain in their original containers and no
   duplicate same-name container appears.
 - [ ] Confirm backend and portal pins, account names, and remembered roles stay
@@ -295,10 +347,10 @@ v1.0.3 baseline and is expected to require a later implementation change.
 
 ### Fresh-profile one-time session-reuse offer gate
 
-- [ ] In both fresh profiles, confirm `https://*.amazon.com/*` is not granted
+- [ ] In both fresh profiles, confirm `https://*.console.aws.amazon.com/*` is not granted
   and `backendSessionReuseAutoOfferHandled` is absent before backend setup.
 - [ ] Choose the first backend **Save & test** in the acceptance profile. The
-  Firefox request for `https://*.amazon.com/*` must begin directly from that
+  Firefox request for `https://*.console.aws.amazon.com/*` must begin directly from that
   click, without waiting for the helper result. Accept it, complete a valid
   helper test, and confirm the permission is present, session reuse is enabled,
   and `backendSessionReuseAutoOfferHandled` is `true`.
@@ -336,6 +388,11 @@ v1.0.3 baseline and is expected to require a later implementation change.
 - [ ] Revoke optional role discovery. Normal portal clicks must still work,
   saved pin roles must remain, and live role changes must request permission.
   Re-grant it and verify choices return.
+- [ ] Inspect the role-discovery request after the portal region is known. It
+  must be exactly `https://portal.sso.<region>.amazonaws.com/*`; a grant for a
+  different region must not authorize the regional role API call. Clear or
+  change the saved portal and confirm an unbound or wrong-origin cached region
+  is redetected before any target is offered.
 - [ ] Sign out or revoke the exact portal permission. Readiness must identify
   the missing condition, native portal navigation must remain available, and
   no wrong-container console tab may be created.
@@ -397,6 +454,9 @@ v1.0.3 baseline and is expected to require a later implementation change.
   not trigger a helper request or affect portal readiness, pins, or launch flow.
 
 ### Live non-production acceptance gate
+
+Status: **deferred/manual for Phase 5**. The Firefox 149.0/155.0 synthetic scope
+gate above does not replace these real portal and helper checks.
 
 - [ ] Only after every local gate passes, start the real helper and run both
   launch paths against non-production AWS accounts. Verify the visible account

@@ -5,10 +5,11 @@ import { portalApiBase } from "./portal.js";
 export const LEGACY_ROLE_DISCOVERY_ORIGIN = "https://*.amazonaws.com/*";
 export const LEGACY_BACKEND_SESSION_REUSE_ORIGIN = "https://*.amazon.com/*";
 
-// This is the conservative console replacement: it still covers every
-// aws.amazon.com host, but no unrelated amazon.com site. Runtime code does not
-// request it until the real-Firefox cookie gate has passed.
-export const BACKEND_SESSION_REUSE_ORIGIN = "https://*.aws.amazon.com/*";
+// This covers the global and regional AWS Console hosts used by backend
+// session reuse, but excludes sibling aws.amazon.com services. Its production
+// cookie operations passed the isolated Firefox 149 and 155 scope gate.
+export const BACKEND_SESSION_REUSE_ORIGIN =
+  "https://*.console.aws.amazon.com/*";
 
 function literalOriginSet(origins) {
   if (!Array.isArray(origins)) return new Set();
@@ -124,4 +125,92 @@ export function backendSessionReuseOriginsForRevoke(grantedOrigins) {
       origin === BACKEND_SESSION_REUSE_ORIGIN
     )
     .sort();
+}
+
+const FEATURE_MODE = Object.freeze({
+  "role-discovery": "portal",
+  "backend-session-reuse": "backend",
+});
+
+/** Start only an explicit user-action transaction. Callers must invoke
+ * permissions.request() from the same synchronous click-handler stack. */
+export function beginExplicitPermissionTransaction({
+  trigger,
+  feature,
+  mode,
+  modeRevision,
+  classification,
+}) {
+  if (trigger !== "user-action") {
+    throw new Error("Permission changes require an explicit user action");
+  }
+  if (FEATURE_MODE[feature] !== mode) {
+    throw new Error("Permission feature does not belong to the active mode");
+  }
+  if (!Number.isSafeInteger(modeRevision) || modeRevision < 0) {
+    throw new Error("Invalid permission mode revision");
+  }
+  if (
+    !classification ||
+    typeof classification.targetOrigin !== "string" ||
+    typeof classification.targetGranted !== "boolean"
+  ) {
+    throw new Error("Invalid permission classification");
+  }
+  return {
+    feature,
+    expectedMode: mode,
+    expectedModeRevision: modeRevision,
+    targetOrigin: classification.targetOrigin,
+    targetWasLiteral: classification.targetGranted,
+    requestOrigins: classification.targetGranted
+      ? []
+      : [classification.targetOrigin],
+  };
+}
+
+/** Decide cleanup only from a fresh post-request permission inventory. */
+export function settleExplicitPermissionTransaction(transaction, {
+  requestOutcome,
+  currentMode,
+  currentModeRevision,
+  classification,
+}) {
+  const noRemoval = (state) => ({ state, removeOrigins: [] });
+  if (!transaction || !classification) {
+    throw new Error("Invalid permission transaction");
+  }
+  if (classification.targetOrigin !== transaction.targetOrigin) {
+    throw new Error("Permission target changed during the transaction");
+  }
+  if (requestOutcome === "declined") return noRemoval("declined");
+  if (requestOutcome === "error") return noRemoval("request-error");
+  if (!new Set(["accepted", "not-needed"]).has(requestOutcome)) {
+    throw new Error("Invalid permission request outcome");
+  }
+
+  if (
+    currentMode !== transaction.expectedMode ||
+    currentModeRevision !== transaction.expectedModeRevision
+  ) {
+    return {
+      state: "cancelled",
+      removeOrigins:
+        requestOutcome === "accepted" &&
+        !transaction.targetWasLiteral &&
+        classification.targetGranted
+          ? [transaction.targetOrigin]
+          : [],
+    };
+  }
+  if (!classification.targetGranted) {
+    return noRemoval("target-not-literal");
+  }
+  if (classification.removalCandidateOrigins.length > 0) {
+    return {
+      state: "cleanup-ready",
+      removeOrigins: [...classification.removalCandidateOrigins],
+    };
+  }
+  return noRemoval("enabled");
 }

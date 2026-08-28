@@ -6,10 +6,12 @@ import {
   LEGACY_BACKEND_SESSION_REUSE_ORIGIN,
   LEGACY_ROLE_DISCOVERY_ORIGIN,
   backendSessionReuseOriginsForRevoke,
+  beginExplicitPermissionTransaction,
   classifyBackendSessionReusePermission,
   classifyRoleDiscoveryPermission,
   roleDiscoveryOrigin,
   roleDiscoveryOriginsForRevoke,
+  settleExplicitPermissionTransaction,
 } from "../firefox-extension/shared/permissions.js";
 
 const SYNTHETIC_REGION = "xx-test-1";
@@ -124,8 +126,11 @@ test("a stale regional grant is preserved until the replacement is literal", () 
   assert.deepEqual(classification.removalCandidateOrigins, []);
 });
 
-test("backend reuse narrows only to the conservative AWS-owned subtree", () => {
-  assert.equal(BACKEND_SESSION_REUSE_ORIGIN, "https://*.aws.amazon.com/*");
+test("backend reuse narrows to the Firefox-proven console subtree", () => {
+  assert.equal(
+    BACKEND_SESSION_REUSE_ORIGIN,
+    "https://*.console.aws.amazon.com/*",
+  );
   assert.deepEqual(
     classifyBackendSessionReusePermission([]),
     expectedClassification({
@@ -270,4 +275,153 @@ test("the Phase 5A manifest retains legacy ceilings that cover all candidates", 
       `${candidate} must remain requestable from the Phase 5A manifest`,
     );
   }
+});
+
+function beginRoleTransaction(classification, overrides = {}) {
+  return beginExplicitPermissionTransaction({
+    trigger: "user-action",
+    feature: "role-discovery",
+    mode: "portal",
+    modeRevision: 4,
+    classification,
+    ...overrides,
+  });
+}
+
+test("permission transactions can begin only from the feature's explicit user action", () => {
+  const classification = classifyRoleDiscoveryPermission([], SYNTHETIC_REGION);
+  for (const trigger of ["startup", "update", "mode-switch"]) {
+    assert.throws(() => beginRoleTransaction(classification, { trigger }));
+  }
+  assert.throws(() => beginRoleTransaction(classification, { mode: "backend" }));
+  assert.throws(() => beginExplicitPermissionTransaction({
+    trigger: "user-action",
+    feature: "backend-session-reuse",
+    mode: "portal",
+    modeRevision: 4,
+    classification,
+  }));
+});
+
+test("begin preserves its input and requests a missing literal target", () => {
+  const classification = classifyRoleDiscoveryPermission(
+    [LEGACY_ROLE_DISCOVERY_ORIGIN],
+    SYNTHETIC_REGION,
+  );
+  const snapshot = structuredClone(classification);
+  const transaction = beginRoleTransaction(classification);
+  assert.deepEqual(classification, snapshot);
+  assert.deepEqual(transaction, {
+    feature: "role-discovery",
+    expectedMode: "portal",
+    expectedModeRevision: 4,
+    targetOrigin: ROLE_ORIGIN,
+    targetWasLiteral: false,
+    requestOrigins: [ROLE_ORIGIN],
+  });
+});
+
+test("decline and request error never propose permission removal", () => {
+  const initial = classifyRoleDiscoveryPermission(
+    [LEGACY_ROLE_DISCOVERY_ORIGIN],
+    SYNTHETIC_REGION,
+  );
+  const transaction = beginRoleTransaction(initial);
+  for (const [requestOutcome, state] of [
+    ["declined", "declined"],
+    ["error", "request-error"],
+  ]) {
+    assert.deepEqual(
+      settleExplicitPermissionTransaction(transaction, {
+        requestOutcome,
+        currentMode: "portal",
+        currentModeRevision: 4,
+        classification: initial,
+      }),
+      { state, removeOrigins: [] },
+    );
+  }
+});
+
+test("accepted coverage without a literal target preserves legacy access", () => {
+  const legacy = classifyRoleDiscoveryPermission(
+    [LEGACY_ROLE_DISCOVERY_ORIGIN],
+    SYNTHETIC_REGION,
+  );
+  const decision = settleExplicitPermissionTransaction(
+    beginRoleTransaction(legacy),
+    {
+      requestOutcome: "accepted",
+      currentMode: "portal",
+      currentModeRevision: 4,
+      classification: legacy,
+    },
+  );
+  assert.deepEqual(decision, {
+    state: "target-not-literal",
+    removeOrigins: [],
+  });
+  assert.equal(legacy.effectiveGranted, true);
+});
+
+test("fresh literal proof enables cleanup of only freshly classified grants", () => {
+  const initial = classifyRoleDiscoveryPermission(
+    [LEGACY_ROLE_DISCOVERY_ORIGIN, PREVIOUS_ROLE_ORIGIN],
+    SYNTHETIC_REGION,
+  );
+  const fresh = classifyRoleDiscoveryPermission(
+    [LEGACY_ROLE_DISCOVERY_ORIGIN, PREVIOUS_ROLE_ORIGIN, ROLE_ORIGIN],
+    SYNTHETIC_REGION,
+  );
+  assert.deepEqual(
+    settleExplicitPermissionTransaction(beginRoleTransaction(initial), {
+      requestOutcome: "accepted",
+      currentMode: "portal",
+      currentModeRevision: 4,
+      classification: fresh,
+    }),
+    {
+      state: "cleanup-ready",
+      removeOrigins: [LEGACY_ROLE_DISCOVERY_ORIGIN, PREVIOUS_ROLE_ORIGIN],
+    },
+  );
+});
+
+test("a mode change rolls back only a target newly added by this transaction", () => {
+  const missing = classifyRoleDiscoveryPermission([], SYNTHETIC_REGION);
+  const literal = classifyRoleDiscoveryPermission([ROLE_ORIGIN], SYNTHETIC_REGION);
+  assert.deepEqual(
+    settleExplicitPermissionTransaction(beginRoleTransaction(missing), {
+      requestOutcome: "accepted",
+      currentMode: "backend",
+      currentModeRevision: 5,
+      classification: literal,
+    }),
+    { state: "cancelled", removeOrigins: [ROLE_ORIGIN] },
+  );
+
+  const existingTransaction = beginRoleTransaction(literal);
+  assert.deepEqual(
+    settleExplicitPermissionTransaction(existingTransaction, {
+      requestOutcome: "not-needed",
+      currentMode: "backend",
+      currentModeRevision: 5,
+      classification: literal,
+    }),
+    { state: "cancelled", removeOrigins: [] },
+  );
+});
+
+test("settlement fails closed if the permission target changes", () => {
+  const initial = classifyRoleDiscoveryPermission([], SYNTHETIC_REGION);
+  const changed = classifyRoleDiscoveryPermission([], PREVIOUS_SYNTHETIC_REGION);
+  assert.throws(() => settleExplicitPermissionTransaction(
+    beginRoleTransaction(initial),
+    {
+      requestOutcome: "accepted",
+      currentMode: "portal",
+      currentModeRevision: 4,
+      classification: changed,
+    },
+  ));
 });

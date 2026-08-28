@@ -6,14 +6,27 @@ import {
   BACKEND_SSO_IDENTITY_KEY,
   BACKEND_SSO_PROFILE_KEY,
 } from "../firefox-extension/shared/backend.js";
+import {
+  BACKEND_SESSION_REUSE_ORIGIN,
+  LEGACY_BACKEND_SESSION_REUSE_ORIGIN,
+  LEGACY_ROLE_DISCOVERY_ORIGIN,
+  roleDiscoveryOrigin,
+} from "../firefox-extension/shared/permissions.js";
 
 const OPTIONS_MODULE = new URL(
   "../firefox-extension/options/options.js",
   import.meta.url,
 );
 
-const PORTAL_API_ORIGINS = ["https://*.amazonaws.com/*"];
-const CONSOLE_ORIGINS = ["https://*.amazon.com/*"];
+const SYNTHETIC_REGION = "xx-test-1";
+const REPLACEMENT_SYNTHETIC_REGION = "yy-test-2";
+const ROLE_DISCOVERY_ORIGINS = [roleDiscoveryOrigin(SYNTHETIC_REGION)];
+const REPLACEMENT_ROLE_DISCOVERY_ORIGINS = [
+  roleDiscoveryOrigin(REPLACEMENT_SYNTHETIC_REGION),
+];
+const LEGACY_ROLE_DISCOVERY_ORIGINS = [LEGACY_ROLE_DISCOVERY_ORIGIN];
+const CONSOLE_ORIGINS = [BACKEND_SESSION_REUSE_ORIGIN];
+const LEGACY_CONSOLE_ORIGINS = [LEGACY_BACKEND_SESSION_REUSE_ORIGIN];
 const BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY =
   "backendSessionReuseAutoOfferHandled";
 const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
@@ -22,6 +35,21 @@ const REPLACEMENT_SYNTHETIC_HELPER_TOKEN = `__CONTAINOODLE_TEST_${"4".repeat(23)
 const SYNTHETIC_PROFILE = "__CONTAINOODLE_TEST_PROFILE__";
 const SYNTHETIC_IDENTITY_KEY = "0".repeat(64);
 const PREVIOUS_SYNTHETIC_IDENTITY_KEY = "4".repeat(64);
+
+function matchPatternCovers(ceiling, requested) {
+  const parse = (pattern) => {
+    const match = /^https:\/\/(\*\.)?([^/]+)\/\*$/.exec(pattern);
+    return match && { wildcard: Boolean(match[1]), hostname: match[2] };
+  };
+  const allowed = parse(ceiling);
+  const candidate = parse(requested);
+  if (!allowed || !candidate) return ceiling === requested;
+  if (!allowed.wildcard) {
+    return !candidate.wildcard && candidate.hostname === allowed.hostname;
+  }
+  return candidate.hostname === allowed.hostname ||
+    candidate.hostname.endsWith(`.${allowed.hostname}`);
+}
 
 function decodeBase64Url(value) {
   const base64 = value.replace(/-/g, "+").replace(/_/g, "/") + "=";
@@ -222,6 +250,7 @@ function createFixture({
   const permissionSet = new Set(granted);
   const permissionRequests = [];
   const permissionRemovals = [];
+  const permissionCallOrder = [];
   const runtimeMessages = [];
   const fetchCalls = [];
   const storageSetCalls = [];
@@ -235,7 +264,7 @@ function createFixture({
       mode: "backend",
       backendUrl: "http://127.0.0.1:8765",
       portalStartUrl: "",
-      ssoRegion: "",
+      ssoRegion: SYNTHETIC_REGION,
       defaultRole: "",
       groupNamePattern: "",
       groupNameReplacement: "",
@@ -251,7 +280,10 @@ function createFixture({
   let readinessOverride = null;
   let permissionRequestAllowed = true;
   let permissionRequestError = null;
+  let permissionRequestGate = null;
+  let materializeCoveredPermissionRequest = true;
   let permissionRemovalFailureOrigin = null;
+  let portalReadinessGate = null;
   let configWriteGate = null;
   let failNextStorageWrite = false;
   let failNextConfigWrite = false;
@@ -270,6 +302,11 @@ function createFixture({
   let challengeSequence = 0;
   let helperToken = storageData[BACKEND_AUTH_TOKEN_KEY];
 
+  const hasEffectiveOrigin = (requested) =>
+    [...permissionSet].some((grantedOrigin) =>
+      matchPatternCovers(grantedOrigin, requested)
+    );
+
   function currentReadiness() {
     if (readinessOverride) return { ...readinessOverride };
 
@@ -279,6 +316,9 @@ function createFixture({
       ? `${new URL(portalStartUrl).origin}/*`
       : null;
     const portalAccess = Boolean(portalOrigin && permissionSet.has(portalOrigin));
+    const roleDiscoveryPermissionOrigin = configured && sessionAvailable
+      ? roleDiscoveryOrigin(storageData.config.ssoRegion)
+      : null;
 
     return {
       ok: true,
@@ -286,12 +326,15 @@ function createFixture({
       configured,
       portalAccess,
       session: portalAccess && sessionAvailable,
-      roleDiscoveryAccess: PORTAL_API_ORIGINS.every((origin) =>
-        permissionSet.has(origin),
+      roleDiscoveryAccess: Boolean(
+        roleDiscoveryPermissionOrigin &&
+        hasEffectiveOrigin(roleDiscoveryPermissionOrigin)
       ),
-      consoleAccess: CONSOLE_ORIGINS.every((origin) =>
-        permissionSet.has(origin),
-      ),
+      roleDiscoveryRegion: roleDiscoveryPermissionOrigin
+        ? storageData.config.ssoRegion
+        : null,
+      roleDiscoveryPermissionOrigin,
+      consoleAccess: CONSOLE_ORIGINS.every(hasEffectiveOrigin),
     };
   }
 
@@ -333,21 +376,37 @@ function createFixture({
     permissions: {
       onAdded,
       onRemoved,
+      async getAll() {
+        permissionCallOrder.push("getAll");
+        return { origins: [...permissionSet] };
+      },
       async contains({ origins }) {
-        return origins.every((origin) => permissionSet.has(origin));
+        return origins.every(hasEffectiveOrigin);
       },
       async request({ origins }) {
+        permissionCallOrder.push(`request:${origins.join(",")}`);
         permissionRequests.push([...origins]);
+        if (permissionRequestGate) {
+          const gate = permissionRequestGate;
+          permissionRequestGate = null;
+          await gate.promise;
+        }
         if (permissionRequestError) {
           const error = permissionRequestError;
           permissionRequestError = null;
           throw error;
         }
         if (!permissionRequestAllowed) return false;
-        origins.forEach((origin) => permissionSet.add(origin));
+        if (
+          materializeCoveredPermissionRequest ||
+          !origins.every(hasEffectiveOrigin)
+        ) {
+          origins.forEach((origin) => permissionSet.add(origin));
+        }
         return true;
       },
       async remove({ origins }) {
+        permissionCallOrder.push(`remove:${origins.join(",")}`);
         permissionRemovals.push([...origins]);
         if (
           permissionRemovalFailureOrigin &&
@@ -363,7 +422,15 @@ function createFixture({
     runtime: {
       async sendMessage(message) {
         runtimeMessages.push({ ...message });
-        if (message.type === "portal-readiness") return currentReadiness();
+        if (message.type === "portal-readiness") {
+          if (portalReadinessGate) {
+            const gate = portalReadinessGate;
+            portalReadinessGate = null;
+            await gate.promise;
+            if (gate.error) throw gate.error;
+          }
+          return currentReadiness();
+        }
         if (message.type === "open-portal") return { ok: true };
         if (message.type === "reset-group-titles") {
           return { ...resetGroupTitlesResult };
@@ -473,6 +540,7 @@ function createFixture({
     storageData,
     permissionRequests,
     permissionRemovals,
+    permissionCallOrder,
     runtimeMessages,
     fetch,
     fetchCalls,
@@ -491,11 +559,31 @@ function createFixture({
     setPermissionRequestAllowed(value) {
       permissionRequestAllowed = value;
     },
+    setMaterializeCoveredPermissionRequest(value) {
+      materializeCoveredPermissionRequest = value;
+    },
+    pauseNextPermissionRequest() {
+      let release;
+      const promise = new Promise((resolve) => { release = resolve; });
+      permissionRequestGate = { promise, release };
+      return release;
+    },
+    grantedOrigins() {
+      return [...permissionSet];
+    },
     failNextPermissionRequest(error = new Error("simulated permission request failure")) {
       permissionRequestError = error;
     },
     failPermissionRemovalFor(origin) {
       permissionRemovalFailureOrigin = origin;
+    },
+    pauseNextPortalReadiness(
+      error = new Error("simulated stale portal readiness failure"),
+    ) {
+      let release;
+      const promise = new Promise((resolve) => { release = resolve; });
+      portalReadinessGate = { promise, release, error };
+      return release;
     },
     pauseNextConfigWrite() {
       let release;
@@ -1065,7 +1153,7 @@ test("first backend Save & test offers session reuse synchronously without block
     );
     assert.match(
       fixture.elements.get("console-status").textContent,
-      /Disabled/,
+      /declined/,
     );
 
     await fixture.elements.get("backend-save").dispatch("click");
@@ -1180,6 +1268,148 @@ test("a remembered auto-offer decision survives reload and an existing grant rec
     await alreadyGranted.elements.get("backend-save").dispatch("click");
     await waitForBackendRequest(alreadyGranted);
     assert.deepEqual(alreadyGranted.permissionRequests, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("explicit legacy migration requests first, then removes broad access after literal proof", async () => {
+  const fixture = createFixture({ granted: LEGACY_CONSOLE_ORIGINS });
+  try {
+    await loadOptions(fixture);
+    assert.match(
+      fixture.elements.get("console-status").textContent,
+      /older broad access/,
+    );
+    assert.equal(fixture.elements.get("console-grant").textContent, "Tighten access");
+
+    fixture.permissionCallOrder.length = 0;
+    await fixture.elements.get("console-grant").dispatch("click");
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+
+    assert.equal(
+      fixture.permissionCallOrder[0],
+      `request:${BACKEND_SESSION_REUSE_ORIGIN}`,
+    );
+    assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+    assert.deepEqual(fixture.permissionRemovals, [LEGACY_CONSOLE_ORIGINS]);
+    assert.deepEqual(fixture.grantedOrigins(), CONSOLE_ORIGINS);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a covered request that stays broad preserves the working legacy grant", async () => {
+  const fixture = createFixture({ granted: LEGACY_CONSOLE_ORIGINS });
+  fixture.setMaterializeCoveredPermissionRequest(false);
+  try {
+    await loadOptions(fixture);
+    fixture.permissionCallOrder.length = 0;
+    await fixture.elements.get("console-grant").dispatch("click");
+    await waitFor(() => /kept the older broad grant/.test(
+      fixture.elements.get("console-status").textContent,
+    ));
+
+    assert.equal(
+      fixture.permissionCallOrder[0],
+      `request:${BACKEND_SESSION_REUSE_ORIGIN}`,
+    );
+    assert.deepEqual(fixture.permissionRemovals, []);
+    assert.deepEqual(fixture.grantedOrigins(), LEGACY_CONSOLE_ORIGINS);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("finish tightening removes a legacy grant without another prompt", async () => {
+  const fixture = createFixture({
+    granted: [...LEGACY_CONSOLE_ORIGINS, ...CONSOLE_ORIGINS],
+  });
+  try {
+    await loadOptions(fixture);
+    assert.equal(
+      fixture.elements.get("console-grant").textContent,
+      "Finish tightening",
+    );
+    fixture.permissionCallOrder.length = 0;
+    await fixture.elements.get("console-grant").dispatch("click");
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+    await waitFor(() => /repeated backend launches/.test(
+      fixture.elements.get("console-status").textContent,
+    ));
+
+    assert.equal(fixture.permissionRequests.length, 0);
+    assert.equal(fixture.permissionCallOrder[0], "getAll");
+    assert.deepEqual(fixture.permissionRemovals, [LEGACY_CONSOLE_ORIGINS]);
+    assert.deepEqual(fixture.grantedOrigins(), CONSOLE_ORIGINS);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a failed tightening cleanup preserves both working grants and reports the failure", async () => {
+  const fixture = createFixture({
+    granted: [...LEGACY_CONSOLE_ORIGINS, ...CONSOLE_ORIGINS],
+  });
+  fixture.failPermissionRemovalFor(LEGACY_BACKEND_SESSION_REUSE_ORIGIN);
+  try {
+    await loadOptions(fixture);
+    await fixture.elements.get("console-grant").dispatch("click");
+    await waitFor(() => /simulated permission removal failure/.test(
+      fixture.elements.get("console-status").textContent,
+    ));
+
+    assert.deepEqual(
+      fixture.grantedOrigins(),
+      [...LEGACY_CONSOLE_ORIGINS, ...CONSOLE_ORIGINS],
+    );
+    assert.equal(
+      fixture.elements.get("console-grant").textContent,
+      "Finish tightening",
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a mode change rolls back only a newly accepted narrow grant", async () => {
+  const fixture = createFixture();
+  const releaseRequest = fixture.pauseNextPermissionRequest();
+  try {
+    await loadOptions(fixture);
+    fixture.permissionCallOrder.length = 0;
+    await fixture.elements.get("console-grant").dispatch("click");
+    assert.equal(
+      fixture.permissionCallOrder[0],
+      `request:${BACKEND_SESSION_REUSE_ORIGIN}`,
+    );
+
+    const portalMode = fixture.elements.get("mode-portal");
+    portalMode.checked = true;
+    await portalMode.dispatch("change");
+    await waitFor(() => fixture.storageData.config.mode === "portal");
+    releaseRequest();
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+
+    assert.deepEqual(fixture.permissionRemovals, [CONSOLE_ORIGINS]);
+    assert.deepEqual(fixture.grantedOrigins(), []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("startup inspects but never migrates permissions", async () => {
+  const fixture = createFixture({
+    granted: [...LEGACY_CONSOLE_ORIGINS, ...CONSOLE_ORIGINS],
+  });
+  try {
+    await loadOptions(fixture);
+    assert.deepEqual(fixture.permissionRequests, []);
+    assert.deepEqual(fixture.permissionRemovals, []);
+    assert.deepEqual(
+      fixture.grantedOrigins(),
+      [...LEGACY_CONSOLE_ORIGINS, ...CONSOLE_ORIGINS],
+    );
   } finally {
     cleanupGlobals();
   }
@@ -1398,7 +1628,13 @@ test("backend settings reject remote helper addresses without saving or fetching
 });
 
 test("portal core access requests only the normalized portal host", async () => {
-  const fixture = createFixture({ config: { mode: "portal" } });
+  const fixture = createFixture({
+    config: { mode: "portal" },
+    storage: {
+      portalRegionCache: "yy-test-2",
+      portalRegionCacheOrigin: "https://d-9999999999.awsapps.com",
+    },
+  });
   try {
     await loadOptions(fixture);
     const portalUrl = fixture.elements.get("portal-url");
@@ -1413,8 +1649,10 @@ test("portal core access requests only the normalized portal host", async () => 
       fixture.storageData.config.portalStartUrl,
       "https://d-1234567890.awsapps.com/start",
     );
+    assert.equal(fixture.storageData.portalRegionCache, undefined);
+    assert.equal(fixture.storageData.portalRegionCacheOrigin, undefined);
     assert.equal(
-      fixture.permissionRequests[0].includes(PORTAL_API_ORIGINS[0]),
+      fixture.permissionRequests[0].includes(ROLE_DISCOVERY_ORIGINS[0]),
       false,
     );
     assert.equal(
@@ -1641,19 +1879,108 @@ test("manual, cookie, and focus events refresh portal readiness", async () => {
   }
 });
 
-test("role choices and session reuse permissions are isolated to their modes", async () => {
-  const fixture = createFixture({ config: { mode: "portal" } });
+test("a superseded readiness failure cannot overwrite the newest portal status", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl },
+    granted: ["https://d-0000000000.awsapps.com/*"],
+  });
+  try {
+    await loadOptions(fixture);
+    const releaseStaleReadiness = fixture.pauseNextPortalReadiness();
+    const readinessCount = () => fixture.runtimeMessages.filter(
+      ({ type }) => type === "portal-readiness",
+    ).length;
+    const before = readinessCount();
+
+    await fixture.elements.get("portal-refresh").dispatch("click");
+    await waitFor(() => readinessCount() === before + 1);
+    await fixture.elements.get("portal-refresh").dispatch("click");
+    await waitFor(() => readinessCount() === before + 2);
+    await waitFor(() => /source session detected/.test(
+      fixture.elements.get("portal-status").textContent,
+    ));
+
+    releaseStaleReadiness();
+    await settle();
+    assert.match(
+      fixture.elements.get("portal-status").textContent,
+      /source session detected/,
+    );
+    assert.doesNotMatch(
+      fixture.elements.get("portal-status").textContent,
+      /stale portal readiness failure/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("role permission is never requested without a validated cached target", async () => {
+  const fixture = createFixture({ config: { mode: "portal", ssoRegion: "" } });
   try {
     await loadOptions(fixture);
     await fixture.elements.get("role-discovery-grant").dispatch("click");
     await settle();
+    assert.deepEqual(fixture.permissionRequests, []);
+    assert.match(
+      fixture.elements.get("role-discovery-status").textContent,
+      /Sign in and refresh readiness/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a stale regional role grant remains explicitly revocable without a current target", async () => {
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl: "", ssoRegion: "" },
+    granted: REPLACEMENT_ROLE_DISCOVERY_ORIGINS,
+  });
+  try {
+    await loadOptions(fixture);
+    assert.equal(fixture.elements.get("role-discovery-revoke").disabled, false);
+    assert.match(
+      fixture.elements.get("role-discovery-status").textContent,
+      /Existing role access is still granted/,
+    );
+
+    await fixture.elements.get("role-discovery-revoke").dispatch("click");
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+    await settle();
+
+    assert.deepEqual(
+      fixture.permissionRemovals,
+      [REPLACEMENT_ROLE_DISCOVERY_ORIGINS],
+    );
+    assert.deepEqual(fixture.grantedOrigins(), []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("role choices and session reuse permissions are isolated to their modes", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl },
+    granted: ["https://d-0000000000.awsapps.com/*"],
+  });
+  try {
+    await loadOptions(fixture);
+    fixture.permissionCallOrder.length = 0;
+    await fixture.elements.get("role-discovery-grant").dispatch("click");
+    await settle();
+    assert.equal(
+      fixture.permissionCallOrder[0],
+      `request:${ROLE_DISCOVERY_ORIGINS[0]}`,
+    );
     await fixture.elements.get("role-discovery-revoke").dispatch("click");
     await settle();
 
     // A stale or scripted click cannot activate the hidden backend permission.
     await fixture.elements.get("console-grant").dispatch("click");
     await settle();
-    assert.deepEqual(fixture.permissionRequests, [PORTAL_API_ORIGINS]);
+    assert.deepEqual(fixture.permissionRequests, [ROLE_DISCOVERY_ORIGINS]);
 
     fixture.elements.get("mode-portal").checked = false;
     fixture.elements.get("mode-backend").checked = true;
@@ -1663,7 +1990,7 @@ test("role choices and session reuse permissions are isolated to their modes", a
     // The portal-only control is equally inert in backend mode.
     await fixture.elements.get("role-discovery-grant").dispatch("click");
     await settle();
-    assert.deepEqual(fixture.permissionRequests, [PORTAL_API_ORIGINS]);
+    assert.deepEqual(fixture.permissionRequests, [ROLE_DISCOVERY_ORIGINS]);
 
     await fixture.elements.get("console-grant").dispatch("click");
     await settle();
@@ -1671,13 +1998,117 @@ test("role choices and session reuse permissions are isolated to their modes", a
     await settle();
 
     assert.deepEqual(fixture.permissionRequests, [
-      PORTAL_API_ORIGINS,
+      ROLE_DISCOVERY_ORIGINS,
       CONSOLE_ORIGINS,
     ]);
     assert.deepEqual(fixture.permissionRemovals, [
-      PORTAL_API_ORIGINS,
+      ROLE_DISCOVERY_ORIGINS,
       CONSOLE_ORIGINS,
     ]);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("explicit role migration requests the cached regional target before removing broad access", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const portalOrigin = "https://d-0000000000.awsapps.com/*";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl },
+    granted: [portalOrigin, ...LEGACY_ROLE_DISCOVERY_ORIGINS],
+  });
+  try {
+    await loadOptions(fixture);
+    assert.match(
+      fixture.elements.get("role-discovery-status").textContent,
+      /older broad access/,
+    );
+
+    fixture.permissionCallOrder.length = 0;
+    await fixture.elements.get("role-discovery-grant").dispatch("click");
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+
+    assert.equal(
+      fixture.permissionCallOrder[0],
+      `request:${ROLE_DISCOVERY_ORIGINS[0]}`,
+    );
+    assert.deepEqual(fixture.permissionRequests, [ROLE_DISCOVERY_ORIGINS]);
+    assert.deepEqual(fixture.permissionRemovals, [LEGACY_ROLE_DISCOVERY_ORIGINS]);
+    assert.deepEqual(
+      fixture.grantedOrigins().sort(),
+      [portalOrigin, ...ROLE_DISCOVERY_ORIGINS].sort(),
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a mode change rolls back a newly accepted regional role grant", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const portalOrigin = "https://d-0000000000.awsapps.com/*";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl },
+    granted: [portalOrigin],
+  });
+  const releaseRequest = fixture.pauseNextPermissionRequest();
+  try {
+    await loadOptions(fixture);
+    fixture.permissionCallOrder.length = 0;
+    await fixture.elements.get("role-discovery-grant").dispatch("click");
+    assert.equal(
+      fixture.permissionCallOrder[0],
+      `request:${ROLE_DISCOVERY_ORIGINS[0]}`,
+    );
+
+    const backendMode = fixture.elements.get("mode-backend");
+    backendMode.checked = true;
+    await backendMode.dispatch("change");
+    await waitFor(() => fixture.storageData.config.mode === "backend");
+    releaseRequest();
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+
+    assert.deepEqual(fixture.permissionRemovals, [ROLE_DISCOVERY_ORIGINS]);
+    assert.deepEqual(fixture.grantedOrigins(), [portalOrigin]);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a same-mode region change cancels an older role grant without touching current access", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const portalOrigin = "https://d-0000000000.awsapps.com/*";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl },
+    granted: [
+      portalOrigin,
+      ...LEGACY_ROLE_DISCOVERY_ORIGINS,
+      ...REPLACEMENT_ROLE_DISCOVERY_ORIGINS,
+    ],
+  });
+  const releaseRequest = fixture.pauseNextPermissionRequest();
+  try {
+    await loadOptions(fixture);
+    await fixture.elements.get("role-discovery-grant").dispatch("click");
+    assert.deepEqual(fixture.permissionRequests, [ROLE_DISCOVERY_ORIGINS]);
+
+    fixture.elements.get("sso-region").value = REPLACEMENT_SYNTHETIC_REGION;
+    await fixture.elements.get("role-save").dispatch("click");
+    await waitFor(
+      () => fixture.storageData.config.ssoRegion === REPLACEMENT_SYNTHETIC_REGION,
+    );
+
+    releaseRequest();
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+
+    assert.deepEqual(fixture.permissionRemovals, [ROLE_DISCOVERY_ORIGINS]);
+    assert.deepEqual(
+      fixture.grantedOrigins().sort(),
+      [
+        portalOrigin,
+        ...LEGACY_ROLE_DISCOVERY_ORIGINS,
+        ...REPLACEMENT_ROLE_DISCOVERY_ORIGINS,
+      ].sort(),
+    );
   } finally {
     cleanupGlobals();
   }
