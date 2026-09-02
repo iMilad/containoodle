@@ -455,8 +455,28 @@ v1.0.3 baseline and is expected to require a later implementation change.
 
 ### Live non-production acceptance gate
 
-Status: **deferred/manual for Phase 5**. The Firefox 149.0/155.0 synthetic scope
-gate above does not replace these real portal and helper checks.
+Status: **partially executed manually for Phase 5**. The Firefox 149.0/155.0
+synthetic scope gate above does not replace these real portal and helper checks.
+
+On 2026-09-02, a dedicated Firefox Developer Edition profile completed the
+explicit permission checks against non-production AWS access without recording
+any account, profile, or role identifiers:
+
+- Portal role discovery was granted, revoked, and granted again. Normal portal
+  launch remained functional while revoked, the saved pin remained available,
+  and live role choices returned after re-granting the exact regional access.
+- Firefox retained the legacy broad backend grant when the narrower request was
+  covered but not stored literally. The controlled Revoke then Allow flow
+  replaced it with console-only access. Session reuse worked with that access;
+  after another revoke, a normal helper launch still succeeded; the narrow grant
+  was then restored.
+- Portal-region auto-detection was unavailable despite a detected source
+  session. The documented explicit region override enabled the exact regional
+  request. Options now reports that condition accurately instead of asking the
+  already signed-in user to sign in again.
+
+This records only the permission migration and launch-continuity checks above;
+the remaining acceptance items stay open.
 
 - [ ] Only after every local gate passes, start the real helper and run both
   launch paths against non-production AWS accounts. Verify the visible account

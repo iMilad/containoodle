@@ -485,7 +485,10 @@ function hasManagedGrant(classification) {
   );
 }
 
-function renderRoleDiscoveryStatus(classification, { managedWithoutTarget = false } = {}) {
+function renderRoleDiscoveryStatus(
+  classification,
+  { managedWithoutTarget = false, portalSession = false } = {},
+) {
   const targetReady = Boolean(roleDiscoveryPermissionTarget && classification);
   const grant = el("role-discovery-grant");
   const revoke = el("role-discovery-revoke");
@@ -507,8 +510,12 @@ function renderRoleDiscoveryStatus(classification, { managedWithoutTarget = fals
     setStatus(
       "role-discovery-status",
       managedWithoutTarget
-        ? "Existing role access is still granted · sign in and refresh to tighten it, or revoke it now"
-        : "Sign in and refresh readiness before allowing role choices",
+        ? portalSession
+          ? "A previously granted role-access permission is still stored · set the SSO region below to tighten it, or revoke it now"
+          : "Existing role access is still granted · sign in and refresh to tighten it, or revoke it now"
+        : portalSession
+          ? "Portal session detected, but the SSO region could not be detected · set it under Advanced: SSO region override"
+          : "Sign in and refresh readiness before allowing role choices",
       managedWithoutTarget || undefined,
     );
   } else if (cleanupPending) {
@@ -778,6 +785,7 @@ async function refreshPortalReadiness() {
       renderRoleDiscoveryStatus(null, {
         managedWithoutTarget:
           roleDiscoveryOriginsForRevoke(grantedOrigins).length > 0,
+        portalSession: Boolean(ready.session),
       });
     }
 

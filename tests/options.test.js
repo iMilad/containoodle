@@ -1932,6 +1932,77 @@ test("role permission is never requested without a validated cached target", asy
   }
 });
 
+test("a signed-in portal with no detected region points to the manual override", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl, ssoRegion: "" },
+    granted: ["https://d-0000000000.awsapps.com/*"],
+  });
+  fixture.setReadiness({
+    ok: true,
+    mode: "portal",
+    configured: true,
+    portalAccess: true,
+    session: true,
+    roleDiscoveryAccess: false,
+    roleDiscoveryRegion: null,
+    roleDiscoveryPermissionOrigin: null,
+    consoleAccess: false,
+  });
+  try {
+    await loadOptions(fixture);
+
+    assert.equal(fixture.elements.get("role-discovery-grant").disabled, true);
+    assert.equal(fixture.elements.get("role-discovery-revoke").disabled, true);
+    assert.match(
+      fixture.elements.get("role-discovery-status").textContent,
+      /SSO region could not be detected.*Advanced: SSO region override/,
+    );
+    assert.doesNotMatch(
+      fixture.elements.get("role-discovery-status").textContent,
+      /Sign in/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a signed-in portal can revoke stored role access without a detected region", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl, ssoRegion: "" },
+    granted: [
+      "https://d-0000000000.awsapps.com/*",
+      ...REPLACEMENT_ROLE_DISCOVERY_ORIGINS,
+    ],
+  });
+  fixture.setReadiness({
+    ok: true,
+    mode: "portal",
+    configured: true,
+    portalAccess: true,
+    session: true,
+    roleDiscoveryAccess: false,
+    roleDiscoveryRegion: null,
+    roleDiscoveryPermissionOrigin: null,
+    consoleAccess: false,
+  });
+  try {
+    await loadOptions(fixture);
+
+    assert.equal(fixture.elements.get("role-discovery-grant").disabled, true);
+    assert.equal(fixture.elements.get("role-discovery-revoke").disabled, false);
+    assert.match(
+      fixture.elements.get("role-discovery-status").textContent,
+      /previously granted.*still stored.*set the SSO region.*or revoke it now/,
+    );
+    assert.deepEqual(fixture.permissionRequests, []);
+    assert.deepEqual(fixture.permissionRemovals, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
 test("a stale regional role grant remains explicitly revocable without a current target", async () => {
   const fixture = createFixture({
     config: { mode: "portal", portalStartUrl: "", ssoRegion: "" },
