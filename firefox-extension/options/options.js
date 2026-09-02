@@ -31,6 +31,13 @@ import {
   roleDiscoveryOriginsForRevoke,
   settleExplicitPermissionTransaction,
 } from "../shared/permissions.js";
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_STATES,
+  isOnboardingPending,
+  normalizeOnboardingState,
+  onboardingStateForMode,
+} from "../shared/onboarding.js";
 
 const DEFAULT_CONFIG = {
   mode: "backend",
@@ -52,6 +59,10 @@ let backendRequestController = null;
 let backendSsoProfile = "";
 let backendSessionReuseAutoOfferHandled = false;
 let consolePermissionGranted = false;
+// Connection saves and onboarding completion need their own revision. Optional
+// permission discovery can legitimately change while one of those saves is in
+// flight (for example when the requested portal grant fires permissions.onAdded).
+let connectionContextRevision = 0;
 // Advances whenever the active mode or a mode-specific permission target
 // changes, so an older prompt cannot clean up grants for the new context.
 let permissionModeRevision = 0;
@@ -61,6 +72,9 @@ let roleDiscoveryPermissionTarget = null;
 let roleDiscoveryClassification = null;
 let lastValidatedRoleDiscoveryPermissionTarget = null;
 let portalReadinessSequence = 0;
+let onboardingState = null;
+let onboardingDismissedForPage = false;
+let portalCorePermissionOperations = 0;
 
 function setStatus(id, message, ok) {
   const node = el(id);
@@ -79,15 +93,103 @@ function setBackendSsoProfileInvalid(invalid) {
   );
 }
 
-function saveConfig(patch) {
+function saveConfig(
+  patch,
+  { nextOnboardingState, expectedContext } = {},
+) {
   const operation = async () => {
+    if (expectedContext) {
+      if (!localConnectionContextMatches(expectedContext)) return false;
+      if (!await persistedConnectionContextMatches(expectedContext)) return false;
+      if (!localConnectionContextMatches(expectedContext)) return false;
+    }
     const nextConfig = { ...config, ...patch };
-    await browser.storage.local.set({ config: nextConfig });
+    const values = { config: nextConfig };
+    if (nextOnboardingState !== undefined) {
+      values[ONBOARDING_KEY] = nextOnboardingState;
+    }
+    await browser.storage.local.set(values);
     config = nextConfig;
+    if (nextOnboardingState !== undefined) {
+      onboardingState = normalizeOnboardingState(nextOnboardingState);
+    }
+    return true;
   };
   const result = configSaveQueue.then(operation, operation);
   configSaveQueue = result.catch(() => {});
   return result;
+}
+
+function onboardingIsChoosing() {
+  return onboardingState === ONBOARDING_STATES.CHOOSE;
+}
+
+function activeModeIs(mode) {
+  return !onboardingIsChoosing() && config.mode === mode;
+}
+
+function configsMatch(left, right) {
+  if (
+    !left || typeof left !== "object" || Array.isArray(left) ||
+    !right || typeof right !== "object" || Array.isArray(right)
+  ) {
+    return false;
+  }
+  const effectiveLeft = { ...DEFAULT_CONFIG, ...left };
+  const effectiveRight = { ...DEFAULT_CONFIG, ...right };
+  const leftKeys = Object.keys(effectiveLeft);
+  const rightKeys = Object.keys(effectiveRight);
+  return leftKeys.length === rightKeys.length && leftKeys.every(
+    (key) => Object.prototype.hasOwnProperty.call(effectiveRight, key) &&
+      effectiveLeft[key] === effectiveRight[key],
+  );
+}
+
+async function persistedConnectionContextMatches({
+  expectedConfig,
+  expectedOnboardingState,
+}) {
+  const stored = await browser.storage.local.get(["config", ONBOARDING_KEY]);
+  return configsMatch(stored.config, expectedConfig) &&
+    normalizeOnboardingState(stored[ONBOARDING_KEY]) ===
+      expectedOnboardingState;
+}
+
+function localConnectionContextMatches({
+  expectedConfig,
+  expectedOnboardingState,
+  expectedConnectionRevision,
+}) {
+  return connectionContextRevision === expectedConnectionRevision &&
+    configsMatch(config, expectedConfig) &&
+    onboardingState === expectedOnboardingState;
+}
+
+function captureConnectionContext() {
+  return {
+    expectedConfig: { ...config },
+    expectedOnboardingState: onboardingState,
+    expectedConnectionRevision: connectionContextRevision,
+  };
+}
+
+function renderOnboarding() {
+  const panel = el("onboarding");
+  const active = isOnboardingPending(onboardingState) &&
+    !onboardingDismissedForPage;
+  panel.hidden = !active;
+  panel.setAttribute("aria-hidden", String(!active));
+  if (!active) return;
+
+  const descriptions = {
+    [ONBOARDING_STATES.CHOOSE]:
+      "Choose Local AWS CLI helper or AWS access portal below. Containoodle will then show only the setup you need.",
+    [ONBOARDING_STATES.BACKEND]:
+      "Local helper is selected. Start server.py, enter its URL and access token, then choose Save & test.",
+    [ONBOARDING_STATES.PORTAL]:
+      "AWS access portal is selected. Enter its start URL, grant that exact site access, then sign in and refresh readiness.",
+  };
+  el("onboarding-description").textContent = descriptions[onboardingState] || "";
 }
 
 function invalidateRoleDiscoveryTarget() {
@@ -112,11 +214,12 @@ function resetRoleDiscoveryPermissionContext() {
 }
 
 function renderMode() {
-  el("mode-backend").checked = config.mode === "backend";
-  el("mode-portal").checked = config.mode === "portal";
+  const choosing = onboardingIsChoosing();
+  el("mode-backend").checked = !choosing && config.mode === "backend";
+  el("mode-portal").checked = !choosing && config.mode === "portal";
 
   for (const panel of document.querySelectorAll("[data-mode-panel]")) {
-    const active = panel.dataset.modePanel === config.mode;
+    const active = !choosing && panel.dataset.modePanel === config.mode;
     panel.hidden = !active;
     panel.setAttribute("aria-hidden", String(!active));
     for (const control of panel.querySelectorAll("button, input, textarea")) {
@@ -129,18 +232,47 @@ function renderMode() {
   }
 }
 
+function bindOnboarding() {
+  el("onboarding-continue").addEventListener("click", () => {
+    onboardingDismissedForPage = true;
+    renderOnboarding();
+    el(config.mode === "portal" ? "mode-portal" : "mode-backend").focus();
+  });
+}
+
 function bindMode() {
   for (const id of ["mode-backend", "mode-portal"]) {
     el(id).addEventListener("change", async (event) => {
       if (!event.target.checked) return;
+      connectionContextRevision += 1;
       resetRoleDiscoveryPermissionContext();
       if (event.target.value === "portal" && backendRequestController) {
         backendRequestController.abort();
       }
-      await saveConfig({ mode: event.target.value });
+      const nextState = isOnboardingPending(onboardingState)
+        ? onboardingStateForMode(event.target.value)
+        : undefined;
+      try {
+        await saveConfig(
+          { mode: event.target.value },
+          { nextOnboardingState: nextState },
+        );
+      } catch {
+        renderMode();
+        renderOnboarding();
+        if (isOnboardingPending(onboardingState)) {
+          setStatus("onboarding-status", "Could not save the connection method", false);
+        }
+        return;
+      }
+      setStatus("onboarding-status", "");
       renderMode();
+      renderOnboarding();
       if (config.mode === "portal") {
-        await Promise.all([refreshPortalPinsStatus(), refreshPortalReadiness()]);
+        await Promise.all([
+          refreshPortalPinsStatus(),
+          refreshPortalReadinessAutomatically(),
+        ]);
       } else {
         await Promise.all([
           refreshBackendCacheStatus(),
@@ -271,9 +403,31 @@ async function backendIdentityErrorMessage(response) {
   return payload.error;
 }
 
-function commitBackendConnection(url, token, profile, identityKey, accounts) {
+function commitBackendConnection(
+  url,
+  token,
+  profile,
+  identityKey,
+  accounts,
+  requestContext,
+) {
   const operation = async () => {
-    if (config.mode !== "backend") return false;
+    if (
+      config.mode !== "backend" ||
+      !localConnectionContextMatches(requestContext)
+    ) {
+      return false;
+    }
+    const completesOnboarding =
+      requestContext.expectedOnboardingState === ONBOARDING_STATES.BACKEND;
+    if (
+      completesOnboarding &&
+      !await persistedConnectionContextMatches(requestContext)
+    ) {
+      return false;
+    }
+    if (!localConnectionContextMatches(requestContext)) return false;
+
     const nextConfig = { ...config, backendUrl: url };
     await browser.storage.local.set({
       config: nextConfig,
@@ -284,9 +438,15 @@ function commitBackendConnection(url, token, profile, identityKey, accounts) {
       ...(backendSessionReuseAutoOfferHandled
         ? { [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: true }
         : {}),
+      ...(completesOnboarding
+        ? { [ONBOARDING_KEY]: ONBOARDING_STATES.COMPLETE }
+        : {}),
     });
     config = nextConfig;
     backendSsoProfile = profile;
+    if (completesOnboarding) {
+      onboardingState = ONBOARDING_STATES.COMPLETE;
+    }
     return true;
   };
   const result = configSaveQueue.then(operation, operation);
@@ -296,7 +456,8 @@ function commitBackendConnection(url, token, profile, identityKey, accounts) {
 
 async function refreshBackendAccounts({ saveUrl }) {
   // This guard is the Options-page half of the no-backend Portal contract.
-  if (config.mode !== "backend") return;
+  if (!activeModeIs("backend")) return;
+  const requestContext = captureConnectionContext();
 
   let url;
   let profile = null;
@@ -415,12 +576,23 @@ async function refreshBackendAccounts({ saveUrl }) {
           profile,
           identityKey,
           accounts,
+          requestContext,
         );
       } catch {
         setStatus("backend-status", "Helper connected, but settings could not be saved", false);
         return;
       }
-      if (!committed) return;
+      if (!committed) {
+        if (localConnectionContextMatches(requestContext)) {
+          setStatus(
+            "backend-status",
+            "Connection settings changed elsewhere · review them and try again",
+            false,
+          );
+        }
+        return;
+      }
+      renderOnboarding();
       el("backend-url").value = url;
       el("backend-token").value = "";
       el("backend-sso-profile").value = profile;
@@ -466,7 +638,7 @@ function bindBackend() {
     setBackendSsoProfileInvalid(false);
   });
   el("backend-save").addEventListener("click", () => {
-    if (config.mode !== "backend") return;
+    if (!activeModeIs("backend")) return;
     beginBackendSessionReuseAutoOffer();
     void refreshBackendAccounts({ saveUrl: true });
   });
@@ -695,7 +867,7 @@ function markBackendSessionReuseAutoOfferHandled() {
 
 function beginBackendSessionReuseAutoOffer() {
   if (
-    config.mode !== "backend" ||
+    !activeModeIs("backend") ||
     backendSessionReuseAutoOfferHandled ||
     consolePermissionGranted ||
     !backendSessionReuseClassification
@@ -730,7 +902,75 @@ async function refreshConsoleStatus() {
   }
 }
 
-async function refreshPortalReadiness() {
+async function completePortalOnboarding({
+  ready,
+  grantedOrigins,
+  sequence,
+  portalStartUrl,
+  requestContext,
+}) {
+  if (
+    onboardingState !== ONBOARDING_STATES.PORTAL ||
+    !ready.configured ||
+    !ready.portalAccess ||
+    !ready.session ||
+    ready.mode !== "portal"
+  ) {
+    return false;
+  }
+
+  let exactOrigin;
+  try {
+    exactOrigin = portalOriginPattern(portalStartUrl);
+  } catch {
+    return false;
+  }
+  if (!grantedOrigins.includes(exactOrigin)) return false;
+
+  const operation = async () => {
+    if (
+      !localConnectionContextMatches(requestContext) ||
+      onboardingState !== ONBOARDING_STATES.PORTAL ||
+      config.mode !== "portal" ||
+      config.portalStartUrl !== portalStartUrl ||
+      portalReadinessSequence !== sequence
+    ) {
+      return false;
+    }
+    if (!await persistedConnectionContextMatches(requestContext)) return false;
+    if (
+      !localConnectionContextMatches(requestContext) ||
+      portalReadinessSequence !== sequence
+    ) {
+      return false;
+    }
+    await browser.storage.local.set({
+      [ONBOARDING_KEY]: ONBOARDING_STATES.COMPLETE,
+    });
+    onboardingState = ONBOARDING_STATES.COMPLETE;
+    return true;
+  };
+  const result = configSaveQueue.then(operation, operation);
+  configSaveQueue = result.catch(() => {});
+  try {
+    const completed = await result;
+    if (completed) {
+      renderOnboarding();
+    }
+    return completed;
+  } catch {
+    if (
+      onboardingState === ONBOARDING_STATES.PORTAL &&
+      config.mode === "portal" &&
+      portalReadinessSequence === sequence
+    ) {
+      setStatus("onboarding-status", "Connection is ready, but setup status could not be saved", false);
+    }
+    return false;
+  }
+}
+
+async function refreshPortalReadiness({ allowRemoteRegionLookup = true } = {}) {
   if (config.mode !== "portal") return;
 
   const sequence = ++portalReadinessSequence;
@@ -738,7 +978,10 @@ async function refreshPortalReadiness() {
   invalidateRoleDiscoveryTarget();
   el("open-portal").disabled = !config.portalStartUrl;
   try {
-    const ready = await browser.runtime.sendMessage({ type: "portal-readiness" });
+    const ready = await browser.runtime.sendMessage({
+      type: "portal-readiness",
+      ...(allowRemoteRegionLookup ? {} : { allowRemoteRegionLookup: false }),
+    });
     if (!ready || !ready.ok) {
       throw new Error((ready && ready.error) || "Could not inspect portal readiness");
     }
@@ -802,6 +1045,13 @@ async function refreshPortalReadiness() {
         true
       );
     }
+    await completePortalOnboarding({
+      ready,
+      grantedOrigins,
+      sequence,
+      portalStartUrl: config.portalStartUrl,
+      requestContext: captureConnectionContext(),
+    });
   } catch (err) {
     if (
       config.mode === "portal" &&
@@ -818,8 +1068,15 @@ async function refreshPortalReadiness() {
   }
 }
 
+function refreshPortalReadinessAutomatically() {
+  return refreshPortalReadiness({
+    allowRemoteRegionLookup: !isOnboardingPending(onboardingState),
+  });
+}
+
 async function savePortal() {
   if (config.mode !== "portal") return;
+  const requestContext = captureConnectionContext();
 
   let normalized;
   try {
@@ -835,6 +1092,7 @@ async function savePortal() {
     : null;
   const nextPattern = portalOriginPattern(normalized);
 
+  portalCorePermissionOperations += 1;
   try {
     // Start both calls before awaiting so the permission request remains in the
     // button's user gesture while rollback can still distinguish an existing
@@ -842,6 +1100,23 @@ async function savePortal() {
     const existingAccess = browser.permissions.contains({ origins: [nextPattern] });
     const requestingAccess = browser.permissions.request({ origins: [nextPattern] });
     const [hadNextAccess, granted] = await Promise.all([existingAccess, requestingAccess]);
+    let contextStillCurrent = localConnectionContextMatches(requestContext);
+    try {
+      if (contextStillCurrent) {
+        contextStillCurrent = await persistedConnectionContextMatches(requestContext);
+      }
+    } catch (err) {
+      if (granted && !hadNextAccess) {
+        await browser.permissions.remove({ origins: [nextPattern] }).catch(() => {});
+      }
+      throw err;
+    }
+    if (!contextStillCurrent) {
+      if (granted && !hadNextAccess) {
+        await browser.permissions.remove({ origins: [nextPattern] }).catch(() => {});
+      }
+      return;
+    }
     if (!granted) {
       el("portal-url").value = previousStartUrl;
       setStatus(
@@ -856,8 +1131,18 @@ async function savePortal() {
 
     try {
       if (normalized !== previousStartUrl) {
+        const saved = await saveConfig(
+          { portalStartUrl: normalized },
+          { expectedContext: requestContext },
+        );
+        if (!saved) {
+          if (!hadNextAccess) {
+            await browser.permissions.remove({ origins: [nextPattern] }).catch(() => {});
+          }
+          return;
+        }
+        connectionContextRevision += 1;
         resetRoleDiscoveryPermissionContext();
-        await saveConfig({ portalStartUrl: normalized });
         await browser.storage.local.remove([
           "portalRegionCache",
           "portalRegionCacheOrigin",
@@ -881,6 +1166,8 @@ async function savePortal() {
     await refreshPortalReadiness();
   } catch (err) {
     setStatus("portal-status", err.message, false);
+  } finally {
+    portalCorePermissionOperations -= 1;
   }
 }
 
@@ -967,6 +1254,7 @@ function bindPortal() {
       setStatus("role-settings-status", "Invalid SSO region (expected e.g. eu-west-1)", false);
       return;
     }
+    connectionContextRevision += 1;
     resetRoleDiscoveryPermissionContext();
     await saveConfig({ ssoRegion });
     await browser.storage.local.remove([
@@ -980,7 +1268,7 @@ function bindPortal() {
 
 function bindConsole() {
   el("console-grant").addEventListener("click", () => {
-    if (config.mode !== "backend") return;
+    if (!activeModeIs("backend")) return;
     if (!backendSessionReuseClassification) return;
     beginPermissionGrant({
       feature: "backend-session-reuse",
@@ -991,7 +1279,7 @@ function bindConsole() {
     });
   });
   el("console-revoke").addEventListener("click", () => {
-    if (config.mode !== "backend") return;
+    if (!activeModeIs("backend")) return;
     void revokeManagedPermission({
       mode: "backend",
       originsForRevoke: backendSessionReuseOriginsForRevoke,
@@ -1052,10 +1340,91 @@ async function refreshPortalPinsStatus() {
 }
 
 async function refreshPermissionStatuses() {
+  if (onboardingIsChoosing()) return;
   if (config.mode === "portal") {
-    await refreshPortalReadiness();
+    await refreshPortalReadinessAutomatically();
   } else {
     await refreshConsoleStatus();
+  }
+}
+
+function applyStoredConnectionChanges(changes) {
+  const hasConfig = Object.prototype.hasOwnProperty.call(changes, "config");
+  const hasOnboarding = Object.prototype.hasOwnProperty.call(
+    changes,
+    ONBOARDING_KEY,
+  );
+  if (!hasConfig && !hasOnboarding) return;
+
+  const previousConfig = config;
+  const previousOnboardingState = onboardingState;
+  const previousMode = config.mode;
+  const wasChoosing = onboardingIsChoosing();
+  let nextConfig = config;
+  if (hasConfig) {
+    const storedConfig = changes.config.newValue;
+    nextConfig = {
+      ...DEFAULT_CONFIG,
+      ...(storedConfig && typeof storedConfig === "object" &&
+          !Array.isArray(storedConfig)
+        ? storedConfig
+        : {}),
+    };
+    nextConfig.backendUrl = safeBackendUrl(nextConfig.backendUrl);
+  }
+  let nextOnboardingState = onboardingState;
+  if (hasOnboarding) {
+    nextOnboardingState = normalizeOnboardingState(
+      changes[ONBOARDING_KEY].newValue,
+    );
+  }
+
+  const activeConnectionMode = (candidateConfig, candidateOnboardingState) => {
+    if (candidateOnboardingState === ONBOARDING_STATES.CHOOSE) return null;
+    if (
+      candidateOnboardingState === ONBOARDING_STATES.BACKEND ||
+      candidateOnboardingState === ONBOARDING_STATES.PORTAL
+    ) {
+      return candidateOnboardingState;
+    }
+    return candidateConfig.mode;
+  };
+  const previousActiveMode = activeConnectionMode(
+    previousConfig,
+    previousOnboardingState,
+  );
+  const nextActiveMode = activeConnectionMode(nextConfig, nextOnboardingState);
+  const configChanged = !configsMatch(previousConfig, nextConfig);
+  const onboardingChanged = previousOnboardingState !== nextOnboardingState;
+  const permissionContextChanged =
+    previousActiveMode !== nextActiveMode ||
+    (
+      nextActiveMode === "portal" &&
+      (
+        previousConfig.portalStartUrl !== nextConfig.portalStartUrl ||
+        previousConfig.ssoRegion !== nextConfig.ssoRegion
+      )
+    );
+
+  if (configChanged || onboardingChanged) connectionContextRevision += 1;
+  if (permissionContextChanged) resetRoleDiscoveryPermissionContext();
+  if (
+    backendRequestController &&
+    (
+      nextActiveMode !== "backend" ||
+      previousConfig.backendUrl !== nextConfig.backendUrl
+    )
+  ) {
+    backendRequestController.abort();
+  }
+
+  config = nextConfig;
+  onboardingState = nextOnboardingState;
+  el("open-portal").disabled = !config.portalStartUrl;
+
+  renderOnboarding();
+  if (config.mode !== previousMode || onboardingIsChoosing() !== wasChoosing) {
+    renderMode();
   }
 }
 
@@ -1064,6 +1433,7 @@ async function init() {
     "config",
     BACKEND_SSO_PROFILE_KEY,
     BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY,
+    ONBOARDING_KEY,
   ]);
   const stored = storedState.config;
   config = { ...DEFAULT_CONFIG, ...(stored || {}) };
@@ -1077,16 +1447,37 @@ async function init() {
   }
   backendSessionReuseAutoOfferHandled =
     storedState[BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY] === true;
+  onboardingState = normalizeOnboardingState(storedState[ONBOARDING_KEY]);
 
+  bindOnboarding();
   bindMode();
   bindBackend();
   bindPortal();
   bindConsole();
   bindGroupNaming();
+  renderOnboarding();
   renderMode();
 
-  if (config.mode === "portal") {
-    await Promise.all([refreshPortalPinsStatus(), refreshPortalReadiness()]);
+  if (browser.storage?.onChanged?.addListener) {
+    browser.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== "local") return;
+      applyStoredConnectionChanges(changes);
+      if (
+        config.mode === "portal" &&
+        Object.prototype.hasOwnProperty.call(changes, "portalPinnedAccounts")
+      ) {
+        void refreshPortalPinsStatus();
+      }
+    });
+  }
+
+  if (onboardingIsChoosing()) {
+    // A new install has no active connection method until the user chooses one.
+  } else if (config.mode === "portal") {
+    await Promise.all([
+      refreshPortalPinsStatus(),
+      refreshPortalReadinessAutomatically(),
+    ]);
   } else {
     await Promise.all([
       refreshBackendCacheStatus(),
@@ -1095,19 +1486,12 @@ async function init() {
     ]);
   }
 
-  browser.permissions.onAdded.addListener(() => { void refreshPermissionStatuses(); });
-  browser.permissions.onRemoved.addListener(() => { void refreshPermissionStatuses(); });
-  if (browser.storage?.onChanged?.addListener) {
-    browser.storage.onChanged.addListener((changes, areaName) => {
-      if (
-        config.mode === "portal" &&
-        areaName === "local" &&
-        Object.prototype.hasOwnProperty.call(changes, "portalPinnedAccounts")
-      ) {
-        void refreshPortalPinsStatus();
-      }
-    });
-  }
+  const refreshAfterPermissionChange = () => {
+    if (portalCorePermissionOperations > 0) return;
+    void refreshPermissionStatuses();
+  };
+  browser.permissions.onAdded.addListener(refreshAfterPermissionChange);
+  browser.permissions.onRemoved.addListener(refreshAfterPermissionChange);
   if (browser.cookies?.onChanged?.addListener) {
     browser.cookies.onChanged.addListener((change) => {
       if (
@@ -1116,7 +1500,7 @@ async function init() {
         change.cookie.name === "x-amz-sso_authn" &&
         change.cookie.storeId === "firefox-default"
       ) {
-        void refreshPortalReadiness();
+        void refreshPortalReadinessAutomatically();
       }
     });
   }

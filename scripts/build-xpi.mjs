@@ -33,6 +33,7 @@ const expectedFiles = [
   "shared/accounts.js",
   "shared/backend.js",
   "shared/group-naming.js",
+  "shared/onboarding.js",
   "shared/permissions.js",
   "shared/portal.js",
   "sidebar/env.js",

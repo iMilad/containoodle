@@ -104,6 +104,62 @@ header {
   display: none;
 }
 
+/* ── First-run setup ────────────────────────────────────────── */
+.onboarding-card {
+  min-width: 0;
+  min-height: 0;
+  margin: 12px 10px;
+  padding: 16px;
+  border: 1px solid var(--accent-light);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.onboarding-card[hidden] {
+  display: none;
+}
+
+.onboarding-card h1 {
+  color: var(--text-primary);
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.onboarding-card p {
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+#onboarding-open-setup {
+  width: 100%;
+  min-height: 36px;
+  margin-top: 14px;
+  padding: 7px 10px;
+  border: 1px solid var(--accent-light);
+  border-radius: var(--radius-sm);
+  background: var(--bg-item);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: normal;
+  cursor: pointer;
+}
+
+#onboarding-open-setup:hover {
+  background: var(--bg-item-hover);
+}
+
+#onboarding-open-setup:focus-visible {
+  outline: 3px solid var(--aws-orange);
+  outline-offset: 2px;
+}
+
 #open-portal-btn {
   flex-shrink: 0;
   padding: 4px 9px;
@@ -706,6 +762,11 @@ footer {
   color: var(--text-muted);
 }
 
+#status-text.setup {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
 .dot {
   width: 6px;
   height: 6px;
@@ -714,6 +775,7 @@ footer {
 
 .dot.online  { background: var(--success); box-shadow: 0 0 6px rgba(52, 211, 153, 0.5); }
 .dot.offline { background: var(--error);   box-shadow: 0 0 6px rgba(248, 113, 113, 0.3); }
+.dot.setup   { background: var(--aws-orange); }
 
 .footer-buttons {
   display: flex;
@@ -737,6 +799,10 @@ footer {
   transition: color var(--transition), border-color var(--transition);
 }
 
+#refresh-btn[hidden] {
+  display: none;
+}
+
 #refresh-btn:hover,
 #options-btn:hover {
   color: var(--accent-light);
@@ -750,3 +816,18 @@ footer {
 /* ── Animations ───────────────────────────────────────────────── */
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+@media (forced-colors: active) {
+  .onboarding-card,
+  #onboarding-open-setup {
+    border-color: CanvasText;
+  }
+
+  #onboarding-open-setup:focus-visible {
+    outline-color: Highlight;
+  }
+
+  .dot.setup {
+    background: CanvasText;
+  }
+}

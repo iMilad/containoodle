@@ -1,5 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_STATES,
+} from "../firefox-extension/shared/onboarding.js";
 
 const TEST_EXTENSION_ORIGIN = "moz-extension://containoodle-test";
 const TEST_HELPER_TOKEN = "A".repeat(43);
@@ -171,9 +176,11 @@ const originalGlobals = Object.fromEntries(
 );
 
 let importSequence = 0;
+let scheduledTimers = new Set();
 
 function createSidebarFixture({
   storage = {},
+  includeDefaultStorage = true,
   containers = [],
   tabs = [],
   sendMessageImpl = null,
@@ -181,7 +188,7 @@ function createSidebarFixture({
     throw new Error("Unexpected backend request");
   },
 } = {}) {
-  const storageData = {
+  const defaultStorage = {
     config: {
       mode: "portal",
       portalStartUrl: "https://example.awsapps.com/start",
@@ -189,9 +196,15 @@ function createSidebarFixture({
     portalPinnedAccounts: [],
     backendPinnedAccountIds: [],
     backendAuthToken: TEST_HELPER_TOKEN,
-    ...storage,
   };
+  const storageData = includeDefaultStorage
+    ? { ...defaultStorage, ...storage }
+    : { ...storage };
   const sentMessages = [];
+  const storageGetCalls = [];
+  let containerQueryCalls = 0;
+  let tabQueryCalls = 0;
+  let openOptionsCalls = 0;
   const storageChanged = extensionEvent();
   const ids = new Map([
     ["account-list", new Element()],
@@ -205,7 +218,12 @@ function createSidebarFixture({
     ["portal-toolbar", new Element()],
     ["open-portal-btn", new Element("button")],
     ["portal-toolbar-hint", new Element()],
+    ["onboarding-card", new Element("section")],
+    ["onboarding-heading", new Element("h1")],
+    ["onboarding-description", new Element("p")],
+    ["onboarding-open-setup", new Element("button")],
   ]);
+  ids.get("onboarding-card").hidden = true;
   const document = {
     getElementById(id) {
       return ids.get(id) || null;
@@ -223,6 +241,9 @@ function createSidebarFixture({
     storage: {
       local: {
         async get(keys) {
+          storageGetCalls.push(
+            Array.isArray(keys) ? [...keys] : keys,
+          );
           return storageGet(storageData, keys);
         },
         async set(values) {
@@ -240,6 +261,7 @@ function createSidebarFixture({
     },
     contextualIdentities: {
       async query() {
+        containerQueryCalls += 1;
         return containers.map((container) => ({ ...container }));
       },
       onCreated: extensionEvent(),
@@ -248,6 +270,7 @@ function createSidebarFixture({
     },
     tabs: {
       async query(query) {
+        tabQueryCalls += 1;
         const matches = query && query.active
           ? tabs.filter((tab) => tab.active)
           : tabs;
@@ -262,7 +285,9 @@ function createSidebarFixture({
       getManifest() {
         return { version: "test" };
       },
-      openOptionsPage: async () => {},
+      async openOptionsPage() {
+        openOptionsCalls += 1;
+      },
       async sendMessage(message) {
         sentMessages.push(message);
         if (sendMessageImpl) {
@@ -331,13 +356,29 @@ function createSidebarFixture({
     storageData,
     storageChanged,
     sentMessages,
+    storageGetCalls,
+    get containerQueryCalls() {
+      return containerQueryCalls;
+    },
+    get tabQueryCalls() {
+      return tabQueryCalls;
+    },
+    get openOptionsCalls() {
+      return openOptionsCalls;
+    },
   };
 }
 
 async function loadSidebar(fixture, { waitForInitialRefresh = true } = {}) {
   const nativeSetTimeout = originalGlobals.setTimeout.value;
-  globalThis.setTimeout = (...args) => {
-    const timer = nativeSetTimeout(...args);
+  const fixtureTimers = new Set();
+  scheduledTimers = fixtureTimers;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    const timer = nativeSetTimeout((...callbackArgs) => {
+      fixtureTimers.delete(timer);
+      callback(...callbackArgs);
+    }, delay, ...args);
+    fixtureTimers.add(timer);
     timer.unref?.();
     return timer;
   };
@@ -375,6 +416,8 @@ async function waitFor(check, message) {
 }
 
 function cleanupGlobals() {
+  for (const timer of scheduledTimers) clearTimeout(timer);
+  scheduledTimers.clear();
   for (const [name, original] of Object.entries(originalGlobals)) {
     if (original.exists) globalThis[name] = original.value;
     else delete globalThis[name];
@@ -441,6 +484,242 @@ function assertNoRawHelperToken(url, options, token = TEST_HELPER_TOKEN) {
   const rendered = `${url}\n${[...headers].flat().join("\n")}`;
   assert.doesNotMatch(rendered, new RegExp(token));
 }
+
+test("sidebar onboarding markup has a labelled native setup action", async () => {
+  const html = await readFile(
+    new URL("../firefox-extension/sidebar/sidebar.html", import.meta.url),
+    "utf8",
+  );
+  const card = html.match(
+    /<section\s+id="onboarding-card"[\s\S]*?<\/section>/,
+  );
+
+  assert.ok(card, "onboarding card must remain a semantic section");
+  assert.match(card[0], /aria-labelledby="onboarding-heading"/);
+  assert.match(card[0], /aria-describedby="onboarding-description"/);
+  assert.match(
+    card[0],
+    /<button[\s\S]*?type="button"[\s\S]*?id="onboarding-open-setup"/,
+  );
+  assert.match(card[0], />Open setup<\/button>/);
+});
+
+test("first-install sidebar waits for lifecycle onboarding before legacy reads", async () => {
+  let releaseOnboarding;
+  const onboardingReady = new Promise((resolve) => {
+    releaseOnboarding = resolve;
+  });
+  let backendFetchCalls = 0;
+  const fixture = createSidebarFixture({
+    includeDefaultStorage: false,
+    fetchImpl: async () => {
+      backendFetchCalls += 1;
+      throw new Error("first-install onboarding must not contact the helper");
+    },
+    sendMessageImpl: async (message) => {
+      assert.deepEqual(message, { type: "resolve-connection-onboarding" });
+      return { state: await onboardingReady };
+    },
+  });
+
+  try {
+    await loadSidebar(fixture, { waitForInitialRefresh: false });
+
+    assert.equal(fixture.ids.get("onboarding-card").hidden, true);
+    assert.equal(
+      fixture.ids.get("loading-state").classList.contains("visible"),
+      true,
+    );
+    assert.deepEqual(fixture.storageGetCalls, [ONBOARDING_KEY]);
+    assert.deepEqual(fixture.sentMessages, [
+      { type: "resolve-connection-onboarding" },
+    ]);
+    assert.equal(backendFetchCalls, 0);
+    assert.equal(fixture.containerQueryCalls, 0);
+    assert.equal(fixture.tabQueryCalls, 0);
+
+    releaseOnboarding(ONBOARDING_STATES.CHOOSE);
+    await waitFor(
+      () => !fixture.ids.get("onboarding-card").hidden,
+      "sidebar did not show onboarding after lifecycle initialization",
+    );
+
+    assert.equal(
+      fixture.ids.get("onboarding-card").dataset.state,
+      ONBOARDING_STATES.CHOOSE,
+    );
+    assert.deepEqual(fixture.storageGetCalls, [ONBOARDING_KEY]);
+    assert.equal(backendFetchCalls, 0);
+    assert.equal(fixture.containerQueryCalls, 0);
+    assert.equal(fixture.tabQueryCalls, 0);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("pending onboarding shows only the accessible setup path", async () => {
+  const cases = [
+    {
+      state: ONBOARDING_STATES.CHOOSE,
+      heading: "Set up Containoodle",
+      description: "Choose how Containoodle should open AWS console sessions.",
+    },
+    {
+      state: ONBOARDING_STATES.BACKEND,
+      heading: "Finish helper setup",
+      description: "Connect and test the local AWS CLI helper before opening accounts.",
+    },
+    {
+      state: ONBOARDING_STATES.PORTAL,
+      heading: "Finish portal setup",
+      description: "Add your AWS access portal and confirm it is ready before opening accounts.",
+    },
+  ];
+
+  for (const { state, heading, description } of cases) {
+    let backendFetchCalls = 0;
+    const fixture = createSidebarFixture({
+      storage: {
+        [ONBOARDING_KEY]: state,
+        config: {
+          mode: "backend",
+          backendUrl: "http://127.0.0.1:8421",
+          portalStartUrl: "https://d-0000000000.awsapps.com/start",
+        },
+      },
+      containers: [{
+        cookieStoreId: "firefox-container-synthetic",
+        name: "__CONTAINOODLE_TEST_ACCOUNT__",
+        color: "blue",
+      }],
+      tabs: [{
+        id: 1,
+        cookieStoreId: "firefox-container-synthetic",
+        active: true,
+        windowId: 1,
+        title: "Synthetic console",
+      }],
+      fetchImpl: async () => {
+        backendFetchCalls += 1;
+        throw new Error("onboarding must not contact the helper");
+      },
+      sendMessageImpl: async () => {
+        throw new Error("onboarding must not send runtime messages");
+      },
+    });
+
+    try {
+      await loadSidebar(fixture);
+
+      const card = fixture.ids.get("onboarding-card");
+      assert.equal(card.hidden, false);
+      assert.equal(card.dataset.state, state);
+      assert.equal(fixture.ids.get("onboarding-heading").textContent, heading);
+      assert.equal(
+        fixture.ids.get("onboarding-description").textContent,
+        description,
+      );
+      assert.equal(fixture.ids.get("account-list").hidden, true);
+      assert.equal(fixture.ids.get("loading-state").hidden, true);
+      assert.equal(
+        fixture.ids.get("loading-state").classList.contains("visible"),
+        false,
+      );
+      assert.equal(fixture.ids.get("portal-toolbar").hidden, true);
+      assert.equal(fixture.ids.get("refresh-btn").hidden, true);
+      assert.equal(fixture.ids.get("status-text").textContent, "Setup required");
+      assert.equal(fixture.ids.get("status-text").classList.contains("setup"), true);
+      assert.equal(fixture.ids.get("status-dot").className, "dot setup");
+
+      assert.equal(backendFetchCalls, 0);
+      assert.deepEqual(fixture.sentMessages, []);
+      assert.equal(fixture.containerQueryCalls, 0);
+      assert.equal(fixture.tabQueryCalls, 0);
+      assert.deepEqual(fixture.storageGetCalls, [ONBOARDING_KEY]);
+
+      await fixture.ids.get("onboarding-open-setup").listeners.click[0]();
+      await settle();
+      assert.equal(fixture.openOptionsCalls, 1);
+      assert.equal(backendFetchCalls, 0);
+      assert.deepEqual(fixture.sentMessages, []);
+      assert.equal(fixture.containerQueryCalls, 0);
+      assert.equal(fixture.tabQueryCalls, 0);
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
+
+test("completing onboarding resumes the existing sidebar refresh", async () => {
+  const fixture = createSidebarFixture({
+    storage: {
+      [ONBOARDING_KEY]: ONBOARDING_STATES.CHOOSE,
+    },
+  });
+
+  try {
+    await loadSidebar(fixture);
+    assert.equal(fixture.ids.get("onboarding-card").hidden, false);
+    assert.equal(fixture.containerQueryCalls, 0);
+    assert.equal(fixture.tabQueryCalls, 0);
+
+    await fixture.browser.storage.local.set({
+      [ONBOARDING_KEY]: ONBOARDING_STATES.COMPLETE,
+    });
+    await waitFor(
+      () => fixture.ids.get("status-text").textContent === "Portal · ready",
+      "normal sidebar refresh did not resume after onboarding",
+    );
+
+    assert.equal(fixture.ids.get("onboarding-card").hidden, true);
+    assert.equal(fixture.ids.get("account-list").hidden, false);
+    assert.equal(fixture.ids.get("loading-state").hidden, false);
+    assert.equal(fixture.ids.get("portal-toolbar").hidden, false);
+    assert.equal(fixture.ids.get("refresh-btn").hidden, false);
+    assert.equal(fixture.ids.get("status-text").classList.contains("setup"), false);
+    assert.equal(fixture.containerQueryCalls, 1);
+    assert.equal(fixture.tabQueryCalls, 2);
+    assert.deepEqual(fixture.sentMessages, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("missing, invalid, and complete onboarding markers preserve sidebar behavior", async () => {
+  const cases = [
+    { label: "missing", state: undefined },
+    { label: "invalid", state: "__CONTAINOODLE_TEST_INVALID_STATE__" },
+    { label: "complete", state: ONBOARDING_STATES.COMPLETE },
+  ];
+
+  for (const { label, state } of cases) {
+    const fixture = createSidebarFixture({
+      storage: state === undefined ? {} : { [ONBOARDING_KEY]: state },
+    });
+
+    try {
+      await loadSidebar(fixture);
+      assert.equal(
+        fixture.ids.get("onboarding-card").hidden,
+        true,
+        `${label} marker must not show onboarding`,
+      );
+      assert.equal(fixture.ids.get("account-list").hidden, false);
+      assert.equal(fixture.ids.get("portal-toolbar").hidden, false);
+      assert.equal(fixture.ids.get("status-text").textContent, "Portal · ready");
+      assert.equal(fixture.containerQueryCalls, 1);
+      assert.equal(fixture.tabQueryCalls, 2);
+      assert.deepEqual(
+        fixture.sentMessages,
+        state === undefined
+          ? [{ type: "resolve-connection-onboarding" }]
+          : [],
+      );
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
 
 test("backend account refresh authenticates while portal mode never calls the helper", async () => {
   const requests = [];

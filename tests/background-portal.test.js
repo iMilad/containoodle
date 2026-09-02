@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_STATES,
+} from "../firefox-extension/shared/onboarding.js";
 
 const START = "https://d-0000000000.awsapps.com/start";
 const ACCOUNT_ID = "0".repeat(12);
@@ -800,6 +804,204 @@ async function fireBackgroundLifecycle(event, details) {
   const rejection = settlements.find((result) => result.status === "rejected");
   if (rejection) throw rejection.reason;
 }
+
+test("connection onboarding lifecycle distinguishes new installs from existing profiles", async (t) => {
+  const cases = [
+    {
+      name: "fresh install",
+      initialStorage: {},
+      details: { reason: "install" },
+      expected: ONBOARDING_STATES.CHOOSE,
+    },
+    {
+      name: "install retaining configuration",
+      initialStorage: { config: { mode: "backend" } },
+      details: { reason: "install" },
+      expected: ONBOARDING_STATES.COMPLETE,
+    },
+    {
+      name: "update without a marker",
+      initialStorage: {},
+      details: { reason: "update", previousVersion: "1.1.1" },
+      expected: ONBOARDING_STATES.COMPLETE,
+    },
+    {
+      name: "invalid stored marker",
+      initialStorage: { [ONBOARDING_KEY]: "invalid-test-state" },
+      details: { reason: "install" },
+      expected: ONBOARDING_STATES.COMPLETE,
+    },
+  ];
+
+  for (const lifecycle of cases) {
+    await t.test(lifecycle.name, async () => {
+      const fixture = makeBrowser(lifecycle.initialStorage);
+      await loadBackground(fixture);
+      const configBefore = structuredClone(fixture.storageData.config);
+      const permissionChecksBefore = structuredClone(
+        fixture.permissionContainsCalls,
+      );
+      const originalSet = fixture.browser.storage.local.set;
+      let onboardingWrites = 0;
+      fixture.browser.storage.local.set = async (values) => {
+        if (Object.hasOwn(values, ONBOARDING_KEY)) onboardingWrites += 1;
+        return originalSet(values);
+      };
+
+      await fireBackgroundLifecycle(
+        fixture.events.runtimeInstalled,
+        lifecycle.details,
+      );
+
+      assert.strictEqual(
+        fixture.storageData[ONBOARDING_KEY],
+        lifecycle.expected,
+      );
+      assert.deepStrictEqual(fixture.storageData.config, configBefore);
+      assert.deepStrictEqual(
+        fixture.permissionContainsCalls,
+        permissionChecksBefore,
+      );
+      assert.deepStrictEqual(fixture.createdTabs, []);
+      assert.deepStrictEqual(fixture.cookieWrites, []);
+      assert.deepStrictEqual(fixture.cookieRemovals, []);
+      assert.strictEqual(onboardingWrites, 1);
+
+      await fireBackgroundLifecycle(
+        fixture.events.runtimeInstalled,
+        lifecycle.details,
+      );
+      assert.strictEqual(onboardingWrites, 1, "repeat lifecycle must not rewrite state");
+    });
+  }
+});
+
+test("sidebar onboarding resolution waits for the in-flight install marker", async () => {
+  const fixture = makeBrowser({});
+  const onMessage = await loadBackground(fixture);
+  const lifecycleListener = fixture.events.runtimeInstalled.listeners.find(
+    (listener) => listener.name === "beginConnectionOnboarding",
+  );
+  assert.ok(lifecycleListener, "missing connection onboarding lifecycle listener");
+
+  const originalGet = fixture.browser.storage.local.get;
+  let releaseLifecycleRead;
+  const lifecycleRead = new Promise((resolve) => {
+    releaseLifecycleRead = resolve;
+  });
+  let delayedLifecycleReads = 0;
+  fixture.browser.storage.local.get = async (keys) => {
+    if (
+      delayedLifecycleReads === 0 &&
+      Array.isArray(keys) &&
+      keys.length === 2 &&
+      keys.includes(ONBOARDING_KEY) &&
+      keys.includes("config")
+    ) {
+      delayedLifecycleReads += 1;
+      await lifecycleRead;
+    }
+    return originalGet(keys);
+  };
+
+  const permissionChecksBefore = structuredClone(
+    fixture.permissionContainsCalls,
+  );
+  const initialization = lifecycleListener({ reason: "install" });
+  let resolutionSettled = false;
+  const resolution = Promise.resolve(onMessage({
+    type: "resolve-connection-onboarding",
+  }, {})).then((result) => {
+    resolutionSettled = true;
+    return result;
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(delayedLifecycleReads, 1);
+  assert.strictEqual(resolutionSettled, false);
+  assert.strictEqual(Object.hasOwn(fixture.storageData, ONBOARDING_KEY), false);
+  assert.deepStrictEqual(
+    fixture.permissionContainsCalls,
+    permissionChecksBefore,
+  );
+  assert.deepStrictEqual(fixture.createdTabs, []);
+  assert.deepStrictEqual(fixture.cookieWrites, []);
+  assert.deepStrictEqual(fixture.cookieRemovals, []);
+
+  releaseLifecycleRead();
+  const [resolved] = await Promise.all([resolution, initialization]);
+  assert.deepStrictEqual(resolved, { state: ONBOARDING_STATES.CHOOSE });
+  assert.strictEqual(
+    fixture.storageData[ONBOARDING_KEY],
+    ONBOARDING_STATES.CHOOSE,
+  );
+});
+
+test("sidebar onboarding resolution preserves ordinary missing-marker behavior", async () => {
+  const fixture = makeBrowser({});
+  const onMessage = await loadBackground(fixture);
+
+  assert.deepStrictEqual(
+    await onMessage({ type: "resolve-connection-onboarding" }, {}),
+    { state: undefined },
+  );
+  assert.strictEqual(Object.hasOwn(fixture.storageData, ONBOARDING_KEY), false);
+  assert.deepStrictEqual(fixture.permissionContainsCalls, []);
+  assert.deepStrictEqual(fixture.createdTabs, []);
+  assert.deepStrictEqual(fixture.cookieWrites, []);
+  assert.deepStrictEqual(fixture.cookieRemovals, []);
+});
+
+test("connection onboarding preserves recognized state and ignores startup", async (t) => {
+  for (const state of Object.values(ONBOARDING_STATES)) {
+    await t.test(`preserves ${state}`, async () => {
+      const fixture = makeBrowser({ [ONBOARDING_KEY]: state });
+      await loadBackground(fixture);
+      const originalSet = fixture.browser.storage.local.set;
+      let onboardingWrites = 0;
+      fixture.browser.storage.local.set = async (values) => {
+        if (Object.hasOwn(values, ONBOARDING_KEY)) onboardingWrites += 1;
+        return originalSet(values);
+      };
+
+      await fireBackgroundLifecycle(
+        fixture.events.runtimeInstalled,
+        { reason: "update", previousVersion: "1.1.1" },
+      );
+
+      assert.strictEqual(fixture.storageData[ONBOARDING_KEY], state);
+      assert.strictEqual(onboardingWrites, 0);
+    });
+  }
+
+  await t.test("startup does not initialize missing state", async () => {
+    const fixture = makeBrowser({});
+    await loadBackground(fixture);
+    await fireBackgroundLifecycle(fixture.events.runtimeStartup);
+    assert.strictEqual(
+      Object.hasOwn(fixture.storageData, ONBOARDING_KEY),
+      false,
+    );
+  });
+});
+
+test("connection onboarding storage failure never rejects installation", async () => {
+  const fixture = makeBrowser({});
+  await loadBackground(fixture);
+  const originalSet = fixture.browser.storage.local.set;
+  fixture.browser.storage.local.set = async (values) => {
+    if (Object.hasOwn(values, ONBOARDING_KEY)) {
+      throw new Error("synthetic onboarding storage failure");
+    }
+    return originalSet(values);
+  };
+
+  await fireBackgroundLifecycle(
+    fixture.events.runtimeInstalled,
+    { reason: "install" },
+  );
+  assert.strictEqual(Object.hasOwn(fixture.storageData, ONBOARDING_KEY), false);
+});
 
 test("open portal focuses an exact default-store portal tab", async () => {
   const fixture = makeBrowser();
@@ -2577,6 +2779,9 @@ test("v1.0.3 storage fixtures survive install and startup cleanup", async (t) =>
 
         const expected = structuredClone(before);
         for (const key of transientKeys) delete expected[key];
+        if (lifecycle.eventName === "runtimeInstalled") {
+          expected[ONBOARDING_KEY] = ONBOARDING_STATES.COMPLETE;
+        }
 
         const fixture = makeBrowser(before);
         await loadBackground(fixture);
@@ -2592,7 +2797,7 @@ test("v1.0.3 storage fixtures survive install and startup cleanup", async (t) =>
         assert.deepStrictEqual(
           fixture.storageData,
           expected,
-          "lifecycle cleanup must remove only transient group IDs",
+          "lifecycle must initialize onboarding and remove only transient group IDs",
         );
 
         await fireBackgroundLifecycle(event, lifecycle.details);
@@ -3130,6 +3335,44 @@ test("role readiness queries only the exact regional target with legacy coverage
       (origins) => !origins.includes("https://*.amazonaws.com/*")
     ));
   }
+});
+
+test("passive portal readiness never performs remote region discovery", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config.ssoRegion = "";
+  delete fixture.storageData.portalRegionCache;
+  delete fixture.storageData.portalRegionCacheOrigin;
+  const onMessage = await loadBackground(fixture);
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return new Response(JSON.stringify({ region: TEST_PORTAL_REGION }), {
+      status: 200,
+    });
+  };
+
+  const passive = await onMessage({
+    type: "portal-readiness",
+    allowRemoteRegionLookup: false,
+  }, {});
+  assert.strictEqual(passive.portalAccess, true);
+  assert.strictEqual(passive.session, true);
+  assert.strictEqual(passive.roleDiscoveryRegion, null);
+  assert.strictEqual(passive.roleDiscoveryPermissionOrigin, null);
+  assert.strictEqual(fetchCalls, 0);
+  assert.strictEqual(fixture.storageData.portalRegionCache, undefined);
+
+  const explicit = await onMessage({ type: "portal-readiness" }, {});
+  assert.strictEqual(fetchCalls, 1);
+  assert.strictEqual(explicit.roleDiscoveryRegion, TEST_PORTAL_REGION);
+  assert.strictEqual(
+    explicit.roleDiscoveryPermissionOrigin,
+    TEST_ROLE_DISCOVERY_ORIGIN,
+  );
+  assert.strictEqual(
+    fixture.storageData.portalRegionCacheOrigin,
+    new URL(START).origin,
+  );
 });
 
 test("portal role discovery calls only the authorized synthetic regional API", async () => {

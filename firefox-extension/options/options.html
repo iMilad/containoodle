@@ -10,6 +10,23 @@
   <main>
     <h1>Containoodle settings</h1>
 
+    <section
+      id="onboarding"
+      class="onboarding-card"
+      aria-labelledby="onboarding-heading"
+      aria-describedby="onboarding-description"
+      hidden
+    >
+      <p class="onboarding-kicker">First-time setup</p>
+      <h2 id="onboarding-heading">Start here</h2>
+      <p id="onboarding-description" class="onboarding-description"></p>
+      <p class="onboarding-safety">Choosing a method only selects its setup panel. Firefox asks for site access later, when you use that panel's explicit setup button.</p>
+      <div class="actions onboarding-actions">
+        <button type="button" id="onboarding-continue" class="linkish">Hide this guide for now</button>
+      </div>
+      <p id="onboarding-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
     <section id="connection-method" aria-labelledby="connection-method-heading">
       <h2 id="connection-method-heading">Connection method</h2>
       <fieldset class="mode-options">
@@ -24,7 +41,7 @@
           >
           <span>
             <strong>Local AWS CLI helper</strong>
-            <small>Use <code>server.py</code> and your AWS CLI SSO token when the access portal is unavailable.</small>
+            <small>Use <code>server.py</code> with an existing AWS CLI SSO login when the access portal is unavailable.</small>
           </span>
         </label>
         <label class="radio" for="mode-portal">
@@ -48,6 +65,7 @@
       class="mode-panel"
       data-mode-panel="backend"
       aria-labelledby="backend-heading"
+      hidden
     >
       <h2 id="backend-heading">Local AWS CLI helper</h2>
       <p class="section-intro">Containoodle gets accounts and sign-in URLs from the helper running on this computer.</p>
@@ -78,7 +96,7 @@
           spellcheck="false"
           aria-describedby="backend-token-help backend-token-status"
         >
-        <p class="hint" id="backend-token-help">Run <code>python3 server.py --show-token</code>, then paste its 43-character result here. It is stored only in this Firefox profile; the extension never redisplays it after saving. Leave this field blank to test with the token already stored.</p>
+        <p class="hint" id="backend-token-help">Run <code>python3 server.py --show-token</code> to print the helper's persistent 43-character token. That command then exits, so start <code>python3 server.py</code> separately. Paste the token here once; it is stored only in this Firefox profile and never redisplayed after saving. Leave this field blank to test with the token already stored.</p>
         <p class="status" id="backend-token-status" role="status" aria-live="polite">Checking saved token…</p>
       </div>
 
@@ -87,7 +105,7 @@
         <input
           type="text"
           id="backend-sso-profile"
-          placeholder="__CONTAINOODLE_TEST_PROFILE__"
+          placeholder="containoodle-example-profile"
           autocomplete="off"
           autocapitalize="off"
           maxlength="128"

@@ -42,6 +42,11 @@ import {
   BACKEND_SESSION_REUSE_ORIGIN,
   roleDiscoveryOrigin,
 } from "./shared/permissions.js";
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_STATES,
+  onboardingStateForLifecycle,
+} from "./shared/onboarding.js";
 
 const DEFAULT_CONFIG = {
   mode: "backend",
@@ -52,12 +57,15 @@ const DEFAULT_CONFIG = {
   groupNameReplacement: "",
 };
 
+const RESOLVE_CONNECTION_ONBOARDING = "resolve-connection-onboarding";
+
 const ENV_CONTAINER_COLOR = { prod: "red", qa: "yellow", dev: "green", test: "toolbar" };
 const ENV_GROUP_COLOR = { prod: "red", qa: "yellow", dev: "green", test: "grey" };
 const REGION_RE = /^[a-z]{2}-[a-z]+-\d$/;
 const BACKEND_SESSION_REUSE_ORIGINS = [BACKEND_SESSION_REUSE_ORIGIN];
 let storageMigrationPromise = null;
 let connectionModeRevision = 0;
+let connectionOnboardingInitialization = null;
 
 function ensureStorageMigration() {
   if (!storageMigrationPromise) {
@@ -681,7 +689,7 @@ function copiedPortalCookieMatches(candidate, source) {
    booleans, never the portal cookie value. Session detection shares the
    same FPI/partition selection as launch so Options cannot report a cookie
    jar that the handoff would reject. */
-async function portalReadiness() {
+async function portalReadiness({ allowRemoteRegionLookup = true } = {}) {
   const config = await getConfig();
   const result = {
     ok: true,
@@ -718,7 +726,7 @@ async function portalReadiness() {
     // Precompute the exact regional request target before the Options click.
     // Optional discovery failure must never make core portal readiness fail.
     let region = await knownPortalRegion(config);
-    if (!region && result.session) {
+    if (!region && result.session && allowRemoteRegionLookup) {
       try {
         region = await portalRegion(config);
       } catch {
@@ -2055,7 +2063,49 @@ async function cleanupStaleGroups() {
   }
 }
 
+/* Mark only genuine, unconfigured installs for first-run setup. Existing
+   profiles are grandfathered on update (and on install-like development
+   reloads that retain config), so lifecycle events never change their mode
+   or permissions. A marker failure must not interfere with background work. */
+async function initializeConnectionOnboarding(details = {}) {
+  try {
+    const stored = await browser.storage.local.get([ONBOARDING_KEY, "config"]);
+    const nextState = onboardingStateForLifecycle({
+      reason: details.reason,
+      storedState: stored[ONBOARDING_KEY],
+      hasConfig: Object.prototype.hasOwnProperty.call(stored, "config"),
+    });
+    if (
+      nextState === ONBOARDING_STATES.CHOOSE ||
+      nextState === ONBOARDING_STATES.COMPLETE
+    ) {
+      await browser.storage.local.set({ [ONBOARDING_KEY]: nextState });
+    }
+  } catch {
+    // Onboarding is additive UI; storage failures must preserve core behavior.
+  }
+}
+
+function beginConnectionOnboarding(details) {
+  connectionOnboardingInitialization = initializeConnectionOnboarding(details);
+  return connectionOnboardingInitialization;
+}
+
+async function resolveConnectionOnboarding() {
+  try {
+    if (connectionOnboardingInitialization) {
+      await connectionOnboardingInitialization;
+    }
+    const stored = await browser.storage.local.get(ONBOARDING_KEY);
+    return { state: stored[ONBOARDING_KEY] };
+  } catch {
+    // The sidebar deliberately falls back to established behavior on failure.
+    return {};
+  }
+}
+
 browser.runtime.onStartup.addListener(cleanupStaleGroups);
+browser.runtime.onInstalled.addListener(beginConnectionOnboarding);
 browser.runtime.onInstalled.addListener(cleanupStaleGroups);
 browser.runtime.onStartup.addListener(seedKnownGroupTitles);
 browser.runtime.onInstalled.addListener(seedKnownGroupTitles);
@@ -2361,6 +2411,9 @@ browser.tabs.onRemoved.addListener((tabId) => {
 /* ─── Messages ───────────────────────────────────────────────────── */
 
 browser.runtime.onMessage.addListener((msg, sender) => {
+  if (msg && msg.type === RESOLVE_CONNECTION_ONBOARDING) {
+    return resolveConnectionOnboarding();
+  }
   if (msg && msg.type === "launch") {
     return launch(msg.accountId, msg.role, { expectedMode: msg.mode });
   }
@@ -2374,7 +2427,11 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     return setBackendPin(msg.accountId, msg.pinned, msg.mode);
   }
   if (msg && msg.type === "open-portal") return openPortal(msg.mode);
-  if (msg && msg.type === "portal-readiness") return portalReadiness();
+  if (msg && msg.type === "portal-readiness") {
+    return portalReadiness({
+      allowRemoteRegionLookup: msg.allowRemoteRegionLookup !== false,
+    });
+  }
   if (msg && msg.type === "reset-group-titles") return resetGroupTitles();
   if (msg && msg.type === "portal-interceptor-state") {
     return portalInterceptorState(sender && sender.tab);

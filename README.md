@@ -75,7 +75,7 @@ the reachable portal into the right container.
 | Capability | Behaviour |
 |---|---|
 | 🎯 **One click in** | Local helper mode launches from the Containoodle sidebar; portal mode lets you choose the account and role in the AWS Access Portal as usual. A sidebar button focuses or opens the configured portal. Either way, the console lands in the account's container. |
-| 🔀 **Two exclusive modes** | **Local helper** uses `server.py` and your AWS CLI SSO token. **Portal** uses the reachable AWS Access Portal with no helper or AWS CLI. Only one mode is active; account lists and remembered roles never cross between them. |
+| 🔀 **Two exclusive modes** | **Local helper** uses `server.py` with your existing AWS CLI SSO login. **Portal** uses the reachable AWS Access Portal with no helper or AWS CLI. Only one mode is active; account lists and remembered roles never cross between them. |
 | 🎭 **The right role** | Portal handoffs use the exact role you clicked. Portal shortcuts use only their saved portal role or optional portal role discovery. Backend launches use only backend account/role data and leave final fallback resolution to the helper. |
 | 🗂️ **Separated by design** | Each account gets one named container. AWS console cookies stay container-scoped; portal mode copies the scoped SSO authentication cookie needed to bootstrap the selected session. |
 | 📑 **Tab groups** | Every account's tabs land in their own Firefox tab group, colour-matched to the environment. Portal handoffs keep the displayed account name when it can be captured; an optional regex pattern and replacement can shorten automatic group titles. Manual titles always win. |
@@ -216,6 +216,14 @@ Open the sidebar with **View → Sidebar → Containoodle**, `Alt+Shift+A`, or
 opens the options page.
 
 ## Set up a connection
+
+On a genuinely new Firefox profile, the sidebar shows **Set up Containoodle**.
+Choose **Open setup**, then select one connection method. Selecting a method only
+saves that choice and reveals its existing setup controls; it does not request
+site access or contact AWS or the local helper. Helper onboarding finishes after
+a successful **Save & test**. Portal onboarding finishes after the exact portal
+origin is granted and a signed-in portal session is detected. Existing and
+upgraded profiles keep their current behavior and do not enter first-run setup.
 
 Switching modes does not merge account lists or remembered roles. Portal launches
 never use backend cache/session-reuse logic, and backend launches never use portal

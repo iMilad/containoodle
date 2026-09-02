@@ -19,12 +19,19 @@ import {
   normalizeBackendToken,
   safeBackendUrl,
 } from "../shared/backend.js";
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_STATES,
+  isOnboardingPending,
+} from "../shared/onboarding.js";
 
 const DEFAULT_CONFIG = {
   mode: "backend",
   backendUrl: DEFAULT_BACKEND_URL,
   portalStartUrl: "",
 };
+
+const RESOLVE_CONNECTION_ONBOARDING = "resolve-connection-onboarding";
 
 // Display labels for the env classes returned by accountEnv() (env.js)
 const ENV_LABEL = { prod: "PROD", qa: "QA", dev: "DEV", test: "TEST" };
@@ -45,6 +52,8 @@ let lastActiveTabId = null;
 let refreshGeneration = 0;
 let modeRevision = 0;
 let backendRequestController = null;
+let onboardingResolved = false;
+let onboardingPending = false;
 // Tab ids Firefox reported removed — tabs.query() can still return a
 // closing tab briefly after onRemoved, leaving ghosts in Active
 const removedTabIds = new Set();
@@ -73,6 +82,10 @@ const notification = document.getElementById("notification");
 const portalToolbar = document.getElementById("portal-toolbar");
 const openPortalBtn = document.getElementById("open-portal-btn");
 const portalToolbarHint = document.getElementById("portal-toolbar-hint");
+const onboardingCard = document.getElementById("onboarding-card");
+const onboardingHeading = document.getElementById("onboarding-heading");
+const onboardingDescription = document.getElementById("onboarding-description");
+const onboardingOpenSetup = document.getElementById("onboarding-open-setup");
 
 // ── Notification ─────────────────────────────────────────────
 let notifyTimer = null;
@@ -83,6 +96,73 @@ function notify(message, type = "info", onClick = null) {
   notification.onclick = onClick;
   clearTimeout(notifyTimer);
   notifyTimer = setTimeout(() => { notification.hidden = true; }, onClick ? 10000 : 4000);
+}
+
+const ONBOARDING_COPY = Object.freeze({
+  [ONBOARDING_STATES.CHOOSE]: {
+    heading: "Set up Containoodle",
+    description: "Choose how Containoodle should open AWS console sessions.",
+  },
+  [ONBOARDING_STATES.BACKEND]: {
+    heading: "Finish helper setup",
+    description: "Connect and test the local AWS CLI helper before opening accounts.",
+  },
+  [ONBOARDING_STATES.PORTAL]: {
+    heading: "Finish portal setup",
+    description: "Add your AWS access portal and confirm it is ready before opening accounts.",
+  },
+});
+
+function showOnboarding(state) {
+  const copy = ONBOARDING_COPY[state] || ONBOARDING_COPY[ONBOARDING_STATES.CHOOSE];
+  onboardingPending = true;
+  if (backendRequestController) backendRequestController.abort();
+  rolePicks.clear();
+
+  onboardingHeading.textContent = copy.heading;
+  onboardingDescription.textContent = copy.description;
+  onboardingCard.dataset.state = state;
+  onboardingCard.hidden = false;
+  portalToolbar.hidden = true;
+  listEl.hidden = true;
+  loadingState.classList.remove("visible");
+  loadingState.hidden = true;
+  refreshBtn.hidden = true;
+  notification.hidden = true;
+  statusDot.className = "dot setup";
+  statusText.classList.add("setup");
+  statusText.textContent = "Setup required";
+}
+
+function hideOnboarding() {
+  onboardingPending = false;
+  onboardingCard.hidden = true;
+  delete onboardingCard.dataset.state;
+  listEl.hidden = false;
+  loadingState.hidden = false;
+  refreshBtn.hidden = false;
+  statusText.classList.remove("setup");
+}
+
+async function readOnboardingState() {
+  try {
+    const stored = await browser.storage.local.get(ONBOARDING_KEY);
+    if (Object.prototype.hasOwnProperty.call(stored, ONBOARDING_KEY)) {
+      return stored[ONBOARDING_KEY];
+    }
+
+    // The install sidebar can load while the background's asynchronous
+    // lifecycle write is still pending. Wait only in that ambiguous missing
+    // state; ordinary startups receive an immediate missing response and keep
+    // the established behavior.
+    const resolved = await browser.runtime.sendMessage({
+      type: RESOLVE_CONNECTION_ONBOARDING,
+    });
+    return resolved && resolved.state;
+  } catch {
+    // A missing or unreadable marker must preserve the established sidebar.
+    return null;
+  }
 }
 
 // ── Config + accounts ────────────────────────────────────────
@@ -314,12 +394,14 @@ async function getContainerTabMap() {
 
 // ── Debounced render (for event-driven calls) ────────────────
 function scheduleRender() {
+  if (!onboardingResolved || onboardingPending) return;
   clearTimeout(renderDebounceTimer);
   renderDebounceTimer = setTimeout(render, 50);
 }
 
 // ── Render ───────────────────────────────────────────────────
 async function render(expectedGeneration = refreshGeneration) {
+  if (!onboardingResolved || onboardingPending) return;
   const containerMap = await getContainerTabMap();
   if (expectedGeneration !== refreshGeneration) return;
   const portalMode = config.mode === "portal";
@@ -1046,6 +1128,8 @@ function containerCssColor(name) {
 }
 
 // ── Footer buttons ───────────────────────────────────────────
+onboardingOpenSetup.addEventListener("click", openOptionsAction);
+
 refreshBtn.addEventListener("click", async () => {
   refreshBtn.classList.add("spinning");
   await fullRefresh();
@@ -1074,6 +1158,15 @@ browser.contextualIdentities.onUpdated.addListener(scheduleRender);
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   const keys = Object.keys(changes);
+  if (changes[ONBOARDING_KEY]) {
+    onboardingResolved = true;
+    if (isOnboardingPending(changes[ONBOARDING_KEY].newValue)) {
+      onboardingPending = true;
+      if (backendRequestController) backendRequestController.abort();
+    }
+    void fullRefresh();
+    return;
+  }
   if (changes.config) {
     const oldMode = changes.config.oldValue?.mode;
     const newMode = changes.config.newValue?.mode;
@@ -1121,6 +1214,15 @@ browser.storage.onChanged.addListener((changes, area) => {
 async function fullRefresh() {
   const generation = ++refreshGeneration;
   loadingState.classList.add("visible");
+  const nextOnboardingState = await readOnboardingState();
+  if (generation !== refreshGeneration) return;
+  onboardingResolved = true;
+  if (isOnboardingPending(nextOnboardingState)) {
+    showOnboarding(nextOnboardingState);
+    return;
+  }
+
+  hideOnboarding();
   const nextConfig = await readConfig();
   if (generation !== refreshGeneration) return;
   if (nextConfig.mode === "portal" && backendRequestController) {

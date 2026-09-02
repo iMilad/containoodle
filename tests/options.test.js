@@ -12,6 +12,10 @@ import {
   LEGACY_ROLE_DISCOVERY_ORIGIN,
   roleDiscoveryOrigin,
 } from "../firefox-extension/shared/permissions.js";
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_STATES,
+} from "../firefox-extension/shared/onboarding.js";
 
 const OPTIONS_MODULE = new URL(
   "../firefox-extension/options/options.js",
@@ -115,6 +119,8 @@ class FakeElement {
     this.attributes = new Map();
     this.controls = [];
     this.listeners = new Map();
+    this.focused = false;
+    this.scrolled = false;
   }
 
   addEventListener(type, listener) {
@@ -134,6 +140,14 @@ class FakeElement {
   querySelectorAll(selector) {
     if (selector === "button, input, textarea") return this.controls;
     return [];
+  }
+
+  focus() {
+    this.focused = true;
+  }
+
+  scrollIntoView() {
+    this.scrolled = true;
   }
 
   async dispatch(type, event = {}) {
@@ -160,6 +174,10 @@ function createEvent() {
 
 function createDocument() {
   const ids = [
+    "onboarding",
+    "onboarding-description",
+    "onboarding-continue",
+    "onboarding-status",
     "mode-backend",
     "mode-portal",
     "backend-panel",
@@ -197,6 +215,7 @@ function createDocument() {
   const elements = new Map(ids.map((id) => [id, new FakeElement(id)]));
   const backendPanel = elements.get("backend-panel");
   const portalPanel = elements.get("portal-panel");
+  elements.get("onboarding").hidden = true;
 
   elements.get("mode-backend").value = "backend";
   elements.get("mode-portal").value = "portal";
@@ -245,6 +264,9 @@ function createFixture({
   granted = [],
   portalSession = true,
   storage = {},
+  emitOwnPermissionChanges = false,
+  emitOwnStorageChanges = false,
+  ownEventsAfterResolve = false,
 } = {}) {
   const { document, elements } = createDocument();
   const permissionSet = new Set(granted);
@@ -299,6 +321,7 @@ function createFixture({
   };
   let backendFetchError = null;
   let backendAuthFailure = null;
+  let backendAccountsGate = null;
   let challengeSequence = 0;
   let helperToken = storageData[BACKEND_AUTH_TOKEN_KEY];
 
@@ -306,6 +329,14 @@ function createFixture({
     [...permissionSet].some((grantedOrigin) =>
       matchPatternCovers(grantedOrigin, requested)
     );
+
+  async function emitOwnEvent(event, ...args) {
+    if (ownEventsAfterResolve) {
+      setImmediate(() => { void event.fire(...args); });
+      return;
+    }
+    await event.fire(...args);
+  }
 
   function currentReadiness() {
     if (readinessOverride) return { ...readinessOverride };
@@ -363,12 +394,35 @@ function createFixture({
             failNextConfigWrite = false;
             throw new Error("simulated config write failure");
           }
+          const changes = Object.fromEntries(
+            Object.entries(values).map(([key, newValue]) => [
+              key,
+              {
+                oldValue: structuredClone(storageData[key]),
+                newValue: structuredClone(newValue),
+              },
+            ]),
+          );
           storageSetCalls.push(structuredClone(values));
           Object.assign(storageData, values);
+          if (emitOwnStorageChanges) {
+            await emitOwnEvent(storageChanged, changes, "local");
+          }
         },
         async remove(keys) {
-          for (const key of Array.isArray(keys) ? keys : [keys]) {
+          const normalizedKeys = Array.isArray(keys) ? keys : [keys];
+          const changes = Object.fromEntries(normalizedKeys.map((key) => [
+            key,
+            {
+              oldValue: structuredClone(storageData[key]),
+              newValue: undefined,
+            },
+          ]));
+          for (const key of normalizedKeys) {
             delete storageData[key];
+          }
+          if (emitOwnStorageChanges) {
+            await emitOwnEvent(storageChanged, changes, "local");
           }
         },
       },
@@ -397,11 +451,19 @@ function createFixture({
           throw error;
         }
         if (!permissionRequestAllowed) return false;
+        const newlyAdded = origins.filter((origin) => !permissionSet.has(origin));
         if (
           materializeCoveredPermissionRequest ||
           !origins.every(hasEffectiveOrigin)
         ) {
           origins.forEach((origin) => permissionSet.add(origin));
+        }
+        if (emitOwnPermissionChanges && newlyAdded.some(
+          (origin) => permissionSet.has(origin)
+        )) {
+          await emitOwnEvent(onAdded, {
+            origins: newlyAdded.filter((origin) => permissionSet.has(origin)),
+          });
         }
         return true;
       },
@@ -415,7 +477,11 @@ function createFixture({
           permissionRemovalFailureOrigin = null;
           throw new Error("simulated permission removal failure");
         }
+        const removed = origins.filter((origin) => permissionSet.has(origin));
         origins.forEach((origin) => permissionSet.delete(origin));
+        if (emitOwnPermissionChanges && removed.length > 0) {
+          await emitOwnEvent(onRemoved, { origins: removed });
+        }
         return true;
       },
     },
@@ -475,6 +541,11 @@ function createFixture({
     }
     if (!deferBackendFetch) {
       const isIdentityRequest = requestUrl.pathname === "/sso-identity";
+      if (!isIdentityRequest && backendAccountsGate) {
+        const gate = backendAccountsGate;
+        backendAccountsGate = null;
+        await gate.promise;
+      }
       const responseStatus = isIdentityRequest
         ? backendIdentityStatus
         : backendFetchStatus;
@@ -600,6 +671,12 @@ function createFixture({
     setDeferredBackendFetch(value) {
       deferBackendFetch = value;
     },
+    pauseNextBackendAccountsResponse() {
+      let release;
+      const promise = new Promise((resolve) => { release = resolve; });
+      backendAccountsGate = { promise };
+      return release;
+    },
     setBackendFetchResponse(status, payload = []) {
       backendFetchStatus = status;
       backendFetchPayload = payload;
@@ -682,6 +759,263 @@ function assertNoRawHelperToken(call, ...tokens) {
   const rendered = `${call.url}\n${[...headers].flat().join("\n")}`;
   for (const token of tokens) assert.doesNotMatch(rendered, new RegExp(token));
 }
+
+test("onboarding renders only recognized pending states and choose has no active mode", async () => {
+  const cases = [
+    {
+      state: ONBOARDING_STATES.CHOOSE,
+      mode: "backend",
+      visible: true,
+      selected: null,
+      description: /Choose Local AWS CLI helper or AWS access portal/,
+    },
+    {
+      state: ONBOARDING_STATES.BACKEND,
+      mode: "backend",
+      visible: true,
+      selected: "backend",
+      description: /Local helper is selected/,
+    },
+    {
+      state: ONBOARDING_STATES.PORTAL,
+      mode: "portal",
+      visible: true,
+      selected: "portal",
+      description: /AWS access portal is selected/,
+    },
+    {
+      state: ONBOARDING_STATES.COMPLETE,
+      mode: "backend",
+      visible: false,
+      selected: "backend",
+    },
+    {
+      state: undefined,
+      mode: "backend",
+      visible: false,
+      selected: "backend",
+    },
+    {
+      state: "unexpected-state",
+      mode: "portal",
+      visible: false,
+      selected: "portal",
+    },
+  ];
+
+  for (const entry of cases) {
+    const fixture = createFixture({
+      config: { mode: entry.mode, portalStartUrl: "" },
+      storage: { [ONBOARDING_KEY]: entry.state },
+      portalSession: false,
+    });
+    try {
+      await loadOptions(fixture);
+
+      assert.equal(fixture.elements.get("onboarding").hidden, !entry.visible);
+      assert.equal(
+        fixture.elements.get("mode-backend").checked,
+        entry.selected === "backend",
+      );
+      assert.equal(
+        fixture.elements.get("mode-portal").checked,
+        entry.selected === "portal",
+      );
+      assert.equal(
+        fixture.elements.get("backend-panel").hidden,
+        entry.selected !== "backend",
+      );
+      assert.equal(
+        fixture.elements.get("portal-panel").hidden,
+        entry.selected !== "portal",
+      );
+      if (entry.description) {
+        assert.match(
+          fixture.elements.get("onboarding-description").textContent,
+          entry.description,
+        );
+      }
+      assert.deepEqual(fixture.permissionRequests, []);
+      assert.deepEqual(fixture.permissionRemovals, []);
+      assert.deepEqual(fixture.fetchCalls, []);
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
+
+test("onboarding mode choices atomically use the existing config save path", async () => {
+  for (const mode of ["backend", "portal"]) {
+    const fixture = createFixture({
+      config: {
+        mode: "backend",
+        groupNamePattern: "^synthetic-(.+)$",
+        groupNameReplacement: "$1",
+      },
+      storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.CHOOSE },
+      portalSession: false,
+    });
+    try {
+      await loadOptions(fixture);
+      const input = fixture.elements.get(`mode-${mode}`);
+      input.checked = true;
+      await input.dispatch("change");
+      await settle();
+
+      assert.equal(fixture.storageData.config.mode, mode);
+      assert.equal(fixture.storageData.config.groupNamePattern, "^synthetic-(.+)$");
+      assert.equal(fixture.storageData.config.groupNameReplacement, "$1");
+      assert.equal(fixture.storageData[ONBOARDING_KEY], mode);
+      assert.equal(fixture.storageSetCalls.length, 1);
+      assert.deepEqual(fixture.storageSetCalls[0], {
+        config: fixture.storageData.config,
+        [ONBOARDING_KEY]: mode,
+      });
+      assert.equal(fixture.elements.get(`${mode}-panel`).hidden, false);
+      assert.equal(fixture.elements.get("onboarding").hidden, false);
+      assert.deepEqual(fixture.permissionRequests, []);
+      assert.deepEqual(fixture.permissionRemovals, []);
+      assert.deepEqual(fixture.fetchCalls, []);
+      assert.deepEqual(
+        fixture.runtimeMessages.filter(({ type }) => type === "portal-readiness"),
+        mode === "portal"
+          ? [{ type: "portal-readiness", allowRemoteRegionLookup: false }]
+          : [],
+      );
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
+
+test("pending portal passive refreshes prohibit remote region lookup", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl, ssoRegion: "" },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+    granted: ["https://d-0000000000.awsapps.com/*"],
+    portalSession: false,
+  });
+  try {
+    await loadOptions(fixture);
+    await fixture.fakeWindow.fire("focus");
+    await fixture.cookiesChanged.fire({
+      cookie: {
+        name: "x-amz-sso_authn",
+        storeId: "firefox-default",
+      },
+    });
+    await settle();
+
+    const readinessMessages = fixture.runtimeMessages.filter(
+      ({ type }) => type === "portal-readiness",
+    );
+    assert.equal(readinessMessages.length, 3);
+    assert.ok(readinessMessages.every(
+      (message) => message.allowRemoteRegionLookup === false,
+    ));
+    assert.deepEqual(fixture.permissionRequests, []);
+    assert.deepEqual(fixture.fetchCalls, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("completed users can switch modes without re-entering onboarding", async () => {
+  const fixture = createFixture({
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.COMPLETE },
+    portalSession: false,
+  });
+  try {
+    await loadOptions(fixture);
+    const portalMode = fixture.elements.get("mode-portal");
+    portalMode.checked = true;
+    await portalMode.dispatch("change");
+    await settle();
+
+    assert.equal(fixture.storageData.config.mode, "portal");
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.COMPLETE,
+    );
+    assert.equal(
+      Object.hasOwn(fixture.storageSetCalls[0], ONBOARDING_KEY),
+      false,
+    );
+    assert.equal(fixture.elements.get("onboarding").hidden, true);
+    assert.deepEqual(fixture.permissionRequests, []);
+    assert.deepEqual(fixture.fetchCalls, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("hiding the guide is page-only and reload resumes the same onboarding step", async () => {
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl: "" },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+    portalSession: false,
+  });
+  let persisted;
+  try {
+    await loadOptions(fixture);
+    await fixture.elements.get("onboarding-continue").dispatch("click");
+
+    assert.equal(fixture.elements.get("onboarding").hidden, true);
+    assert.equal(fixture.elements.get("mode-portal").focused, true);
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.PORTAL,
+    );
+    assert.deepEqual(fixture.storageSetCalls, []);
+    persisted = structuredClone(fixture.storageData);
+  } finally {
+    cleanupGlobals();
+  }
+
+  const reloaded = createFixture({ storage: persisted, portalSession: false });
+  try {
+    await loadOptions(reloaded);
+    assert.equal(reloaded.elements.get("onboarding").hidden, false);
+    assert.equal(reloaded.elements.get("mode-portal").checked, true);
+    assert.equal(reloaded.elements.get("portal-panel").hidden, false);
+    assert.deepEqual(reloaded.permissionRequests, []);
+    assert.deepEqual(reloaded.fetchCalls, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a failed onboarding mode write changes neither mode nor step", async () => {
+  const fixture = createFixture({
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.CHOOSE },
+  });
+  fixture.failFollowingStorageWrite();
+  try {
+    await loadOptions(fixture);
+    const portalMode = fixture.elements.get("mode-portal");
+    portalMode.checked = true;
+    await portalMode.dispatch("change");
+
+    assert.equal(fixture.storageData.config.mode, "backend");
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.CHOOSE,
+    );
+    assert.equal(fixture.elements.get("mode-backend").checked, false);
+    assert.equal(fixture.elements.get("mode-portal").checked, false);
+    assert.equal(fixture.elements.get("backend-panel").hidden, true);
+    assert.equal(fixture.elements.get("portal-panel").hidden, true);
+    assert.match(
+      fixture.elements.get("onboarding-status").textContent,
+      /Could not save/,
+    );
+    assert.deepEqual(fixture.permissionRequests, []);
+    assert.deepEqual(fixture.fetchCalls, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
 
 test("renders the active mode, switches live, and guards backend fetches in portal mode", async () => {
   const fixture = createFixture();
@@ -1159,6 +1493,176 @@ test("first backend Save & test offers session reuse synchronously without block
     await fixture.elements.get("backend-save").dispatch("click");
     await waitForBackendRequest(fixture);
     assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("verified backend setup completes onboarding even when optional reuse is declined", async () => {
+  const fixture = createFixture({
+    storage: {
+      [ONBOARDING_KEY]: ONBOARDING_STATES.BACKEND,
+      [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: undefined,
+    },
+  });
+  fixture.setPermissionRequestAllowed(false);
+  try {
+    await loadOptions(fixture);
+    assert.equal(fixture.elements.get("onboarding").hidden, false);
+
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.COMPLETE,
+    );
+    assert.equal(fixture.elements.get("onboarding").hidden, true);
+    assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+    assert.match(fixture.elements.get("console-status").textContent, /declined/);
+    assert.match(
+      fixture.elements.get("backend-status").textContent,
+      /Connected to local helper/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("own completion and permission events do not roll back accepted backend session reuse", async () => {
+  for (const ownEventsAfterResolve of [false, true]) {
+    const fixture = createFixture({
+      storage: {
+        [ONBOARDING_KEY]: ONBOARDING_STATES.BACKEND,
+        [BACKEND_SESSION_REUSE_AUTO_OFFER_HANDLED_KEY]: undefined,
+      },
+      emitOwnPermissionChanges: true,
+      emitOwnStorageChanges: true,
+      ownEventsAfterResolve,
+    });
+    const releasePermission = fixture.pauseNextPermissionRequest();
+    try {
+      await loadOptions(fixture);
+
+      await fixture.elements.get("backend-save").dispatch("click");
+      await waitFor(() => fixture.permissionRequests.length === 1);
+      await waitForBackendRequest(fixture);
+      assert.equal(
+        fixture.storageData[ONBOARDING_KEY],
+        ONBOARDING_STATES.COMPLETE,
+        "the helper connection should finish while the optional prompt is open",
+      );
+
+      releasePermission();
+      await settle();
+
+      assert.deepEqual(fixture.permissionRequests, [CONSOLE_ORIGINS]);
+      assert.deepEqual(fixture.permissionRemovals, []);
+      assert.deepEqual(fixture.grantedOrigins(), CONSOLE_ORIGINS);
+      assert.match(fixture.elements.get("console-status").textContent, /Enabled/);
+    } finally {
+      releasePermission();
+      cleanupGlobals();
+    }
+  }
+});
+
+test("failed backend verification leaves onboarding pending", async () => {
+  const fixture = createFixture({
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.BACKEND },
+  });
+  fixture.setBackendFetchError(new Error("synthetic helper failure"));
+  try {
+    await loadOptions(fixture);
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitForBackendRequest(fixture);
+
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.BACKEND,
+    );
+    assert.equal(fixture.elements.get("onboarding").hidden, false);
+    assert.match(
+      fixture.elements.get("backend-status").textContent,
+      /unreachable/,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a persisted external choice blocks a stale backend onboarding commit", async () => {
+  const fixture = createFixture({
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.BACKEND },
+  });
+  const releaseAccounts = fixture.pauseNextBackendAccountsResponse();
+  try {
+    await loadOptions(fixture);
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitFor(
+      () => protectedFetchCalls(fixture).length === 2,
+      "backend accounts request did not reach the response gate",
+    );
+
+    const externalConfig = {
+      ...fixture.storageData.config,
+      mode: "portal",
+    };
+    fixture.storageData.config = externalConfig;
+    fixture.storageData[ONBOARDING_KEY] = ONBOARDING_STATES.PORTAL;
+    releaseAccounts();
+    await waitForBackendRequest(fixture);
+
+    assert.deepEqual(fixture.storageData.config, externalConfig);
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.PORTAL,
+    );
+    assert.equal(fixture.storageData.accountsCache, undefined);
+    assert.match(
+      fixture.elements.get("backend-status").textContent,
+      /changed elsewhere/,
+    );
+  } finally {
+    releaseAccounts();
+    cleanupGlobals();
+  }
+});
+
+test("an external connection change synchronizes the page and aborts helper work", async () => {
+  const fixture = createFixture({
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.BACKEND },
+  });
+  fixture.setDeferredBackendFetch(true);
+  try {
+    await loadOptions(fixture);
+    await fixture.elements.get("backend-save").dispatch("click");
+    await waitFor(
+      () => protectedFetchCalls(fixture).length > 0,
+      "backend request did not start",
+    );
+
+    const oldConfig = structuredClone(fixture.storageData.config);
+    const newConfig = { ...oldConfig, mode: "portal" };
+    fixture.storageData.config = newConfig;
+    fixture.storageData[ONBOARDING_KEY] = ONBOARDING_STATES.PORTAL;
+    await fixture.storageChanged.fire({
+      config: { oldValue: oldConfig, newValue: newConfig },
+      [ONBOARDING_KEY]: {
+        oldValue: ONBOARDING_STATES.BACKEND,
+        newValue: ONBOARDING_STATES.PORTAL,
+      },
+    }, "local");
+    await waitFor(() => fixture.abortedFetches === 1);
+
+    assert.equal(fixture.elements.get("mode-portal").checked, true);
+    assert.equal(fixture.elements.get("portal-panel").hidden, false);
+    assert.equal(fixture.elements.get("backend-panel").hidden, true);
+    assert.equal(fixture.elements.get("onboarding").hidden, false);
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.PORTAL,
+    );
   } finally {
     cleanupGlobals();
   }
@@ -1665,6 +2169,283 @@ test("portal core access requests only the normalized portal host", async () => 
   }
 });
 
+test("own permission and completion events keep a configured portal grant", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const portalOrigin = "https://d-0000000000.awsapps.com/*";
+  for (const ownEventsAfterResolve of [false, true]) {
+    const fixture = createFixture({
+      config: { mode: "portal", portalStartUrl },
+      storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+      emitOwnPermissionChanges: true,
+      emitOwnStorageChanges: true,
+      ownEventsAfterResolve,
+    });
+    try {
+      await loadOptions(fixture);
+      await fixture.elements.get("portal-save").dispatch("click");
+      await waitFor(
+        () => fixture.storageData[ONBOARDING_KEY] === ONBOARDING_STATES.COMPLETE,
+        "portal onboarding did not complete after the exact grant",
+      );
+      await settle();
+
+      assert.deepEqual(fixture.permissionRequests, [[portalOrigin]]);
+      assert.deepEqual(fixture.permissionRemovals, []);
+      assert.deepEqual(fixture.grantedOrigins(), [portalOrigin]);
+      assert.equal(fixture.elements.get("onboarding").hidden, true);
+      assert.equal(
+        fixture.elements.get("role-discovery-grant").disabled,
+        false,
+        "the completion marker must not invalidate the discovered role target",
+      );
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
+
+test("switching modes during a portal permission prompt rolls back only its new grant", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const portalOrigin = "https://d-0000000000.awsapps.com/*";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl: "" },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+    granted: ROLE_DISCOVERY_ORIGINS,
+    portalSession: false,
+  });
+  const releasePermission = fixture.pauseNextPermissionRequest();
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("portal-url").value = portalStartUrl;
+    await fixture.elements.get("portal-save").dispatch("click");
+    await waitFor(() => fixture.permissionRequests.length === 1);
+
+    const backendMode = fixture.elements.get("mode-backend");
+    backendMode.checked = true;
+    await backendMode.dispatch("change");
+    releasePermission();
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+
+    assert.equal(fixture.storageData.config.mode, "backend");
+    assert.equal(fixture.storageData.config.portalStartUrl, "");
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.BACKEND,
+    );
+    assert.deepEqual(fixture.permissionRequests, [[portalOrigin]]);
+    assert.deepEqual(fixture.permissionRemovals, [[portalOrigin]]);
+    assert.deepEqual(fixture.grantedOrigins(), ROLE_DISCOVERY_ORIGINS);
+  } finally {
+    releasePermission();
+    cleanupGlobals();
+  }
+});
+
+test("a stale prompt also rolls back a newly granted configured portal origin", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const portalOrigin = "https://d-0000000000.awsapps.com/*";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+    portalSession: false,
+  });
+  const releasePermission = fixture.pauseNextPermissionRequest();
+  try {
+    await loadOptions(fixture);
+    await fixture.elements.get("portal-save").dispatch("click");
+    await waitFor(() => fixture.permissionRequests.length === 1);
+
+    const backendMode = fixture.elements.get("mode-backend");
+    backendMode.checked = true;
+    await backendMode.dispatch("change");
+    releasePermission();
+    await waitFor(() => fixture.permissionRemovals.length === 1);
+
+    assert.equal(fixture.storageData.config.mode, "backend");
+    assert.equal(fixture.storageData.config.portalStartUrl, portalStartUrl);
+    assert.deepEqual(fixture.permissionRequests, [[portalOrigin]]);
+    assert.deepEqual(fixture.permissionRemovals, [[portalOrigin]]);
+    assert.deepEqual(fixture.grantedOrigins(), []);
+  } finally {
+    releasePermission();
+    cleanupGlobals();
+  }
+});
+
+test("portal onboarding waits for a signed-in session and then completes without role access", async () => {
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl: "" },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+    portalSession: false,
+  });
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const portalOrigin = "https://d-0000000000.awsapps.com/*";
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("portal-url").value = portalStartUrl;
+    await fixture.elements.get("portal-save").dispatch("click");
+    await waitFor(() => fixture.storageData.config.portalStartUrl === portalStartUrl);
+    await settle();
+
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.PORTAL,
+    );
+    assert.equal(fixture.elements.get("onboarding").hidden, false);
+    assert.deepEqual(fixture.permissionRequests, [[portalOrigin]]);
+    assert.match(fixture.elements.get("portal-status").textContent, /sign in required/);
+
+    fixture.setPortalSession(true);
+    await fixture.elements.get("portal-refresh").dispatch("click");
+    await waitFor(
+      () => fixture.storageData[ONBOARDING_KEY] === ONBOARDING_STATES.COMPLETE,
+      "signed-in portal readiness did not complete onboarding",
+    );
+
+    assert.equal(fixture.elements.get("onboarding").hidden, true);
+    assert.deepEqual(fixture.permissionRequests, [[portalOrigin]]);
+    assert.equal(
+      fixture.grantedOrigins().includes(ROLE_DISCOVERY_ORIGINS[0]),
+      false,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("a stale portal readiness response cannot complete onboarding after a mode change", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+    granted: ["https://d-0000000000.awsapps.com/*"],
+    portalSession: false,
+  });
+  try {
+    await loadOptions(fixture);
+    fixture.setPortalSession(true);
+    const readinessCount = () => fixture.runtimeMessages.filter(
+      ({ type }) => type === "portal-readiness",
+    ).length;
+    const before = readinessCount();
+    const releaseReadiness = fixture.pauseNextPortalReadiness(null);
+
+    await fixture.elements.get("portal-refresh").dispatch("click");
+    await waitFor(() => readinessCount() === before + 1);
+
+    const backendMode = fixture.elements.get("mode-backend");
+    backendMode.checked = true;
+    await backendMode.dispatch("change");
+    releaseReadiness();
+    await settle();
+
+    assert.equal(fixture.storageData.config.mode, "backend");
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.BACKEND,
+    );
+    assert.notEqual(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.COMPLETE,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("persisted external state blocks stale portal onboarding completion", async () => {
+  const portalStartUrl = "https://d-0000000000.awsapps.com/start";
+  const exactPortalOrigin = "https://d-0000000000.awsapps.com/*";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+    granted: [exactPortalOrigin],
+    portalSession: false,
+  });
+  try {
+    await loadOptions(fixture);
+    fixture.setReadiness({
+      ok: true,
+      mode: "portal",
+      configured: true,
+      portalAccess: true,
+      session: true,
+      roleDiscoveryAccess: false,
+      roleDiscoveryRegion: null,
+      roleDiscoveryPermissionOrigin: null,
+      consoleAccess: false,
+    });
+    const readinessCount = () => fixture.runtimeMessages.filter(
+      ({ type }) => type === "portal-readiness",
+    ).length;
+    const before = readinessCount();
+    const releaseReadiness = fixture.pauseNextPortalReadiness(null);
+
+    await fixture.elements.get("portal-refresh").dispatch("click");
+    await waitFor(() => readinessCount() === before + 1);
+
+    const externalConfig = {
+      ...fixture.storageData.config,
+      mode: "backend",
+    };
+    fixture.storageData.config = externalConfig;
+    fixture.storageData[ONBOARDING_KEY] = ONBOARDING_STATES.BACKEND;
+    releaseReadiness();
+    await settle();
+
+    assert.deepEqual(fixture.storageData.config, externalConfig);
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.BACKEND,
+    );
+    assert.notEqual(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.COMPLETE,
+    );
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("effective broad portal coverage cannot complete onboarding without the exact grant", async () => {
+  const broadPortalOrigin = "https://*.awsapps.com/*";
+  const exactPortalOrigin = "https://d-0000000000.awsapps.com/*";
+  const fixture = createFixture({
+    config: { mode: "portal", portalStartUrl: "" },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+    granted: [broadPortalOrigin],
+  });
+  fixture.setMaterializeCoveredPermissionRequest(false);
+  fixture.setReadiness({
+    ok: true,
+    mode: "portal",
+    configured: true,
+    portalAccess: true,
+    session: true,
+    roleDiscoveryAccess: false,
+    roleDiscoveryRegion: null,
+    roleDiscoveryPermissionOrigin: null,
+    consoleAccess: false,
+  });
+  try {
+    await loadOptions(fixture);
+    fixture.elements.get("portal-url").value =
+      "https://d-0000000000.awsapps.com/start";
+    await fixture.elements.get("portal-save").dispatch("click");
+    await settle();
+
+    assert.deepEqual(fixture.permissionRequests, [[exactPortalOrigin]]);
+    assert.deepEqual(fixture.grantedOrigins(), [broadPortalOrigin]);
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.PORTAL,
+    );
+    assert.equal(fixture.elements.get("onboarding").hidden, false);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
 test("declined portal replacement preserves the existing portal configuration", async () => {
   const previous = "https://d-1111111111.awsapps.com/start";
   const fixture = createFixture({
@@ -1695,7 +2476,10 @@ test("declined portal replacement preserves the existing portal configuration", 
 });
 
 test("a first portal decline leaves no saved URL and reports that clearly", async () => {
-  const fixture = createFixture({ config: { mode: "portal" } });
+  const fixture = createFixture({
+    config: { mode: "portal" },
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
+  });
   fixture.setPermissionRequestAllowed(false);
   try {
     await loadOptions(fixture);
@@ -1705,6 +2489,10 @@ test("a first portal decline leaves no saved URL and reports that clearly", asyn
     await settle();
 
     assert.equal(fixture.storageData.config.portalStartUrl, "");
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.PORTAL,
+    );
     assert.equal(fixture.elements.get("portal-url").value, "");
     assert.match(
       fixture.elements.get("portal-status").textContent,
@@ -1783,7 +2571,9 @@ test("portal replacement removes only the old origin and preserves pre-existing 
 });
 
 test("switching to portal cancels pending and in-flight backend work", async () => {
-  const pendingSave = createFixture();
+  const pendingSave = createFixture({
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.BACKEND },
+  });
   try {
     await loadOptions(pendingSave);
     pendingSave.setDeferredBackendFetch(true);
@@ -1805,6 +2595,11 @@ test("switching to portal cancels pending and in-flight backend work", async () 
     );
 
     assert.equal(pendingSave.storageData.config.mode, "portal");
+    assert.equal(
+      pendingSave.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.PORTAL,
+      "stale backend work must not complete onboarding after a mode change",
+    );
     assert.equal(pendingSave.abortedFetches, 1);
     assert.equal(
       pendingSave.storageData[BACKEND_AUTH_TOKEN_KEY],
@@ -1937,6 +2732,7 @@ test("a signed-in portal with no detected region points to the manual override",
   const fixture = createFixture({
     config: { mode: "portal", portalStartUrl, ssoRegion: "" },
     granted: ["https://d-0000000000.awsapps.com/*"],
+    storage: { [ONBOARDING_KEY]: ONBOARDING_STATES.PORTAL },
   });
   fixture.setReadiness({
     ok: true,
@@ -1962,6 +2758,12 @@ test("a signed-in portal with no detected region points to the manual override",
       fixture.elements.get("role-discovery-status").textContent,
       /Sign in/,
     );
+    assert.equal(
+      fixture.storageData[ONBOARDING_KEY],
+      ONBOARDING_STATES.COMPLETE,
+      "regional role discovery is optional for core portal setup",
+    );
+    assert.equal(fixture.elements.get("onboarding").hidden, true);
   } finally {
     cleanupGlobals();
   }
@@ -2433,6 +3235,18 @@ test("options markup separates portal pins from backend session reuse", async ()
 
   assert.ok(backendPanel, "backend panel must remain present");
   assert.ok(portalPanel, "portal panel must remain present");
+  assert.match(
+    backendPanel[0].slice(0, backendPanel[0].indexOf(">") + 1),
+    /\shidden(?:\s|>)/,
+    "the backend panel must start hidden until onboarding state is loaded",
+  );
+  assert.match(html, /id="onboarding"/);
+  assert.match(html, /id="onboarding-heading">Start here</);
+  assert.match(html, /id="onboarding-description"/);
+  assert.match(
+    html,
+    /type="button"\s+id="onboarding-continue"|id="onboarding-continue"\s+[^>]*type="button"/,
+  );
   assert.match(backendPanel[0], /id="console-permissions"/);
   assert.match(
     backendPanel[0],
@@ -2449,7 +3263,7 @@ test("options markup separates portal pins from backend session reuse", async ()
   );
   assert.doesNotMatch(backendPanel[0], /id="backend-token"[^>]*\svalue=/);
   assert.match(backendPanel[0], /id="backend-sso-profile"/);
-  assert.match(backendPanel[0], /placeholder="__CONTAINOODLE_TEST_PROFILE__"/);
+  assert.match(backendPanel[0], /placeholder="containoodle-example-profile"/);
   assert.doesNotMatch(portalPanel[0], /id="console-permissions"/);
   assert.doesNotMatch(portalPanel[0], /id="backend-token"/);
   assert.match(portalPanel[0], /id="portal-pins-status"/);
