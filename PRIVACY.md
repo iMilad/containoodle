@@ -73,7 +73,18 @@ access log. Firefox and AWS may retain data under their own settings and policie
 ## Your controls
 
 - Portal and AWS host access is requested at runtime and can be revoked in Containoodle
-  settings or Firefox's add-on permissions.
+  settings or Firefox's add-on permissions. Optional role discovery requests only
+  the exact regional `https://portal.sso.<region>.amazonaws.com/*` target, and
+  optional backend session reuse requests only
+  `https://*.console.aws.amazon.com/*`.
+- Older broad AWS host grants remain effective only for upgrade compatibility.
+  During tightening, Containoodle removes one only after your explicit action and
+  Firefox reports the narrower replacement as a separate literal grant. The
+  explicit **Revoke** action directly removes that feature's recognized grants. If
+  Firefox retains only broad coverage during tightening, Containoodle preserves it
+  and instructs you to revoke, then allow again. Startup, extension update, opening
+  Options, and switching modes do not migrate existing permissions. A newly accepted
+  request is rolled back if its mode or target changed while Firefox's prompt was open.
 - On the first local-helper **Save & test**, Containoodle offers the
   optional AWS console host permission once so it can reuse an existing signed-in
   session. Accepting enables that feature. Declining, or later revoking it, leaves

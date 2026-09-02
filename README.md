@@ -150,8 +150,8 @@ portal permission and a usable signed-in session are present.
 | `contextualIdentities`, `tabs`, `tabGroups` | Core | Creating account containers and managing their tabs and groups. |
 | `cookies`, `scripting` | Core APIs; host-scoped | Copying permitted session cookies and installing the exact-portal click handler. They do not grant access to a host by themselves. |
 | Exact configured AWS Access Portal origin | Portal mode | Click handoff, session detection, and copying the scoped portal authentication cookie into the selected container. |
-| `https://*.amazonaws.com/*` | Optional in Portal mode | Loading role choices when launching or changing a pinned portal shortcut. |
-| `https://*.amazon.com/*` | Optional in Backend mode | Reusing a still-valid console session and suppressing the AWS cookie banner in new backend containers. |
+| `https://portal.sso.<region>.amazonaws.com/*` | Optional in Portal mode | Loading role choices when launching or changing a pinned portal shortcut. Containoodle requests only the exact detected or configured SSO region. |
+| `https://*.console.aws.amazon.com/*` | Optional in Backend mode | Reusing a still-valid console session and suppressing the AWS cookie banner in new backend containers. Other `aws.amazon.com` services remain outside this grant. |
 | Portal-pinned shortcuts | Optional | Direct portal-mode launches after an active account is pinned from the sidebar. Normal portal-click handoff does not require a pin. |
 
 Portal role choices and backend session reuse have separate **Allow** and
@@ -160,9 +160,23 @@ URL requests its exact origin and, after a successful change, removes Containood
 previous exact-origin grant. Revoking a host permission stops future Containoodle access
 to that host but does not delete cookies Firefox already owns.
 
+An older broad `https://*.amazonaws.com/*` role-discovery grant or
+`https://*.amazon.com/*` session-reuse grant remains effective after an upgrade so
+existing users are not broken. Containoodle removes either legacy grant only from an
+explicit **Allow**/**Tighten access** migration and only after Firefox reports the
+narrower grant as a separate literal permission. **Revoke** instead removes that
+feature's recognized grants directly. If Firefox reports that the broad grant covers
+the narrow request without storing that literal grant, Containoodle preserves the broad
+grant and asks you to choose **Revoke**, then **Allow** again. Startup, extension update,
+opening Options, and switching modes by themselves never migrate existing permissions.
+A newly accepted request is rolled back if its mode or target changed while Firefox's
+prompt was open. The
+manifest temporarily retains the legacy broad patterns as optional request ceilings for
+this migration; declaring an optional ceiling does not grant Containoodle that access.
+
 On the first backend **Save & test** in a Firefox profile that has not already
 handled this choice, Containoodle automatically asks once for the optional
-`https://*.amazon.com/*` session-reuse permission. Accepting enables reuse;
+`https://*.console.aws.amazon.com/*` session-reuse permission. Accepting enables reuse;
 declining leaves normal helper launches fully functional. A decline, or a later
 **Revoke**, prevents another automatic prompt. Use **Allow session reuse** if you
 want Firefox to ask again after either choice. The permission remains optional and
@@ -219,9 +233,11 @@ roles, and launch data still come exclusively from the helper.
 6. Choose an account and role in the AWS portal normally. Containoodle hands that launch into the matching container and tab group.
 7. Optional: in the sidebar, choose ☆ on the active account row to keep it as a direct-launch shortcut. Choose ★ later to unpin it; active tabs and the account container remain untouched.
 
-Normal portal clicks and pinning need no broad AWS API permission. Allow **Role
-choices for pinned accounts** only if you want Containoodle to load or change a pin's
-available roles. Backend session reuse does not apply in portal mode.
+Normal portal clicks and pinning need no AWS API permission beyond the exact configured
+portal origin. Allow **Role choices for pinned accounts** only if you want Containoodle
+to load or change a pin's available roles. Firefox then asks for only
+`https://portal.sso.<region>.amazonaws.com/*` for the detected or configured SSO
+region. Backend session reuse does not apply in portal mode.
 
 ### Local helper quick start
 
@@ -288,7 +304,8 @@ Python standard library; no third-party Python packages are required.
    may stay blank only when one valid SSO login is cached. If this Firefox profile
    has not already handled the session-reuse
    choice, that click immediately starts Firefox's one-time optional AWS console
-   permission request, before and in parallel with helper validation. Accept to
+   permission request for `https://*.console.aws.amazon.com/*`, before and in
+   parallel with helper validation. Accept to
    enable reuse, or decline to continue with normal helper-generated launches.
    After a successful helper test, the token field is cleared and the saved value
    is never redisplayed by the extension.
@@ -313,11 +330,13 @@ SSO identity has not changed. Portal mode does not require this token.
    alias used for `aws sso login --profile ...`; leave it blank only when exactly
    one usable SSO login is cached. Then choose **Save & test**.
 
-An existing session-reuse grant remains granted during an in-place update. A
+An existing session-reuse grant, including the older broad
+`https://*.amazon.com/*` grant, remains effective during an in-place update. A
 missing grant remains absent during update and startup; if the profile has not
 previously handled the new one-time offer, the first backend **Save & test**
-presents it. Declining or revoking the permission does not block helper
-setup and prevents another automatic prompt.
+presents it. Declining or revoking the permission does not block helper setup and
+prevents another automatic prompt. Narrowing a legacy grant is a separate explicit
+Options action; it is never performed by update, startup, or a mode switch.
 
 The existing browser account cache remains available while setup is incomplete,
 but helper requests and new helper-generated sessions stay blocked. Portal mode
@@ -353,7 +372,9 @@ key; a changed profile or cached login cannot reuse the previous identity's stat
 The identity key contains no profile name, portal URL, cache path, or AWS token. The
 first backend **Save & test** offers this optional permission once;
 after a decline or revocation, only the manual **Allow session reuse** control asks
-again.
+again. New grants are limited to `https://*.console.aws.amazon.com/*`. An older
+`https://*.amazon.com/*` grant keeps reuse working until you explicitly tighten or
+revoke it.
 
 ## Troubleshooting
 
@@ -391,7 +412,7 @@ hosted service. See the [privacy policy](PRIVACY.md) for the complete details.
 - The optional AWS CLI profile is a local alias used only to resolve the exact modern or legacy SSO cache namespace. Cache candidates are validated before use, multiple identities fail closed, and Containoodle never moves, rewrites, or deletes AWS CLI cache files.
 - No real account IDs, credentials, or internal account names are baked into the project. Runtime account metadata comes from `~/.aws`, the clicked AWS Access Portal page, or extension-local storage. Synthetic account IDs remain in examples and tests.
 - Container ownership is stored by AWS account ID and Firefox cookie-store ID. A pre-existing Firefox container with the same display name is not reused, so labels cannot merge two account sessions.
-- Host permissions are **opt-in at runtime and independently revocable**: core portal setup asks only for the exact configured portal origin. Portal API access is optional and used only for role choices on portal pins. AWS console-cookie access is optional and used only for backend session reuse/banner suppression; the first backend **Save & test** offers it once, but declining or revoking it leaves helper mode functional and stops automatic re-prompts. Containoodle has no hosted backend and sends no analytics or telemetry to a Containoodle service.
+- Host permissions are **opt-in at runtime and independently revocable**: core portal setup asks only for the exact configured portal origin. Optional role discovery requests only `https://portal.sso.<region>.amazonaws.com/*` for the detected or configured region. Optional backend session reuse requests only `https://*.console.aws.amazon.com/*`; the first backend **Save & test** offers it once, but declining or revoking it leaves helper mode functional and stops automatic re-prompts. Legacy broad grants remain effective for compatibility. Tightening removes one only after explicit user action plus proof that Firefox stored the narrow replacement; **Revoke** directly removes the feature's recognized grants. Startup, update, Options load, and mode switching do not migrate existing permissions; a newly accepted request is rolled back if its context changed while the prompt was open. Containoodle has no hosted backend and sends no analytics or telemetry to a Containoodle service.
 - Containoodle's complete data handling, retention, and deletion terms are in the [privacy policy](PRIVACY.md). Firefox's install prompt discloses the data categories the extension handles even though none of that data is sent to the developer.
 - In portal mode, a document-start handler on the exact configured portal reads the validated shortcut URL and the displayed account name associated with the role you click. It does not read forms, credentials, or the rest of the account list. A bounded tab-URL fallback may remove a proven portal-created child tab or return the source tab to the portal only after a successful handoff; redirected or unrelated tabs are left alone.
 - **Portal mode trade-off, deliberately accepted:** the `x-amz-sso_authn` cookie can mint console sessions for every account your SSO user is entitled to. Containoodle copies its Firefox domain/path/isolation scope into each launched account's container and verifies the copy before navigation; Firefox may retain it until its original expiry. Optional sidebar role discovery also sends its value as a bearer token directly to the regional AWS portal API. Containoodle never writes the value to extension storage or logs.

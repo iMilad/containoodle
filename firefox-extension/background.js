@@ -38,6 +38,10 @@ import {
   safeBackendUrl,
   validateBackendSigninUrl,
 } from "./shared/backend.js";
+import {
+  BACKEND_SESSION_REUSE_ORIGIN,
+  roleDiscoveryOrigin,
+} from "./shared/permissions.js";
 
 const DEFAULT_CONFIG = {
   mode: "backend",
@@ -51,8 +55,7 @@ const DEFAULT_CONFIG = {
 const ENV_CONTAINER_COLOR = { prod: "red", qa: "yellow", dev: "green", test: "toolbar" };
 const ENV_GROUP_COLOR = { prod: "red", qa: "yellow", dev: "green", test: "grey" };
 const REGION_RE = /^[a-z]{2}-[a-z]+-\d$/;
-const PORTAL_API_ORIGINS = ["https://*.amazonaws.com/*"];
-const CONSOLE_ORIGINS = ["https://*.amazon.com/*"];
+const BACKEND_SESSION_REUSE_ORIGINS = [BACKEND_SESSION_REUSE_ORIGIN];
 let storageMigrationPromise = null;
 let connectionModeRevision = 0;
 
@@ -511,10 +514,12 @@ const findOrCreateContainer = synchronize(async (accountId, name, env, mode) => 
 
 /* Pre-seed the AWS console cookie-consent cookie (non-essential
    declined) so fresh containers never show the cookie banner.
-   Needs the *.amazon.com host permission; silently skipped without. */
+   Needs the optional AWS Console host permission; silently skipped without. */
 async function seedConsentCookie(storeId) {
   try {
-    if (!(await browser.permissions.contains({ origins: CONSOLE_ORIGINS }))) return;
+    if (!(await browser.permissions.contains({
+      origins: BACKEND_SESSION_REUSE_ORIGINS,
+    }))) return;
     await browser.cookies.set({
       name: "awsccc",
       value: btoa(JSON.stringify({ e: 1, p: 1, f: 1, a: 0, i: crypto.randomUUID(), v: "1" })),
@@ -534,10 +539,13 @@ async function seedConsentCookie(storeId) {
 /* If the container already has a live console session, reuse it and
    skip federation entirely (no backend round-trip, no portal hop).
    Region comes from the console's own cookies; requires the
-   *.amazon.com host permission, otherwise cookies.getAll returns
+   AWS Console host permission, otherwise cookies.getAll returns
    nothing and we fall through to a normal launch. */
 async function liveConsoleRegion(storeId) {
   try {
+    if (!(await browser.permissions.contains({
+      origins: BACKEND_SESSION_REUSE_ORIGINS,
+    }))) return null;
     const regionCookies = await browser.cookies.getAll({ name: "noflush_Region", storeId });
     if (regionCookies.length === 0) return null;
     const region = regionCookies[0].value;
@@ -682,19 +690,18 @@ async function portalReadiness() {
     portalAccess: false,
     session: false,
     roleDiscoveryAccess: false,
+    roleDiscoveryRegion: null,
+    roleDiscoveryPermissionOrigin: null,
     consoleAccess: false,
   };
 
   try {
     if (config.mode !== "portal") {
       result.consoleAccess = await browser.permissions.contains({
-        origins: CONSOLE_ORIGINS,
+        origins: BACKEND_SESSION_REUSE_ORIGINS,
       });
       return result;
     }
-    result.roleDiscoveryAccess = await browser.permissions.contains({
-      origins: PORTAL_API_ORIGINS,
-    });
     if (!result.configured) return result;
 
     result.portalAccess = await browser.permissions.contains({
@@ -707,6 +714,44 @@ async function portalReadiness() {
       await listPortalAuthCookies(url, "firefox-default"),
       url
     ));
+
+    // Precompute the exact regional request target before the Options click.
+    // Optional discovery failure must never make core portal readiness fail.
+    let region = await knownPortalRegion(config);
+    if (!region && result.session) {
+      try {
+        region = await portalRegion(config);
+      } catch {
+        region = null;
+      }
+    }
+    if (region) {
+      const current = await getConfig();
+      if (
+        current.mode === config.mode &&
+        current.portalStartUrl === config.portalStartUrl &&
+        current.ssoRegion === config.ssoRegion
+      ) {
+        const permissionOrigin = roleDiscoveryOrigin(region);
+        try {
+          const granted = await browser.permissions.contains({
+            origins: [permissionOrigin],
+          });
+          const finalConfig = await getConfig();
+          if (
+            finalConfig.mode === config.mode &&
+            finalConfig.portalStartUrl === config.portalStartUrl &&
+            finalConfig.ssoRegion === config.ssoRegion
+          ) {
+            result.roleDiscoveryRegion = region;
+            result.roleDiscoveryPermissionOrigin = permissionOrigin;
+            result.roleDiscoveryAccess = granted;
+          }
+        } catch {
+          // Role choices stay unavailable; core portal handoff remains ready.
+        }
+      }
+    }
     return result;
   } catch (err) {
     return {
@@ -789,29 +834,44 @@ async function fetchBackendJson(url, opts, trustedToken = null) {
 
 /* SSO region: explicit config wins, then cached detection, then
    the portal's whoAmI endpoint. */
-async function portalRegion(config) {
+async function knownPortalRegion(config) {
   if (config.ssoRegion && REGION_RE.test(config.ssoRegion)) return config.ssoRegion;
-  const { portalRegionCache } = await browser.storage.local.get("portalRegionCache");
-  if (portalRegionCache && REGION_RE.test(portalRegionCache)) return portalRegionCache;
+  const {
+    portalRegionCache,
+    portalRegionCacheOrigin,
+  } = await browser.storage.local.get([
+    "portalRegionCache",
+    "portalRegionCacheOrigin",
+  ]);
+  const portalOrigin = config.portalStartUrl
+    ? new URL(config.portalStartUrl).origin
+    : "";
+  if (
+    portalRegionCache &&
+    REGION_RE.test(portalRegionCache) &&
+    portalRegionCacheOrigin === portalOrigin
+  ) return portalRegionCache;
+  return null;
+}
+
+async function portalRegion(config) {
+  const known = await knownPortalRegion(config);
+  if (known) return known;
   const data = await fetchJson(whoAmIUrl(config.portalStartUrl), { credentials: "include" });
   const region = data.region || data.awsRegion || (data.instance && data.instance.region);
   if (!region || !REGION_RE.test(region)) {
     throw new Error("Could not detect the SSO region — set it in Containoodle options");
   }
-  await browser.storage.local.set({ portalRegionCache: region });
+  await browser.storage.local.set({
+    portalRegionCache: region,
+    portalRegionCacheOrigin: new URL(config.portalStartUrl).origin,
+  });
   return region;
 }
 
 /* The portal SPA authenticates with the x-amz-sso_authn cookie value
    passed as a bearer header — same session the cookie copy uses. */
 async function portalDiscoverRoles(config, account) {
-  if (!(await browser.permissions.contains({ origins: PORTAL_API_ORIGINS }))) {
-    const err = new Error(
-      "Role choices are not allowed — enable them in Containoodle options"
-    );
-    err.needsOptions = true;
-    throw err;
-  }
   let cookie;
   try {
     const url = portalCookieUrl(config.portalStartUrl);
@@ -829,7 +889,16 @@ async function portalDiscoverRoles(config, account) {
     err.needsLogin = true;
     throw err;
   }
-  const api = portalApiBase(await portalRegion(config));
+  const region = await portalRegion(config);
+  const permissionOrigin = roleDiscoveryOrigin(region);
+  if (!(await browser.permissions.contains({ origins: [permissionOrigin] }))) {
+    const err = new Error(
+      "Role choices are not allowed — enable them in Containoodle options"
+    );
+    err.needsOptions = true;
+    throw err;
+  }
+  const api = portalApiBase(region);
   const headers = { "x-amz-sso_bearer_token": cookie.value };
   const instances = unwrapResult(await fetchJson(`${api}/instance/appinstances`, { headers }));
   const app = findAccountInstance(instances, account.accountId);

@@ -117,7 +117,8 @@
         </summary>
         <div class="details-body">
           <p class="hint">When enabled, Containoodle can check whether this account's container is already signed in and reuse that session instead of starting another sign-in. It also suppresses the AWS cookie banner in new containers.</p>
-          <p class="hint">On your first local-helper <strong>Save &amp; test</strong>, Firefox asks once for permission to read AWS console cookies. Accepting enables session reuse; declining does not block setup or normal backend launches. Containoodle will not ask automatically again, but you can use <strong>Allow session reuse</strong> below. Revoking access stops future checks but does not delete cookies already managed by Firefox.</p>
+          <p class="hint">On your first local-helper <strong>Save &amp; test</strong>, Firefox asks once for access limited to <code>*.console.aws.amazon.com</code>. Accepting enables session reuse; declining does not block setup or normal backend launches. Containoodle will not ask automatically again, but you can use <strong>Allow session reuse</strong> below. Revoking access stops future checks but does not delete cookies already managed by Firefox.</p>
+          <p class="hint">An older broad AWS grant keeps working until you explicitly tighten or revoke it. If Firefox says the broad grant still covers a narrower request, use <strong>Revoke</strong>, then <strong>Allow session reuse</strong> again. Opening Options, updating Containoodle, and switching modes do not migrate existing permissions.</p>
           <div class="actions">
             <button type="button" id="console-grant">Allow session reuse</button>
             <button type="button" id="console-revoke">Revoke</button>
@@ -180,7 +181,8 @@
 
           <div class="permission-block" aria-labelledby="role-discovery-heading">
             <h3 id="role-discovery-heading">Role choices for pinned accounts</h3>
-            <p class="hint">Allow this only if you want Containoodle to ask the AWS access portal which roles you can choose when launching or changing a pinned shortcut. Pinning and normal portal clicks work without it.</p>
+            <p class="hint">Allow this only if you want Containoodle to ask the AWS access portal which roles you can choose when launching or changing a pinned shortcut. Firefox asks only for the detected regional <code>portal.sso.&lt;region&gt;.amazonaws.com</code> endpoint. Pinning and normal portal clicks work without it.</p>
+            <p class="hint">An older broad AWS API grant keeps working until you explicitly tighten or revoke it. If Firefox keeps only the broad grant after a narrower request, use <strong>Revoke</strong>, then <strong>Allow role choices</strong> again. Opening Options, updating Containoodle, and switching modes do not migrate existing permissions.</p>
             <div class="actions">
               <button type="button" id="role-discovery-grant">Allow role choices</button>
               <button type="button" id="role-discovery-revoke">Revoke</button>
