@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Tagged releases call these exact same checks before any publication step.
+  workflow_call:
 
 permissions:
   contents: read
@@ -12,42 +14,59 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
 
       - name: Install locked build tools
         run: npm ci --ignore-scripts
 
-      - name: Confirm no runtime dependency advisories
-        run: npm audit --omit=dev --audit-level=high
-
-      - name: Python syntax check
-        run: python3 -m py_compile server.py
+      - name: Audit runtime and build dependencies
+        run: npm run audit:dependencies
 
       - name: JavaScript syntax check
         run: |
           set -euo pipefail
-          git ls-files -z '*.js' | while IFS= read -r -d '' f; do
+          git ls-files -z '*.js' '*.mjs' '*.cjs' | while IFS= read -r -d '' f; do
             echo "checking $f"
             node --check "$f"
           done
 
-      - name: Unit tests
-        run: npm test
-
-      - name: Validate extension manifest
-        run: |
-          node -e "const m=require('./firefox-extension/manifest.json'); \
-            if(!m.name||!m.version){console.error('manifest missing name/version');process.exit(1);} \
-            console.log('manifest ok:', m.name, 'v'+m.version)"
+      - name: JavaScript unit tests
+        run: npm run test:js
 
       - name: Lint extension (web-ext)
         run: npm run lint:ext
 
       - name: Build and verify reproducible XPI
         run: npm run build:ext
+
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # Minimum supported and current stable release line; no prereleases.
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: false
+
+      - name: Python syntax check
+        run: python3 -m py_compile server.py
+
+      - name: Isolated helper unit tests
+        env:
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: python3 -m unittest discover -s tests -p 'test_*.py'

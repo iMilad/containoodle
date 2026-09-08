@@ -1,5 +1,9 @@
 # Containoodle v1.0.3 compatibility baseline
 
+The frozen records below are historical. The latest 1.2.0 audit-correction record
+is at the end of this file; [TESTING_1.2.0.md](TESTING_1.2.0.md) is the current
+manual acceptance checklist.
+
 Captured on 2026-08-19 before compatibility or hardening work. This is the
 rollback and upgrade reference for the next release; it does not claim that the
 live checks below have been run.
@@ -80,7 +84,8 @@ account lookup, CORS/JSON transport, and every HTTP route without starting the
 server. AWS subprocesses, federation requests, home-directory paths, and socket
 I/O remain mocked; this is not a live AWS or helper integration test.
 Valid JSON with a malformed account schema remains a later input-hardening gap,
-not behavior that Phase 2 freezes as acceptable.
+not behavior that Phase 2 freezes as acceptable. This historical gap is closed in
+the 1.2.0 candidate described in the final addendum; the Phase 2 record is unchanged.
 
 Phase 3 is an intentional strict local-helper protocol change. The candidate
 uses synchronized manifest, package, and package-lock version `1.1.0`; the
@@ -495,3 +500,317 @@ the remaining acceptance items stay open.
 Any lost stable state, unexpected permission change, stale cross-mode action,
 wrong account or role, duplicate account container, or duplicate account group
 blocks release.
+
+## 1.2.0 local candidate — remaining code readiness
+
+Recorded 2026-09-04. The earlier phase records above are historical evidence, not
+current test counts or a claim that every old manual checkbox has been completed.
+The consolidated manual pass for this candidate is [TESTING_1.2.0.md](TESTING_1.2.0.md).
+
+Implemented in the candidate:
+
+- Existing first-run onboarding and account-display naming work are retained.
+  Naming covers helper lists and portal active/pinned accounts, automatic container
+  names, and automatic group titles without changing identity or manual overrides.
+- Strict, shared account-schema fixtures now cover complete-file validation,
+  duplicate IDs, metadata types, whitespace, Unicode bounds, and invalid Unicode.
+  Startup and authenticated account-based routes validate before AWS work.
+  The extension also validates live lists, cached lists, fallback lookups, and
+  backend naming/title-migration consumers. Rejected data does not replace saved
+  connection values, trusted name metadata, or a usable cache.
+- AWS CLI calls explicitly request JSON and have a 30-second subprocess timeout.
+  Federation has a 15-second socket-operation timeout and a 64-KiB response cap;
+  it does not promise a total request deadline. Timeout/error responses are
+  sanitized and authenticated. The helper token and identity protocol are unchanged.
+- Options/sidebar and manifest text use an English-default catalog with safe
+  fallback and rich-text slot preservation. English is the only shipped language;
+  background/helper diagnostics are not fully localized. Permissions are unchanged.
+- CI covers Python 3.10 and 3.14; release reuses the same validation workflow.
+  Every build compares two independently staged archives after ZIP integrity and
+  exact-allowlist checks. Version drift, unexpected files, and symlink/special-file
+  sources or outputs fail the build. Local AMO preparation does not publish.
+
+Local validation against this uncommitted candidate:
+
+- `npm run build-for-amo`: 346 JavaScript tests and 109 Python tests passed;
+  extension lint reported zero errors, notices, and warnings; packaging passed.
+- Python helper suite additionally passed all 109 tests on both CPython 3.10.20
+  and 3.14.4, with syntax checks. Local JavaScript runtime was Node 24.14.1;
+  hosted Node 20 CI has not run for these uncommitted changes.
+- JavaScript/module syntax checks and `git diff --check` passed.
+- Runtime-dependency audit reported zero vulnerabilities. Scoped redacted secret
+  scans passed for extension source, tests, build scripts, and the helper; this
+  is not a claim that the machine or all repository history is credential-free.
+- Independent read-only reviews covered helper failure handling, locale/DOM
+  safety, and account-validation integration. Findings received focused fixes and
+  regressions before the final build.
+- Artifact: `artifacts/containoodle-1.2.0.xpi`; SHA-256
+  `b7bd9a25262bd973cf216b02880a9d38cde8e5e78a804b599b2ed9ddfd5505ca`.
+  Reproducibility was verified with the local toolchain, not across platforms.
+
+The linter's optional updater could not access its local update-config store; the
+extension validation itself and the command succeeded. No system-config change
+was made to silence that non-validation notice.
+
+Not performed in this finishing pass: real Firefox or AWS interaction, profile
+changes, signed in-place update/restart testing, hosted CI, commit/push/merge,
+tagging, AMO submission, GitHub publication, or a Recommended nomination. The user
+will run the consolidated acceptance checks next. After acceptance and any fixes,
+review/commit, hosted CI, and release gates precede publication; nomination comes
+afterward. Mozilla's curated selection is separate from code/test readiness.
+
+## 1.2.0 audit corrections — 2026-09-05
+
+This record supersedes the preceding 2026-09-04 candidate counts and artifact
+hash, not the historical compatibility contract. Code changes remain local and
+uncommitted; manual acceptance, hosted CI, signing, and publication are separate.
+
+The fresh review identified five concrete gaps and produced focused corrections:
+
+- Helper session reuse now uses per-container generations instead of legacy
+  identity-only markers. Portal mutation invalidates ownership first. Pending
+  sign-ins are recorded before navigation and verification is serialized with
+  session changes. Regressions cover cross-mode completion, overlapping sign-ins,
+  navigation during asynchronous verification, and storage/restart failures.
+  Reuse authority lasts only for the current background lifetime; after a
+  background restart a fresh helper federation is expected. Surviving unresolved
+  tabs are recovered before new verification. Tokens/settings are not reset.
+- SSO role and credential API calls use the validated cache's SSO region, while
+  the account's region remains the console destination. Both routes are covered
+  across modern profiles, legacy profiles, and automatic identity selection.
+- The helper permits up to eight concurrent requests with a five-second socket
+  idle timeout. The extension imposes a 60-second complete exchange deadline.
+  Stalled challenge/protected bodies, cancellation, UI recovery, cache preservation,
+  successful retry, and late signed replies have regressions.
+- Sidebar sections and tab switching use native buttons, tab close is separate,
+  role choices support keyboard dismissal/focus return, and live refresh preserves
+  focus and filter selection. Recovery actions remain reachable and announce
+  status. Label contrast is improved without changing the account layout.
+- CI/release use Node 24 and full dependency auditing. Two unpatched upstream
+  image-parser advisories are explicitly contained, not described as fixed:
+  staged PNG-only inputs, disabled non-PNG calculations in the actual linter,
+  bounded lint, and an exact build-only exception expiring 2026-10-05. New findings
+  fail the gate. Details and upstream links: [TOOLING_SECURITY.md](TOOLING_SECURITY.md).
+
+Final local validation against the complete corrected candidate:
+
+- `npm run build-for-amo`: **398 JavaScript tests and 114 Python tests passed**;
+  extension lint reported zero errors, warnings, and notices. The independently
+  staged 20-file XPI builds matched exactly.
+- All 114 Python tests also passed on CPython **3.10.20** and **3.14.4**.
+  JavaScript checks used Node **24.14.1**. Hosted CI has not run for these changes.
+- The independent session reviewer reproduced and then verified fixes for
+  navigation during reads/writes, failed corrective storage writes with restart,
+  and retryable sign-in pages. All 119 background tests passed in that recheck.
+- Real-DOM keyboard smoke passed in isolated headless Chromium, with no page
+  errors or nested buttons. Measured minimum muted-text contrast was **5.36:1**;
+  active-tab title contrast was **4.98:1**. This is a targeted smoke, not a WCAG
+  conformance certification or Firefox integration test.
+- Full dependency audit passed the explicit containment policy, reporting **two
+  known build-only advisories across three package entries**, not zero total
+  findings. The exception expires 2026-10-05; future findings/expiry block release.
+- Module syntax checks and `git diff --check` passed. Scoped redacted secret scans
+  found no leaks in extension source, helper, scripts, tests, and the new reviewer,
+  nomination, tooling, and testing documents. This is not a whole-machine audit.
+- Final artifact: `artifacts/containoodle-1.2.0.xpi`; SHA-256
+  `48446461e96b0f448146230cacc61033a57e94c18616b5612a7322ef4eee9109`.
+  Earlier 1.2.0 hashes in this file or intermediate console output are superseded.
+
+Independent reviews covered helper region/concurrency, session ownership and
+failure ordering, deadline cancellation, build containment, and reviewer-document
+accuracy. Real-DOM keyboard smoke used isolated headless Chromium with synthetic
+browser APIs and blocked external traffic; this is not live Firefox/AWS acceptance.
+
+[REVIEWER_GUIDE.md](REVIEWER_GUIDE.md) and [MOZILLA_NOMINATION.md](MOZILLA_NOMINATION.md)
+are prepared locally. No nomination was sent, no release was published, and no
+real credential source, AWS account, configured helper, or Firefox profile was
+accessed or changed in this correction pass. The next user step is the consolidated
+manual acceptance round, followed by review/commit, hosted CI, release validation,
+publication, and only then finalizing the nomination for the accepted version.
+
+## 1.2.0 pre-test closure — 2026-09-08 (before service icons)
+
+This entry supersedes older candidate hashes and open layout findings above.
+Previous phase checkboxes and evidence remain historical; they are not extra
+current development tasks. [TESTING_1.2.0.md](TESTING_1.2.0.md) is the single current
+manual acceptance checklist. No previously unrun manual check has been marked
+passed to close the development plan.
+
+The agreed final local work is complete:
+
+- Public display name: **Containoodle — AWS Console Containers**. Version 1.2.0,
+  extension ID and compact sidebar name are unchanged.
+- The confirmed narrow-sidebar clipping is corrected through CSS reflow of
+  account headers, long role labels/options and footer controls. No account,
+  role, permission, storage, or session logic changed in this layout correction.
+- The build-only dependency exception was reviewed again against the live
+  registry/advisories and full audit. The two known advisories remain contained,
+  not fixed upstream. The exact scope and 2026-10-05 expiry remain unchanged.
+- The native Firefox harness now accepts the exact XPI, records its SHA-256 and
+  verifies unchanged bytes, name/version, individual control bounds and usable
+  account-label widths at normal and 200% zoom, including an open role picker.
+
+Current local evidence:
+
+- **399 JavaScript tests** passed on Node 24.14.1; **114 Python tests** passed on
+  each of Python 3.12.13 and 3.14.4. Python 3.10 is not currently installed locally;
+  its previous result above is historical and the hosted CI matrix is still due.
+- Extension lint: **zero errors, warnings, and notices**. Two independently
+  staged builds match byte-for-byte and by hash. Full dependency audit passed
+  the documented exact build-only exception, not a zero-total-findings policy.
+- Frozen XPI: `artifacts/acceptance-1.2.0-becaed9f2972/containoodle-1.2.0.xpi`.
+  SHA-256: `becaed9f29723432214d7e5c37bd9bc18208c2fc18468078f18cc94fa08b60a5`.
+  The normal `artifacts/containoodle-1.2.0.xpi` is byte-identical at this freeze.
+- Matching helper `server.py` SHA-256:
+  `24680bf66ba7a9a6c86eb0bcb299ea5fd62c514bcb81fc9ed6a4e60662d906b1`.
+- Actual Firefox **155.0.1**: **26 offline check groups passed** against the
+  frozen XPI. Developer Edition **156.0**: **27 groups passed**, including a real
+  60.726-second body-read timeout with cache preservation and successful retry.
+  Both reported usable labels and no out-of-viewport role chips/buttons at
+  216/108 CSS pixels. Reports/screenshots and boundaries are documented in
+  [FIREFOX_OFFLINE_TESTING.md](FIREFOX_OFFLINE_TESTING.md).
+- Both runs stopped their owned processes, removed only their owned temporary
+  profiles, and verified saved profile-registration metadata unchanged. No real
+  AWS identity, credentials, helper token, configured helper or signed upgrade
+  was used. Browser HTTP containment is not an OS-wide isolation claim.
+- Final harness syntax and `git diff --check` passed. Redacted secret scans of
+  extension source, helper, scripts, tests, README and the current QA/reviewer/
+  nomination/testing/security documents found no leaks. This bounded scan is
+  not a whole-machine audit or proof that no secret could exist.
+
+The candidate is ready for the user's acceptance round, not yet release-approved.
+No commit, push, merge, signing, publication, or nomination occurred in this pass.
+After manual acceptance: review/commit, hosted CI, signing/update acceptance and
+publication, then verify the live listing and send the prepared nomination. New
+bugs block only as appropriate to their impact; local test success is not a
+guarantee of zero bugs or Mozilla Recommended selection.
+
+## 1.2.0 service-icon follow-up — 2026-09-08 (before Favorites styling)
+
+User finding: sidebar AWS service tabs showed the generic document placeholder.
+Remote HTTP(S) favicons were deliberately blocked; that protection is preserved.
+
+The approved display-only correction adds original bundled SVG pictograms for
+common console services, including all five reported services: SageMaker, S3,
+Systems Manager, Lambda and Inspector. Exact AWS console URL paths select fixed
+geometry; unknown services use a generic cloud. Known SageMaker Studio URLs are
+also recognized. Non-AWS tabs keep the previous safe embedded/browser-local
+favicon fallback. Titles and URL parameters are never inserted into SVG, and
+the classifier is not an identity or trust indicator. URL/favicon update events
+now refresh the displayed icon, including navigation without a title change.
+
+Archive comparison with the previous frozen candidate shows only:
+
+- Added `shared/service-icons.js` (explicitly added to the now 21-file allowlist).
+- Changed `sidebar/sidebar.js` and `sidebar/sidebar.css`.
+- No removed archive entries. Manifest, permissions, background, authentication,
+  account/session code and helper are byte-identical to the previous candidate.
+  No dependency or image-parser allowance was added.
+
+Validation: **406 JavaScript tests**, **114 Python tests** on Python 3.14.4, clean
+extension lint (zero errors/warnings/notices), and two independent byte-identical
+builds. New tests cover routes/aliases, invalid and lookalike hosts, fixed safe SVG
+geometry, both connection modes, unchanged-title navigation, embedded fallback,
+and unaffected tab switching/closing. The first new integration test needed to
+await its final asynchronous render before dismantling its fixture; after that
+test-only correction the complete suite passes without background rejections.
+
+Actual Firefox 155.0.1 passed **27 offline check groups**; Developer Edition 156
+passed **28**, including the real 60.356-second timeout/retry. Both installed the
+exact XPI, rendered all five service icons at normal and 200% zoom, and had no
+out-of-viewport controls/icons. Normal-zoom screenshots were visually inspected.
+The test pages intentionally fail to load because browser traffic is blocked;
+no real AWS session was involved. Saved Firefox profiles were not used and owned
+temporary profiles/processes were cleaned up. Evidence paths are recorded in
+[FIREFOX_OFFLINE_TESTING.md](FIREFOX_OFFLINE_TESTING.md).
+
+Replacement frozen package:
+`artifacts/acceptance-1.2.0-939c49b7e1f6/containoodle-1.2.0.xpi`.
+SHA-256: `939c49b7e1f65affab7426ef8be2c263b797d855be6b12c2df5effafd51cf372`.
+The previous `becaed9f2972` frozen package is preserved. Version stays 1.2.0;
+nothing is committed, published, or nominated in this follow-up. The helper is
+unchanged and needs no restart/token change. Next: load the replacement temporary
+XPI in the existing test profile and check the icons/navigation under item 11 of
+[TESTING_1.2.0.md](TESTING_1.2.0.md), then continue the outstanding acceptance items.
+Already-passed unrelated tests need not be repeated solely for this icon fix.
+
+## 1.2.0 subtitle and Favorites clarity — 2026-09-08 (previous candidate)
+
+User requested a small purpose subtitle under Containoodle and a clear visual
+distinction between Active and saved accounts. The sidebar now shows **AWS
+Console Containers** below the unchanged name/version. **Pinned accounts** is
+renamed **Favorites** throughout related sidebar/Options copy, filters, accessible
+star-button labels and notices. Fixed/pinned role terminology remains separate
+from account favorites. Existing internal pin keys/classes/message APIs remain
+unchanged; there is no migration, reset or new source of saved accounts.
+
+Active uses a cool accent, a circle and **Open tabs now**. Favorites uses a star,
+a warm outlined card with extra separation, and **Saved shortcuts · no open
+tabs**. Distinction does not rely solely on colour. Existing environment colors
+are unchanged. An open favorite still appears only in Active and returns to
+Favorites after its final tab closes. Section controls retain keyboard focus,
+`aria-expanded`, stable focus keys and explanatory accessible descriptions.
+
+Compared byte-for-byte with the icon candidate, only six packaged display files
+changed: the English catalog, Options HTML/JS, and sidebar HTML/JS/CSS. The
+21-file allowlist is unchanged. Manifest/permissions, background, account/session
+logic, local service icons and Python helper are unchanged. Earlier frozen XPIs
+are preserved, with no commit, publish or nomination in this pass.
+
+Validation: **408 JavaScript tests** on Node 24.14.1, **114 Python tests** on
+3.14.4, and clean extension lint with zero errors/warnings/notices. The first lint
+child ended without a diagnostic; an identical guarded retry exited 0. No check
+was weakened or skipped to accept that retry. Two independent builds match.
+New regression assertions cover the localized subtitle, semantic section labels,
+both modes, existing saved keys, no duplicate active favorite, collapse/focus and
+updated accessible action labels. Existing wording assertions were updated to
+the requested Favorites vocabulary.
+
+The frozen XPI passed **28 actual Firefox 155.0.1 check groups** and **29 Developer
+Edition 156 groups**, including the real 60.784-second deadline/retry. Native
+geometry confirms the subtitle below the name and usable section/account text
+and buttons at 216 and 108 CSS pixels. Actual tab closure moves a saved synthetic
+account to Favorites without losing its star. Final normal-zoom screenshots
+were visually inspected. Evidence and remaining live AWS/signing boundaries:
+[FIREFOX_OFFLINE_TESTING.md](FIREFOX_OFFLINE_TESTING.md).
+
+Current package: `artifacts/acceptance-1.2.0-ea34e47c0e75/containoodle-1.2.0.xpi`.
+SHA-256: `ea34e47c0e7534076fe6387eea8ee310e15b26c4f19d8d0e841ff6d921f0b5c4`.
+Version remains 1.2.0. Next: replace the temporary test installation with this
+exact XPI, check the subtitle/Favorites layout and resume the outstanding manual
+acceptance items. No Python restart/token change is needed for this UI update.
+
+## 1.2.0 original page favicons — 2026-09-08 (current)
+
+At the user's request, removed the custom colored service drawings. Sidebar tabs
+now prefer the actual favicon reported by Firefox, including embedded SVG, with
+a small neutral placeholder if unavailable. Remote requests are limited to
+browser-reported static AWS image URLs on console/Studio tabs, omit cookies and
+referrers, enforce CORS, reject redirects/query strings and never retry with
+authentication. The loader limits streamed images to 64 KiB and five seconds;
+its 64-entry memory cache deduplicates pending requests and never evicts an
+in-flight request to start another. SVG remains passive image content, not DOM.
+The privacy policy and reviewer/test documentation disclose this network change.
+
+Byte comparison against the previous frozen XPI confirms only three packaged
+files changed: `shared/service-icons.js`, `sidebar/sidebar.js` and
+`sidebar/sidebar.css`. The manifest, permissions, helper, background, accounts,
+Favorites layout and storage are unchanged. No token or helper restart is needed.
+
+Validation: **412 JavaScript tests**, clean extension lint, reproducible build,
+and **29 check groups each** in actual Firefox 155.0.1 and Developer Edition 156.0
+using the final frozen XPI. SVG page favicons display through the real tab API,
+and the loopback-substituted production loader sends no cookies/referrer or SVG
+subresource requests. Both runs pass normal/200% layout checks, preserve native
+tab controls/permissions/helper behavior, and clean up their disposable profiles.
+No AWS or real profile was used. The unchanged slow helper timeout was not rerun.
+Final source/test/documentation secret scan was scoped and redacted; no leaks
+were found. See `FIREFOX_OFFLINE_TESTING.md` for reports and remaining boundaries.
+
+Current package: `artifacts/acceptance-1.2.0-449492d64c86/containoodle-1.2.0.xpi`.
+SHA-256: `449492d64c861808176530c981702fe86b6c7c8d878a37205631ed9b0d14e5a7`.
+Earlier frozen packages remain intact, including intermediate favicon candidate
+`f5df29a097c7`, which predates the pending-request cache bound. Nothing was
+committed, pushed or published. Next: replace the temporary test add-on with this
+XPI and compare its sidebar icons with the actual AWS tabs. Live AWS CORS/image
+availability remains a user check; blocked images intentionally stay neutral.

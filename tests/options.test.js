@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   BACKEND_AUTH_TOKEN_KEY,
+  BACKEND_REQUEST_TIMEOUT_MS,
   BACKEND_SSO_IDENTITY_KEY,
   BACKEND_SSO_PROFILE_KEY,
 } from "../firefox-extension/shared/backend.js";
@@ -260,6 +261,7 @@ function createDocument() {
 }
 
 function createFixture({
+  i18n,
   config = {},
   granted = [],
   portalSession = true,
@@ -370,6 +372,7 @@ function createFixture({
   }
 
   const browser = {
+    i18n,
     storage: {
       onChanged: storageChanged,
       local: {
@@ -727,6 +730,35 @@ async function waitForBackendRequest(fixture) {
   );
 }
 
+function captureBackendDeadlines(context) {
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const pending = new Map();
+  const captured = new Set();
+  context.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => {
+    if (delay !== BACKEND_REQUEST_TIMEOUT_MS) {
+      return originalSetTimeout(callback, delay, ...args);
+    }
+    const timer = {};
+    captured.add(timer);
+    pending.set(timer, () => callback(...args));
+    return timer;
+  });
+  context.mock.method(globalThis, "clearTimeout", (timer) => {
+    if (!captured.has(timer)) return originalClearTimeout(timer);
+    pending.delete(timer);
+  });
+  return {
+    expire() {
+      assert.equal(pending.size, 1, "exactly one helper exchange should be waiting");
+      const [[timer, callback]] = pending;
+      pending.delete(timer);
+      callback();
+    },
+    get pendingCount() { return pending.size; },
+  };
+}
+
 async function loadOptions(fixture) {
   globalThis.document = fixture.document;
   globalThis.browser = fixture.browser;
@@ -1078,7 +1110,7 @@ test("portal settings report only portal-pinned accounts", async () => {
 
     assert.equal(
       fixture.elements.get("portal-pins-status").textContent,
-      "1 pinned account available in the sidebar",
+      "1 favorite available in the sidebar",
     );
 
     fixture.storageData.portalPinnedAccounts.push({
@@ -1093,7 +1125,7 @@ test("portal settings report only portal-pinned accounts", async () => {
 
     assert.equal(
       fixture.elements.get("portal-pins-status").textContent,
-      "2 pinned accounts available in the sidebar",
+      "2 favorites available in the sidebar",
     );
   } finally {
     cleanupGlobals();
@@ -2043,6 +2075,130 @@ test("backend save with an unreachable helper preserves the working settings", a
     );
   } finally {
     cleanupGlobals();
+  }
+});
+
+test("helper deadlines restore Save & test and Refresh while preserving saved connection values", async (context) => {
+  const deadlines = captureBackendDeadlines(context);
+  for (const action of ["backend-save", "backend-refresh"]) {
+    const workingAccounts = [{
+      accountId: "000000000000",
+      accountName: "__CONTAINOODLE_TEST_WORKING_ACCOUNT__",
+    }];
+    const fixture = createFixture({
+      storage: {
+        [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE,
+        accountsCache: workingAccounts,
+        accountsCacheAt: 1,
+        accountsCacheSource: "backend",
+      },
+    });
+    const before = structuredClone(fixture.storageData);
+    try {
+      await loadOptions(fixture);
+      fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+      fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
+      fixture.elements.get("backend-sso-profile").value = "__CONTAINOODLE_TEST_REPLACEMENT_PROFILE__";
+      if (action === "backend-save") fixture.setHelperToken(REPLACEMENT_SYNTHETIC_HELPER_TOKEN);
+      fixture.setDeferredBackendFetch(true);
+      await fixture.elements.get(action).dispatch("click");
+      await waitFor(() => protectedFetchCalls(fixture).length === 1, "helper exchange did not start");
+      assert.equal(fixture.elements.get("backend-save").disabled, true);
+      assert.equal(fixture.elements.get("backend-refresh").disabled, true);
+
+      deadlines.expire();
+      await waitForBackendRequest(fixture);
+      assert.equal(fixture.abortedFetches, 1);
+      assert.equal(fixture.elements.get("backend-status").textContent, "Local helper timed out. Check server.py and try again.");
+      assert.equal(fixture.elements.get("backend-token").getAttribute("aria-invalid"), "false");
+      assert.deepEqual(fixture.storageData, before, `${action} timeout must preserve URL, token, profile, identity and cache`);
+      assert.equal(deadlines.pendingCount, 0);
+
+      fixture.setDeferredBackendFetch(false);
+      fixture.setBackendFetchResponse(200, workingAccounts);
+      await fixture.elements.get(action).dispatch("click");
+      await waitForBackendRequest(fixture);
+      assert.match(fixture.elements.get("backend-status").textContent, /Connected to local helper/);
+      assert.deepEqual(fixture.storageData.accountsCache, workingAccounts);
+      assert.equal(deadlines.pendingCount, 0);
+      if (action === "backend-save") {
+        assert.equal(fixture.storageData.config.backendUrl, "http://127.0.0.1:8877");
+        assert.equal(fixture.storageData[BACKEND_AUTH_TOKEN_KEY], REPLACEMENT_SYNTHETIC_HELPER_TOKEN);
+        assert.equal(fixture.storageData[BACKEND_SSO_PROFILE_KEY], "__CONTAINOODLE_TEST_REPLACEMENT_PROFILE__");
+      } else {
+        assert.equal(fixture.storageData.config.backendUrl, before.config.backendUrl);
+        assert.equal(fixture.storageData[BACKEND_AUTH_TOKEN_KEY], before[BACKEND_AUTH_TOKEN_KEY]);
+        assert.equal(fixture.storageData[BACKEND_SSO_PROFILE_KEY], before[BACKEND_SSO_PROFILE_KEY]);
+      }
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
+
+test("a signed accounts response arriving after timeout cannot overwrite a successful retry", async (context) => {
+  const deadlines = captureBackendDeadlines(context);
+  for (const action of ["backend-save", "backend-refresh"]) {
+    const workingAccounts = [{ accountId: "000000000000", accountName: "__CONTAINOODLE_TEST_WORKING_ACCOUNT__" }];
+    const retryAccounts = [{ accountId: "111111111111", accountName: "__CONTAINOODLE_TEST_RETRY_ACCOUNT__" }];
+    const staleAccounts = [{ accountId: "222222222222", accountName: "__CONTAINOODLE_TEST_LATE_ACCOUNT__" }];
+    const fixture = createFixture({ storage: {
+      [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE,
+      accountsCache: workingAccounts,
+      accountsCacheAt: 1,
+      accountsCacheSource: "backend",
+    } });
+    const before = structuredClone(fixture.storageData);
+    const releaseLateAccounts = fixture.pauseNextBackendAccountsResponse();
+    let lateResponseReturned = false;
+    try {
+      await loadOptions(fixture);
+      const fixtureFetch = fixture.fetch;
+      let firstAccountsRequest = true;
+      globalThis.fetch = async (...args) => {
+        const isLateRequest = firstAccountsRequest && new URL(args[0]).pathname === "/accounts";
+        if (isLateRequest) firstAccountsRequest = false;
+        const response = await fixtureFetch(...args);
+        if (isLateRequest) lateResponseReturned = true;
+        return response;
+      };
+      fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+      fixture.elements.get("backend-token").value = REPLACEMENT_SYNTHETIC_HELPER_TOKEN;
+      fixture.elements.get("backend-sso-profile").value = "__CONTAINOODLE_TEST_REPLACEMENT_PROFILE__";
+      if (action === "backend-save") fixture.setHelperToken(REPLACEMENT_SYNTHETIC_HELPER_TOKEN);
+      await fixture.elements.get(action).dispatch("click");
+      await waitFor(() => protectedFetchCalls(fixture).some((call) => new URL(call.url).pathname === "/accounts"), "accounts exchange did not start");
+
+      deadlines.expire();
+      await waitForBackendRequest(fixture);
+      assert.deepEqual(fixture.storageData, before);
+      assert.equal(fixture.elements.get("backend-status").textContent, "Local helper timed out. Check server.py and try again.");
+      assert.equal(lateResponseReturned, false);
+
+      fixture.setBackendFetchResponse(200, retryAccounts);
+      await fixture.elements.get(action).dispatch("click");
+      await waitForBackendRequest(fixture);
+      const afterRetry = structuredClone(fixture.storageData);
+      const writesAfterRetry = fixture.storageSetCalls.length;
+      const requestsAfterRetry = fixture.fetchCalls.length;
+      const statusAfterRetry = fixture.elements.get("backend-status").textContent;
+      assert.deepEqual(afterRetry.accountsCache, retryAccounts);
+
+      fixture.setBackendFetchResponse(200, staleAccounts);
+      releaseLateAccounts();
+      await waitFor(() => lateResponseReturned, "late signed reply did not return");
+      await settle();
+      assert.deepEqual(fixture.storageData, afterRetry, "late response must not commit any connection or cache value");
+      assert.equal(fixture.storageSetCalls.length, writesAfterRetry);
+      assert.equal(fixture.fetchCalls.length, requestsAfterRetry);
+      assert.equal(fixture.elements.get("backend-status").textContent, statusAfterRetry);
+      assert.equal(fixture.elements.get("backend-save").disabled, false);
+      assert.equal(fixture.elements.get("backend-refresh").disabled, false);
+      assert.equal(deadlines.pendingCount, 0);
+    } finally {
+      releaseLateAccounts();
+      cleanupGlobals();
+    }
   }
 });
 
@@ -3053,7 +3209,7 @@ test("portal readiness renders unconfigured, permission, session, and ready stat
   }
 });
 
-test("loads saved tab-group naming options", async () => {
+test("loads saved account display naming options", async () => {
   const fixture = createFixture({
     config: {
       groupNamePattern: "^([^-]+)-.*$",
@@ -3076,7 +3232,7 @@ test("loads saved tab-group naming options", async () => {
   }
 });
 
-test("saves a valid tab-group naming rule", async () => {
+test("saves a valid account display naming rule", async () => {
   const fixture = createFixture();
   try {
     await loadOptions(fixture);
@@ -3096,7 +3252,7 @@ test("saves a valid tab-group naming rule", async () => {
     );
     assert.equal(
       fixture.elements.get("group-name-status").textContent,
-      "Tab group naming saved",
+      "Account display naming saved",
     );
     assert.equal(
       fixture.elements.get("group-name-status").className,
@@ -3157,7 +3313,7 @@ test("reports a failed automatic-title reset", async () => {
   }
 });
 
-test("rejects an invalid tab-group name regex without overwriting config", async () => {
+test("rejects an invalid account display name regex without overwriting config", async () => {
   const existing = {
     groupNamePattern: "^([^-]+)-.*$",
     groupNameReplacement: "$1",
@@ -3192,7 +3348,7 @@ test("rejects an invalid tab-group name regex without overwriting config", async
   }
 });
 
-test("allows an empty tab-group pattern to disable name transformation", async () => {
+test("allows an empty account display pattern to disable name transformation", async () => {
   const fixture = createFixture({
     config: {
       groupNamePattern: "^([^-]+)-.*$",
@@ -3210,7 +3366,7 @@ test("allows an empty tab-group pattern to disable name transformation", async (
     assert.equal(fixture.storageData.config.groupNamePattern, "");
     assert.equal(
       fixture.elements.get("group-name-status").textContent,
-      "Tab group naming saved",
+      "Account display naming saved",
     );
     assert.equal(
       fixture.elements.get("group-name-status").className,
@@ -3218,6 +3374,130 @@ test("allows an empty tab-group pattern to disable name transformation", async (
     );
   } finally {
     cleanupGlobals();
+  }
+});
+
+test("naming copy covers both connection modes and keeps reset scoped to tab groups", async () => {
+  const html = await readFile(
+    new URL("../firefox-extension/options/options.html", import.meta.url),
+    "utf8",
+  );
+  const section = html.match(/<section\s+id="group-naming"[\s\S]*?<\/section>/)?.[0];
+
+  assert.ok(section, "account display naming settings must remain present");
+  assert.match(section, /Account display names/);
+  assert.match(section, /sidebar account labels, automatic container names, and automatic tab-group titles/);
+  assert.match(section, /all helper accounts and to open or favorite portal accounts/);
+  assert.match(section, /Manually renamed containers and tab groups keep their custom names/);
+  assert.match(section, /id="group-name-reset" data-i18n="ui_reset_tab_group_titles_to_automatic">Reset tab-group titles to automatic</);
+  assert.match(section, /custom container names are not reset/);
+  assert.doesNotMatch(section, /Container names, sidebar labels, and environment colours are unchanged/);
+});
+
+test("options dynamic status uses native locale lookup without changing connection behavior", async () => {
+  const calls = [];
+  const fixture = createFixture({
+    storage: { accountsCache: [{ accountId: "000000000001", accountName: "__CONTAINOODLE_TEST_ACCOUNT__" }] },
+    i18n: {
+      getMessage(key, values) {
+        calls.push({ key, values });
+        if (key === "ui_one_account_cached") return `TEST-CACHE ${values[0]}`;
+        if (key === "ui_a_helper_access_token_is_stored") return "TEST-TOKEN-SAVED";
+        return "";
+      },
+    },
+  });
+  try {
+    await loadOptions(fixture);
+    assert.equal(fixture.elements.get("backend-accounts-status").textContent, "TEST-CACHE 1");
+    assert.equal(fixture.elements.get("backend-token-status").textContent, "TEST-TOKEN-SAVED");
+    assert.ok(calls.some(({ key, values }) => key === "ui_one_account_cached" && values[0] === "1"));
+    assert.deepEqual(fixture.fetchCalls, []);
+    assert.deepEqual(fixture.permissionRequests, []);
+  } finally {
+    cleanupGlobals();
+  }
+});
+
+test("options cache summary counts only validated account lists without rewriting corrupt storage", async () => {
+  const valid = { accountId: "000000000001", accountName: "__CONTAINOODLE_TEST_ACCOUNT__" };
+  for (const accountsCache of [
+    [null],
+    [{ ...valid, accountName: 7 }],
+    [{ ...valid, role: "__CONTAINOODLE_TEST_INVALID_ROLE__/" }],
+    [valid, { ...valid }],
+    [{ ...valid, accountName: "__CONTAINOODLE_TEST_ACCOUNT__\n" }],
+    { accounts: [valid] },
+  ]) {
+    const fixture = createFixture({ storage: { accountsCache, accountsCacheAt: 1 } });
+    const before = structuredClone(fixture.storageData);
+    try {
+      await loadOptions(fixture);
+      assert.equal(fixture.elements.get("backend-accounts-status").textContent, "No accounts cached");
+      assert.deepEqual(fixture.storageData, before);
+      assert.deepEqual(fixture.fetchCalls, []);
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
+
+test("authenticated account-file errors display only known safe guidance", async () => {
+  const valid = { accountId: "000000000001", accountName: "__CONTAINOODLE_TEST_ACCOUNT__" };
+  for (const [payload, expected] of [
+    [{ error: "accounts.json entry 1: accountName contains invalid Unicode" }, "accounts.json entry 1: accountName contains invalid Unicode"],
+    [{ error: "accounts.json could not be read" }, "accounts.json could not be read"],
+    [{ error: "accounts.json not found", extra: true }, "Local helper returned HTTP 500"],
+    [{ error: "accounts.json entry 1: invalid role __CONTAINOODLE_TEST_ROLE__" }, "Local helper returned HTTP 500"],
+  ]) {
+    const fixture = createFixture({ storage: { accountsCache: [valid] } });
+    const before = structuredClone(fixture.storageData);
+    try {
+      fixture.setBackendFetchResponse(500, payload);
+      await loadOptions(fixture);
+      await fixture.elements.get("backend-refresh").dispatch("click");
+      await waitForBackendRequest(fixture);
+      assert.deepEqual(fixture.storageData, before);
+      assert.equal(fixture.elements.get("backend-status").textContent, expected);
+    } finally {
+      cleanupGlobals();
+    }
+  }
+});
+
+test("signed malformed helper account responses preserve saved connection and valid cache", async () => {
+  const valid = { accountId: "000000000001", accountName: "__CONTAINOODLE_TEST_ACCOUNT__" };
+  const malformed = [
+    [null],
+    [{ ...valid, accountName: 7 }],
+    [{ ...valid, accountId: "not-an-account" }],
+    [{ ...valid, role: "__CONTAINOODLE_TEST_INVALID_ROLE__/" }],
+    [valid, { ...valid }],
+    [{ ...valid, accountName: "__CONTAINOODLE_TEST_ACCOUNT__\n" }],
+  ];
+  for (const accounts of malformed) {
+    const fixture = createFixture({
+      storage: {
+        accountsCache: [valid],
+        accountsCacheAt: 1,
+        accountsCacheSource: "backend",
+        [BACKEND_SSO_PROFILE_KEY]: SYNTHETIC_PROFILE,
+        [BACKEND_SSO_IDENTITY_KEY]: SYNTHETIC_IDENTITY_KEY,
+      },
+    });
+    const before = structuredClone(fixture.storageData);
+    try {
+      fixture.setBackendFetchResponse(200, accounts);
+      await loadOptions(fixture);
+      fixture.elements.get("backend-url").value = "http://127.0.0.1:8877";
+      await fixture.elements.get("backend-save").dispatch("click");
+      await waitForBackendRequest(fixture);
+      assert.deepEqual(fixture.storageData, before);
+      assert.equal(fixture.elements.get("backend-status").textContent, "Local helper returned an unexpected response");
+      assert.equal(protectedFetchCalls(fixture).length, 2, "identity and signed accounts must be requested");
+    } finally {
+      cleanupGlobals();
+    }
   }
 });
 
@@ -3241,7 +3521,7 @@ test("options markup separates portal pins from backend session reuse", async ()
     "the backend panel must start hidden until onboarding state is loaded",
   );
   assert.match(html, /id="onboarding"/);
-  assert.match(html, /id="onboarding-heading">Start here</);
+  assert.match(html, /id="onboarding-heading" data-i18n="ui_start_here">Start here</);
   assert.match(html, /id="onboarding-description"/);
   assert.match(
     html,

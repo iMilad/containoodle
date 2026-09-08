@@ -15,6 +15,7 @@ import http.server
 import json
 import os
 import secrets
+import socketserver
 import stat
 import subprocess
 import sys
@@ -23,6 +24,7 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -44,10 +46,28 @@ HELPER_TOKEN_FILE = Path(
 ).expanduser()
 HELPER_TOKEN = None
 
+# A stalled CLI process is killed and reaped by subprocess.run. Federation
+# applies a socket-operation timeout to both connecting and reading the reply.
+AWS_CLI_TIMEOUT_SECONDS = 30
+FEDERATION_TIMEOUT_SECONDS = 15
+FEDERATION_RESPONSE_LIMIT_BYTES = 64 * 1024
+# A browser can preopen a connection before sending HTTP headers. Keep those
+# sockets from monopolizing the helper, without allowing unlimited workers.
+REQUEST_SOCKET_TIMEOUT_SECONDS = 5
+MAX_CONCURRENT_REQUESTS = 8
+
 import re
-_ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
-_REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
-_ROLE_RE = re.compile(r"^[\w+=,.@-]{1,64}$")
+_ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")
+_REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
+_ROLE_RE = re.compile(r"^[A-Za-z0-9_+=,.@-]{1,64}$")
+_ACCOUNT_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_ACCOUNT_NAME_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+# Match JavaScript String.trim() in shared/accounts.js, including U+FEFF but
+# excluding U+0085 (Python's default str.strip() differs for these characters).
+_ACCOUNT_NAME_TRIM_CHARS = (
+    "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
 _HELPER_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _HELPER_PROOF_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTITY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -71,6 +91,70 @@ _ROUTE_QUERY_KEYS = {
     "/roles": {"account", "identity", "profile"},
     "/generate-url": {"account", "identity", "profile", "role"},
 }
+
+
+class AccountsFileError(RuntimeError):
+    """An actionable accounts-file failure with no user data in its message."""
+
+    def __init__(self, public_message: str, status: int = 500):
+        super().__init__(public_message)
+        self.public_message = public_message
+        self.status = status
+
+
+class AwsRequestTimeout(RuntimeError):
+    """An upstream operation expired; expose no secret-bearing diagnostics."""
+
+
+def _reject_non_json_constant(_value):
+    raise ValueError("Non-JSON constant")
+
+
+def _load_accounts() -> list[dict]:
+    """Load and validate the entire document before exposing or using any row.
+
+    Do not coerce or rewrite valid values: IDs must remain exact strings, and
+    optional/extra fields are preserved for existing extension consumers.
+    """
+    try:
+        accounts = json.loads(
+            ACCOUNTS_FILE.read_text(encoding="utf-8"),
+            parse_constant=_reject_non_json_constant,
+        )
+    except FileNotFoundError:
+        raise AccountsFileError("accounts.json not found", 404) from None
+    except (UnicodeError, ValueError, RecursionError):
+        raise AccountsFileError("accounts.json is invalid") from None
+    except OSError:
+        raise AccountsFileError("accounts.json could not be read") from None
+
+    if not isinstance(accounts, list):
+        raise AccountsFileError("accounts.json must contain an array of accounts")
+    seen_ids = set()
+    for index, account in enumerate(accounts, start=1):
+        prefix = f"accounts.json entry {index}"
+        if not isinstance(account, dict):
+            raise AccountsFileError(f"{prefix} must be an object")
+        account_id = account.get("accountId")
+        if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
+            raise AccountsFileError(f"{prefix}: accountId must be a 12-digit string")
+        name = account.get("accountName")
+        if not isinstance(name, str) or not name.strip(_ACCOUNT_NAME_TRIM_CHARS):
+            raise AccountsFileError(f"{prefix}: accountName must be a nonempty string")
+        if len(name) > 256 or _ACCOUNT_NAME_CONTROL_RE.search(name):
+            raise AccountsFileError(f"{prefix}: accountName is too long or contains control characters")
+        if _ACCOUNT_NAME_SURROGATE_RE.search(name):
+            raise AccountsFileError(f"{prefix}: accountName contains invalid Unicode")
+        for field, pattern in (("role", _ROLE_RE), ("region", _REGION_RE)):
+            if field in account and (
+                not isinstance(account[field], str)
+                or not pattern.fullmatch(account[field])
+            ):
+                raise AccountsFileError(f"{prefix}: invalid {field}")
+        if account_id in seen_ids:
+            raise AccountsFileError(f"{prefix}: duplicate accountId")
+        seen_ids.add(account_id)
+    return accounts
 
 
 # ─── Helper authentication ──────────────────────────────────────────────────
@@ -603,7 +687,7 @@ def _select_profile_sso_identity(profile: str) -> dict:
         ) from error
 
     try:
-        access_token, _, _ = _validate_sso_cache(
+        access_token, _, sso_region = _validate_sso_cache(
             cache_data,
             expected_start_url=resolved["startUrl"],
             expected_region=resolved["region"],
@@ -616,6 +700,7 @@ def _select_profile_sso_identity(profile: str) -> dict:
     return {
         "cache": cache_data,
         "accessToken": access_token,
+        "region": sso_region,
         "identityKey": _sso_identity_key(
             resolved["identityNamespace"],
             access_token,
@@ -655,10 +740,11 @@ def _select_automatic_sso_identity() -> dict:
             "Multiple AWS SSO logins were found. Choose an AWS CLI profile."
         )
 
-    (access_token, start_url, _), cache_data = next(iter(candidates.items()))
+    (access_token, start_url, sso_region), cache_data = next(iter(candidates.items()))
     return {
         "cache": cache_data,
         "accessToken": access_token,
+        "region": sso_region,
         "identityKey": _sso_identity_key(
             start_url,
             access_token,
@@ -686,22 +772,16 @@ def _verify_sso_identity(selection: dict, expected_identity: str | None) -> None
 
 def _get_role_credentials(access_token: str, account_id: str, role: str, region: str) -> dict:
     """Call aws sso get-role-credentials and return the credentials dict."""
-    result = subprocess.run(
+    data = _run_aws_cli(
         [
             "aws", "sso", "get-role-credentials",
             "--access-token", access_token,
             "--account-id", account_id,
             "--role-name", role,
             "--region", region,
+            "--output", "json",
         ],
-        capture_output=True,
-        text=True,
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"aws sso get-role-credentials failed: {result.stderr.strip()}"
-        )
-    data = json.loads(result.stdout)
     creds = data["roleCredentials"]
     return {
         "sessionId": creds["accessKeyId"],
@@ -712,7 +792,7 @@ def _get_role_credentials(access_token: str, account_id: str, role: str, region:
 
 def _list_account_roles(access_token: str, account_id: str, region: str) -> list[str]:
     """Call aws sso list-account-roles and return the role names."""
-    result = subprocess.run(
+    data = _run_aws_cli(
         [
             "aws", "sso", "list-account-roles",
             "--access-token", access_token,
@@ -720,15 +800,29 @@ def _list_account_roles(access_token: str, account_id: str, region: str) -> list
             "--region", region,
             "--output", "json",
         ],
-        capture_output=True,
-        text=True,
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"aws sso list-account-roles failed: {result.stderr.strip()}"
-        )
-    data = json.loads(result.stdout)
     return [r["roleName"] for r in data.get("roleList", []) if r.get("roleName")]
+
+
+def _run_aws_cli(command: list[str]) -> dict:
+    """Bound both CLI calls and discard credential-bearing failure details."""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=AWS_CLI_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise AwsRequestTimeout("AWS CLI request timed out") from None
+    except (OSError, UnicodeError):
+        raise RuntimeError("AWS CLI could not be run") from None
+    if result.returncode != 0:
+        raise RuntimeError("AWS CLI request failed")
+    try:
+        return json.loads(result.stdout)
+    except (ValueError, RecursionError):
+        raise RuntimeError("AWS CLI returned an invalid response") from None
 
 
 def _build_signin_url(session_creds: dict, region: str) -> str:
@@ -741,8 +835,20 @@ def _build_signin_url(session_creds: dict, region: str) -> str:
         "https://signin.aws.amazon.com/federation"
         f"?Action=getSigninToken&Session={session_encoded}"
     )
-    with urllib.request.urlopen(token_url) as resp:
-        token_data = json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(token_url, timeout=FEDERATION_TIMEOUT_SECONDS) as resp:
+            payload = resp.read(FEDERATION_RESPONSE_LIMIT_BYTES + 1)
+            if len(payload) > FEDERATION_RESPONSE_LIMIT_BYTES:
+                raise RuntimeError("AWS federation response is too large")
+            token_data = json.loads(payload.decode())
+    except TimeoutError:
+        raise AwsRequestTimeout("AWS federation request timed out") from None
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise AwsRequestTimeout("AWS federation request timed out") from None
+        raise RuntimeError("AWS federation request failed") from None
+    except (OSError, ValueError, RecursionError):
+        raise RuntimeError("AWS federation returned an invalid response") from None
     signin_token = token_data["SigninToken"]
 
     # Step 2: build login URL with a pre-encoded console destination
@@ -770,7 +876,7 @@ def generate_signin_url(
         selection["accessToken"],
         account_id,
         role,
-        region,
+        selection["region"],
     )
     url = _build_signin_url(creds, region)
     return url
@@ -928,12 +1034,8 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _get_account_meta(self, account_id: str) -> dict | None:
-        """Look up account metadata from accounts.json."""
-        try:
-            accounts = json.loads(ACCOUNTS_FILE.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None
-        for acc in accounts:
+        """Look up metadata only after validating the complete accounts file."""
+        for acc in _load_accounts():
             if acc["accountId"] == account_id:
                 return acc
         return None
@@ -1034,12 +1136,10 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
         # ── /accounts → return accounts list ──
         if path == "/accounts":
             try:
-                accounts = json.loads(ACCOUNTS_FILE.read_text())
+                accounts = _load_accounts()
                 self._send_json(accounts)
-            except FileNotFoundError:
-                self._send_json({"error": "accounts.json not found"}, 404)
-            except json.JSONDecodeError:
-                self._send_json({"error": "accounts.json is invalid"}, 500)
+            except AccountsFileError as error:
+                self._send_json({"error": error.public_message}, error.status)
             return
 
         # ── /sso-identity[?profile=...] → opaque selected identity key ──
@@ -1077,15 +1177,19 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "Invalid AWS SSO selection"}, 400)
                 return
             account_id = qs.get("account", [None])[0]
-            if not account_id or not _ACCOUNT_ID_RE.match(account_id):
+            if not account_id or not _ACCOUNT_ID_RE.fullmatch(account_id):
                 self._send_json({"error": "Invalid or missing account ID (expected 12-digit number)"}, 400)
                 return
-            meta = self._get_account_meta(account_id)
+            try:
+                meta = self._get_account_meta(account_id)
+            except AccountsFileError as error:
+                self._send_json({"error": error.public_message}, error.status)
+                return
             if not meta:
                 self._send_json({"error": "Account not found in accounts.json"}, 404)
                 return
             region = meta.get("region", DEFAULT_REGION)
-            if not _REGION_RE.match(region):
+            if not isinstance(region, str) or not _REGION_RE.fullmatch(region):
                 self._send_json({"error": "Invalid region in account config"}, 400)
                 return
             try:
@@ -1094,10 +1198,13 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
                 roles = _list_account_roles(
                     selection["accessToken"],
                     account_id,
-                    region,
+                    selection["region"],
                 )
             except SsoSelectionError as error:
                 self._send_json({"error": error.public_message}, error.status)
+                return
+            except AwsRequestTimeout:
+                self._send_json({"error": "AWS request timed out. Check your connection and try again."}, 504)
                 return
             except RuntimeError:
                 self._send_json({"error": "Failed to list roles. Is your SSO token valid?"}, 500)
@@ -1116,11 +1223,15 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "Invalid AWS SSO selection"}, 400)
                 return
             account_id = qs.get("account", [None])[0]
-            if not account_id or not _ACCOUNT_ID_RE.match(account_id):
+            if not account_id or not _ACCOUNT_ID_RE.fullmatch(account_id):
                 self._send_json({"error": "Invalid or missing account ID (expected 12-digit number)"}, 400)
                 return
 
-            meta = self._get_account_meta(account_id)
+            try:
+                meta = self._get_account_meta(account_id)
+            except AccountsFileError as error:
+                self._send_json({"error": error.public_message}, error.status)
+                return
             if not meta:
                 self._send_json({"error": "Account not found in accounts.json"}, 404)
                 return
@@ -1131,10 +1242,10 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
             region = meta.get("region", DEFAULT_REGION)
             account_name = meta.get("accountName", account_id)
 
-            if not _ROLE_RE.match(role):
+            if not isinstance(role, str) or not _ROLE_RE.fullmatch(role):
                 self._send_json({"error": "Invalid role name in account config"}, 400)
                 return
-            if not _REGION_RE.match(region):
+            if not isinstance(region, str) or not _REGION_RE.fullmatch(region):
                 self._send_json({"error": "Invalid region in account config"}, 400)
                 return
 
@@ -1148,6 +1259,9 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
                 )
             except SsoSelectionError as error:
                 self._send_json({"error": error.public_message}, error.status)
+                return
+            except AwsRequestTimeout:
+                self._send_json({"error": "AWS request timed out. Check your connection and try again."}, 504)
                 return
             except RuntimeError:
                 self._send_json({"error": "Failed to generate session. Is your SSO token valid?"}, 500)
@@ -1165,6 +1279,43 @@ class ContainoodleHandler(http.server.BaseHTTPRequestHandler):
             return
 
         self.send_error(404)
+
+
+class ContainoodleHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """Serve independent local requests with bounded workers and socket waits."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        try:
+            request.settimeout(REQUEST_SOCKET_TIMEOUT_SECONDS)
+        except OSError:
+            request.close()
+            raise
+        return request, client_address
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            # Do not queue unbounded sockets or create an extra worker to reply.
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 def _parse_args(argv=None):
@@ -1194,11 +1345,13 @@ def main(argv=None):
     with _AUTH_CHALLENGE_LOCK:
         _AUTH_CHALLENGES.clear()
 
-    if not ACCOUNTS_FILE.exists():
-        print(f"⚠  {ACCOUNTS_FILE} not found — create it first.")
+    try:
+        _load_accounts()
+    except AccountsFileError as error:
+        print(f"Accounts unavailable: {error.public_message}", file=sys.stderr)
         return 1
 
-    server = http.server.HTTPServer((HOST, PORT), ContainoodleHandler)
+    server = ContainoodleHTTPServer((HOST, PORT), ContainoodleHandler)
     print(f"╔══════════════════════════════════════════╗")
     print(f"║        Containoodle — ready            ║")
     print(f"║             http://{HOST}:{PORT}        ║")
@@ -1207,6 +1360,7 @@ def main(argv=None):
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
+    finally:
         server.server_close()
     return 0
 

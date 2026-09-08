@@ -8,6 +8,12 @@
    ═══════════════════════════════════════════════════════════════════ */
 
 import { accountEnv } from "./env.js";
+import { safeAccountsError, validateAccounts } from "../shared/accounts.js";
+import { message as t, localizeDocument } from "../shared/i18n.js";
+import { automaticAccountName } from "../shared/group-naming.js";
+import { createFaviconLoader, faviconSourceForTab } from "../shared/service-icons.js";
+
+const loadFavicon = createFaviconLoader();
 import {
   BACKEND_AUTH_TOKEN_KEY,
   BACKEND_SSO_IDENTITY_KEY,
@@ -15,6 +21,7 @@ import {
   DEFAULT_BACKEND_URL,
   backendFetch,
   isBackendAuthenticationError,
+  isBackendTimeoutError,
   normalizeBackendSsoIdentityKey,
   normalizeBackendToken,
   safeBackendUrl,
@@ -42,10 +49,10 @@ let accounts = [];
 let backendOnline = false;
 let usingCache = false;
 let backendAuthProblem = null;
+let backendAccountsProblem = null;
 let searchActiveQuery = "";
 let searchPinnedQuery = "";
 let searchAllQuery = "";
-let pendingFocusSection = null;
 let sectionCollapsed = { active: false, pinned: false, all: true };
 let renderDebounceTimer = null;
 let lastActiveTabId = null;
@@ -68,6 +75,11 @@ let backendPinnedAccountIds = new Set();
 // Explicit Containoodle ownership; display names are labels, not identity.
 let accountContainers = {};
 let containerAccounts = {};
+// cookieStoreId → unmodified source name for a managed container. A container
+// label may already be formatted, so never treat it as an original name.
+let containerOriginalNames = {};
+let containerOriginalNamesRevision = 0;
+const containerOriginalNameRevisions = new Map();
 // accountId → roles list currently offered as an inline picker
 const rolePicks = new Map();
 
@@ -79,6 +91,7 @@ const statusText   = document.getElementById("status-text");
 const refreshBtn   = document.getElementById("refresh-btn");
 const optionsBtn   = document.getElementById("options-btn");
 const notification = document.getElementById("notification");
+const announcement = document.getElementById("sidebar-announcement");
 const portalToolbar = document.getElementById("portal-toolbar");
 const openPortalBtn = document.getElementById("open-portal-btn");
 const portalToolbarHint = document.getElementById("portal-toolbar-hint");
@@ -90,26 +103,41 @@ const onboardingOpenSetup = document.getElementById("onboarding-open-setup");
 // ── Notification ─────────────────────────────────────────────
 let notifyTimer = null;
 function notify(message, type = "info", onClick = null) {
-  notification.textContent = message;
-  notification.className = type + (onClick ? " clickable" : "");
+  const hadFocus = notification.contains(document.activeElement);
+  notification.textContent = "";
+  notification.className = type;
+  if (onClick) {
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "notification-action";
+    action.textContent = message;
+    action.addEventListener("click", onClick);
+    notification.appendChild(action);
+    if (hadFocus) action.focus();
+  } else {
+    notification.textContent = message;
+    if (hadFocus) refreshBtn.focus();
+  }
   notification.hidden = false;
-  notification.onclick = onClick;
+  announcement.textContent = message;
   clearTimeout(notifyTimer);
-  notifyTimer = setTimeout(() => { notification.hidden = true; }, onClick ? 10000 : 4000);
+  // Recovery actions stay available until the next result or refresh. A
+  // timed disappearance would strand keyboard and screen-reader users.
+  if (!onClick) notifyTimer = setTimeout(() => { notification.hidden = true; }, 4000);
 }
 
 const ONBOARDING_COPY = Object.freeze({
   [ONBOARDING_STATES.CHOOSE]: {
-    heading: "Set up Containoodle",
-    description: "Choose how Containoodle should open AWS console sessions.",
+    heading: t("ui_set_up_containoodle", "Set up Containoodle"),
+    description: t("ui_choose_how_containoodle_should_open_aws_console_sessions", "Choose how Containoodle should open AWS console sessions."),
   },
   [ONBOARDING_STATES.BACKEND]: {
-    heading: "Finish helper setup",
-    description: "Connect and test the local AWS CLI helper before opening accounts.",
+    heading: t("ui_finish_helper_setup", "Finish helper setup"),
+    description: t("ui_connect_and_test_the_local_aws_cli_helper_before", "Connect and test the local AWS CLI helper before opening accounts."),
   },
   [ONBOARDING_STATES.PORTAL]: {
-    heading: "Finish portal setup",
-    description: "Add your AWS access portal and confirm it is ready before opening accounts.",
+    heading: t("ui_finish_portal_setup", "Finish portal setup"),
+    description: t("ui_add_your_aws_access_portal_and_confirm_it_is", "Add your AWS access portal and confirm it is ready before opening accounts."),
   },
 });
 
@@ -131,7 +159,7 @@ function showOnboarding(state) {
   notification.hidden = true;
   statusDot.className = "dot setup";
   statusText.classList.add("setup");
-  statusText.textContent = "Setup required";
+  statusText.textContent = t("ui_setup_required", "Setup required");
 }
 
 function hideOnboarding() {
@@ -180,7 +208,7 @@ async function readConfig() {
 async function readAccountsCache() {
   try {
     const { accountsCache } = await browser.storage.local.get("accountsCache");
-    return Array.isArray(accountsCache) ? accountsCache : [];
+    return validateAccounts(accountsCache).errors.length ? [] : accountsCache;
   } catch {
     return [];
   }
@@ -217,6 +245,7 @@ async function readStoredMetadata(activeMode) {
     backendPinnedAccountIds: new Set(),
     accountContainers: {},
     containerAccounts: {},
+    containerOriginalNames: {},
   };
   try {
     const all = await browser.storage.local.get(null);
@@ -254,6 +283,8 @@ async function readStoredMetadata(activeMode) {
         next.accountContainers[key.slice("accountContainer/".length)] = value;
       } else if (key.startsWith("containerAccount/") && typeof value === "string") {
         next.containerAccounts[key.slice("containerAccount/".length)] = value;
+      } else if (key.startsWith("containerOriginalName/") && typeof value === "string") {
+        next.containerOriginalNames[key.slice("containerOriginalName/".length)] = value;
       }
     }
   } catch {
@@ -273,7 +304,7 @@ async function readAccounts(activeConfig) {
       try {
         token = normalizeBackendToken(stored[BACKEND_AUTH_TOKEN_KEY]);
       } catch {
-        const err = new Error("Local helper access token is missing or invalid");
+        const err = new Error(t("ui_local_helper_access_token_is_missing_or_invalid", "Local helper access token is missing or invalid"));
         err.backendAuthProblem = "required";
         throw err;
       }
@@ -283,19 +314,32 @@ async function readAccounts(activeConfig) {
         { signal: controller.signal }
       );
       if (res.status === 401) {
-        const err = new Error("Local helper access token was rejected");
+        const err = new Error(t("ui_local_helper_access_token_was_rejected", "Local helper access token was rejected"));
         err.backendAuthProblem = "rejected";
         throw err;
       }
-      if (!res.ok) throw new Error();
+      if (!res.ok) {
+        const err = new Error();
+        try {
+          err.backendAccountsProblem = safeAccountsError(await res.json());
+        } catch {
+          // A malformed error response is not user-facing diagnostic text.
+        }
+        throw err;
+      }
       const data = await res.json();
-      if (!Array.isArray(data)) throw new Error();
+      if (validateAccounts(data).errors.length) {
+        const err = new Error();
+        err.backendAccountsProblem = t("ui_local_helper_returned_an_unexpected_response", "Local helper returned an unexpected response");
+        throw err;
+      }
       const cached = await readAccountsCache();
       return {
         accounts: data,
         backendOnline: true,
         usingCache: false,
         backendAuthProblem: null,
+        backendAccountsProblem: null,
         cacheChanged: JSON.stringify(cached) !== JSON.stringify(data),
       };
     } catch (err) {
@@ -311,6 +355,9 @@ async function readAccounts(activeConfig) {
         backendOnline: false,
         usingCache: cached.length > 0,
         backendAuthProblem: authProblem,
+        backendAccountsProblem: isBackendTimeoutError(err)
+          ? t("ui_local_helper_timed_out_check_server_py_and_try_again", "Local helper timed out. Check server.py and try again.")
+          : err?.backendAccountsProblem || null,
         cacheChanged: false,
       };
     } finally {
@@ -333,29 +380,30 @@ async function readAccounts(activeConfig) {
 }
 
 function updateStatus() {
+  statusText.title = config.mode === "backend" ? backendAccountsProblem || "" : "";
   if (config.mode === "portal") {
     const ready = Boolean(config.portalStartUrl);
     statusDot.className = `dot ${ready ? "online" : "offline"}`;
     if (!ready) {
-      statusText.textContent = "Portal · not configured";
+      statusText.textContent = t("ui_portal_not_configured", "Portal · not configured");
     } else if (accounts.length === 0) {
-      statusText.textContent = "Portal · ready";
+      statusText.textContent = t("ui_portal_ready", "Portal · ready");
     } else {
-      statusText.textContent = `Portal · ${accounts.length} pinned`;
+      statusText.textContent = t("ui_portal_value_pinned", "Portal · $1 favorites", [accounts.length]);
     }
     return;
   }
   statusDot.className = `dot ${backendOnline ? "online" : "offline"}`;
   if (backendAuthProblem === "required") {
-    statusText.textContent = "Helper access token required";
+    statusText.textContent = t("ui_helper_access_token_required", "Helper access token required");
   } else if (backendAuthProblem === "rejected") {
-    statusText.textContent = "Helper access token rejected";
+    statusText.textContent = t("ui_helper_access_token_rejected", "Helper access token rejected");
   } else if (backendOnline) {
-    statusText.textContent = `Connected · ${accounts.length} accounts`;
+    statusText.textContent = t("ui_connected_value_accounts", "Connected · $1 accounts", [accounts.length]);
   } else {
     statusText.textContent = usingCache
-      ? `Offline · ${accounts.length} cached`
-      : "Containoodle offline";
+      ? t("ui_offline_value_cached", "Offline · $1 cached", [accounts.length])
+      : t("ui_containoodle_offline", "Containoodle offline");
   }
 }
 
@@ -367,8 +415,8 @@ function updatePortalToolbar() {
   portalToolbar.hidden = !portalMode;
   openPortalBtn.disabled = !configured;
   openPortalBtn.title = configured
-    ? "Focus the AWS Access Portal tab, or open it"
-    : "Set the AWS Access Portal URL in Containoodle Options first";
+    ? t("ui_focus_the_aws_access_portal_tab_or_open_it", "Focus the AWS Access Portal tab, or open it")
+    : t("ui_set_the_aws_access_portal_url_in_containoodle_options", "Set the AWS Access Portal URL in Containoodle Options first");
   openPortalBtn.setAttribute("aria-disabled", String(!configured));
   portalToolbarHint.hidden = configured;
 }
@@ -400,6 +448,80 @@ function scheduleRender() {
 }
 
 // ── Render ───────────────────────────────────────────────────
+function displayAccountName(originalName) {
+  return automaticAccountName(
+    originalName,
+    config.groupNamePattern,
+    config.groupNameReplacement,
+  );
+}
+
+function keyedControl(element, key) {
+  element.dataset.focusKey = key;
+  return element;
+}
+
+function listControls() {
+  return [...listEl.querySelectorAll("[data-focus-key]")];
+}
+
+function captureListFocus() {
+  const focused = document.activeElement;
+  if (!focused || !listEl.contains(focused)) return null;
+  return {
+    key: focused.dataset.focusKey,
+    accountKey: focused.closest(".account-item")?.dataset.accountKey,
+    sectionKey: focused.closest(".section")?.dataset.sectionKey,
+    index: listControls().indexOf(focused),
+    start: focused.selectionStart,
+    end: focused.selectionEnd,
+    direction: focused.selectionDirection,
+  };
+}
+
+function restoreListFocus(saved) {
+  if (!saved) return;
+  const controls = listControls().filter((control) => !control.disabled);
+  const restored = controls.find((control) => control.dataset.focusKey === saved.key)
+    || (saved.accountKey && controls.find((control) =>
+      control.closest(".account-item")?.dataset.accountKey === saved.accountKey))
+    || controls.find((control) => control.dataset.focusKey === `section:${saved.sectionKey}`)
+    || controls[Math.min(Math.max(saved.index, 0), controls.length - 1)]
+    || refreshBtn;
+  restored.focus({ preventScroll: true });
+  if (restored.dataset.focusKey === saved.key && typeof saved.start === "number") {
+    restored.setSelectionRange(saved.start, saved.end, saved.direction);
+  }
+}
+
+async function renderWithRoleFocus(accountId, origin) {
+  const focusKey = origin?.dataset.focusKey;
+  await render();
+  // Discovery is asynchronous: only move into the picker if the user is
+  // still on the control that requested it, not after they tab elsewhere.
+  if (!focusKey || document.activeElement?.dataset.focusKey !== focusKey) return;
+  const firstRole = listControls().find((control) =>
+    control.dataset.focusKey === `role:${accountId}:0`);
+  firstRole?.focus({ preventScroll: true });
+}
+
+function dismissRolePicker(accountId, accountKey) {
+  const focused = document.activeElement;
+  const shouldReturn = focused?.closest(".role-picker")
+    ?.closest(".account-item")?.dataset.accountKey === accountKey;
+  rolePicks.delete(accountId);
+  void render().then(() => {
+    if (!shouldReturn) return;
+    // render() already returned focus within the account. Do not steal it
+    // if the user moved elsewhere while Firefox supplied the latest tabs.
+    if (document.activeElement?.closest(".account-item")?.dataset.accountKey !== accountKey) return;
+    const controls = listControls();
+    const origin = controls.find((control) => control.dataset.focusKey === `choose-role:${accountKey}`)
+      || controls.find((control) => control.dataset.focusKey === `launch:${accountKey}`);
+    origin?.focus({ preventScroll: true });
+  });
+}
+
 async function render(expectedGeneration = refreshGeneration) {
   if (!onboardingResolved || onboardingPending) return;
   const containerMap = await getContainerTabMap();
@@ -414,8 +536,12 @@ async function render(expectedGeneration = refreshGeneration) {
     const mappedStoreId = accountContainers[acc.accountId];
     const cd = mappedStoreId ? containerMap.get(mappedStoreId) : null;
     const isPinned = modePinnedIds.has(String(acc.accountId));
+    const originalName = (portalMode && portalAccountOriginalNames[acc.accountId]) ||
+      acc.accountName;
     return {
       account: acc,
+      originalName,
+      displayName: displayAccountName(originalName),
       container: cd ? cd.container : null,
       tabs: cd ? cd.tabs : [],
       isPinned,
@@ -437,12 +563,20 @@ async function render(expectedGeneration = refreshGeneration) {
       const portalName = portalMode && mappedAccountId
         ? portalAccountOriginalNames[mappedAccountId]
         : null;
+      const storedOriginal = mappedAccountId
+        ? containerOriginalNames[cd.container.cookieStoreId]
+        : null;
+      const originalName = portalName || storedOriginal;
       items.push({
         account: {
           accountId: mappedAccountId || "—",
-          accountName: portalName || name,
+          accountName: originalName || name,
           role: "—",
         },
+        originalName: originalName || name,
+        // Missing source metadata is not permission to apply the rule twice
+        // to a formatted label, or to rename an unrelated Firefox container.
+        displayName: originalName ? displayAccountName(originalName) : name,
         container: cd.container,
         tabs: cd.tabs,
         isPinned: portalMode && modePinnedIds.has(String(mappedAccountId)),
@@ -457,7 +591,7 @@ async function render(expectedGeneration = refreshGeneration) {
   }
 
   // Each account belongs to exactly one section. A pinned active account
-  // remains in Active; it moves to Pinned accounts after its final tab closes.
+  // remains in Active; it moves to Favorites after its final tab closes.
   const activeItems = items.filter((i) => i.tabs.length > 0);
   const inactiveItems = items.filter((i) => i.tabs.length === 0);
   const pinnedItems = inactiveItems.filter((i) => i.isPinned);
@@ -468,28 +602,30 @@ async function render(expectedGeneration = refreshGeneration) {
       ? source.filter(
         (i) =>
           i.account.accountName.toLowerCase().includes(query) ||
+          i.originalName.toLowerCase().includes(query) ||
+          i.displayName.toLowerCase().includes(query) ||
           String(i.account.accountId).includes(query)
       )
       : source;
   }
 
   // Filter each section independently.
-  const aq = searchActiveQuery;
-  const pq = searchPinnedQuery;
-  const allq = searchAllQuery;
+  const aq = searchActiveQuery.trim().toLowerCase();
+  const pq = searchPinnedQuery.trim().toLowerCase();
+  const allq = searchAllQuery.trim().toLowerCase();
   const filteredActive = filterItems(activeItems, aq);
   const filteredPinned = filterItems(pinnedItems, pq);
   const filteredOther = filterItems(otherItems, allq);
 
-  // Sort each alphabetically
+  // Sort by the label the user actually sees, without changing source data.
   filteredActive.sort((a, b) =>
-    a.account.accountName.localeCompare(b.account.accountName)
+    a.displayName.localeCompare(b.displayName)
   );
   filteredPinned.sort((a, b) =>
-    a.account.accountName.localeCompare(b.account.accountName)
+    a.displayName.localeCompare(b.displayName)
   );
   filteredOther.sort((a, b) =>
-    a.account.accountName.localeCompare(b.account.accountName)
+    a.displayName.localeCompare(b.displayName)
   );
 
   // Get currently active tab for highlighting
@@ -501,14 +637,17 @@ async function render(expectedGeneration = refreshGeneration) {
   const activeTabId = activeTab ? activeTab.id : null;
 
   // Render
+  // Snapshot immediately before replacing the DOM, after asynchronous work
+  // has finished, so a newer user focus or caret position wins.
+  const savedFocus = captureListFocus();
   listEl.textContent = "";
   loadingState.classList.remove("visible");
 
   // Active section
   if (activeItems.length > 0) {
-    const sec = createSection("active", `Active (${filteredActive.length})`);
+    const sec = createSection("active", t("ui_active_value", "Active ($1)", [filteredActive.length]));
     if (!sectionCollapsed.active) {
-      sec.appendChild(createSearchInput("active", searchActiveQuery, "Filter active…"));
+      sec.appendChild(createSearchInput("active", searchActiveQuery, t("ui_filter_active", "Filter active…")));
       for (const item of filteredActive) {
         sec.appendChild(createAccountEl(item, activeTabId));
       }
@@ -522,11 +661,11 @@ async function render(expectedGeneration = refreshGeneration) {
   if (pinnedItems.length > 0) {
     const secPinned = createSection(
       "pinned",
-      `Pinned accounts (${filteredPinned.length})`
+      t("ui_pinned_accounts_value", "Favorites ($1)", [filteredPinned.length])
     );
     if (!sectionCollapsed.pinned) {
       secPinned.appendChild(
-        createSearchInput("pinned", searchPinnedQuery, "Filter pinned accounts…")
+        createSearchInput("pinned", searchPinnedQuery, t("ui_filter_pinned_accounts", "Filter favorites…"))
       );
       for (const item of filteredPinned) {
         secPinned.appendChild(createAccountEl(item, activeTabId));
@@ -543,11 +682,11 @@ async function render(expectedGeneration = refreshGeneration) {
   if (!portalMode && otherItems.length > 0) {
     const secAll = createSection(
       "all",
-      `Other accounts (${filteredOther.length})`
+      t("ui_other_accounts_value", "Other accounts ($1)", [filteredOther.length])
     );
     if (!sectionCollapsed.all) {
       secAll.appendChild(
-        createSearchInput("all", searchAllQuery, "Filter other accounts…")
+        createSearchInput("all", searchAllQuery, t("ui_filter_other_accounts", "Filter other accounts…"))
       );
       for (const item of filteredOther) {
         secAll.appendChild(createAccountEl(item, activeTabId));
@@ -559,17 +698,7 @@ async function render(expectedGeneration = refreshGeneration) {
     listEl.appendChild(secAll);
   }
 
-  // Restore focus to search input after DOM rebuild
-  if (pendingFocusSection) {
-    const restored = listEl.querySelector(
-      `.section-search-input[data-section="${pendingFocusSection}"]`
-    );
-    if (restored) {
-      restored.focus();
-      restored.selectionStart = restored.selectionEnd = restored.value.length;
-    }
-    pendingFocusSection = null;
-  }
+  restoreListFocus(savedFocus);
 
   // Keep the active tab findable: scroll to it when it changes
   // (not on every render, so it doesn't fight manual scrolling).
@@ -587,13 +716,38 @@ async function render(expectedGeneration = refreshGeneration) {
 }
 
 function sectionHeader(text, sectionKey) {
-  const el = document.createElement("div");
+  const el = keyedControl(document.createElement("button"), `section:${sectionKey}`);
+  el.type = "button";
   el.className = "section-header";
+  el.setAttribute("aria-label", text);
+  el.setAttribute("aria-expanded", String(!sectionCollapsed[sectionKey]));
+  const symbol = document.createElement("span");
+  symbol.className = "section-symbol";
+  symbol.setAttribute("aria-hidden", "true");
+  symbol.textContent = sectionKey === "active" ? "●" : sectionKey === "pinned" ? "★" : "▤";
+  el.appendChild(symbol);
+  const heading = document.createElement("span");
+  heading.className = "section-heading";
+  const label = document.createElement("span");
+  label.className = "section-label";
+  label.textContent = text;
+  heading.appendChild(label);
+  if (sectionKey === "active" || sectionKey === "pinned") {
+    const description = document.createElement("span");
+    description.className = "section-description";
+    description.id = `section-description-${sectionKey}`;
+    description.textContent = sectionKey === "active"
+      ? t("ui_open_tabs_now", "Open tabs now")
+      : t("ui_saved_shortcuts_no_open_tabs", "Saved shortcuts · no open tabs");
+    heading.appendChild(description);
+    el.setAttribute("aria-describedby", description.id);
+  }
+  el.appendChild(heading);
   const chevron = document.createElement("span");
   chevron.className = `section-chevron${sectionCollapsed[sectionKey] ? "" : " open"}`;
+  chevron.setAttribute("aria-hidden", "true");
   chevron.textContent = "▶";
   el.appendChild(chevron);
-  el.appendChild(document.createTextNode(` ${text}`));
   el.addEventListener("click", () => {
     sectionCollapsed[sectionKey] = !sectionCollapsed[sectionKey];
     render();
@@ -604,6 +758,7 @@ function sectionHeader(text, sectionKey) {
 function createSection(sectionKey, title) {
   const wrapper = document.createElement("div");
   wrapper.className = `section section-${sectionKey}`;
+  wrapper.dataset.sectionKey = sectionKey;
   wrapper.appendChild(sectionHeader(title, sectionKey));
   return wrapper;
 }
@@ -611,22 +766,22 @@ function createSection(sectionKey, title) {
 function createSearchInput(section, value, placeholder) {
   const wrapper = document.createElement("div");
   wrapper.className = "section-search";
-  const input = document.createElement("input");
+  const input = keyedControl(document.createElement("input"), `search:${section}`);
   input.type = "text";
   input.className = "section-search-input";
   input.placeholder = placeholder;
+  input.setAttribute("aria-label", placeholder);
   input.value = value;
   input.autocomplete = "off";
   input.spellcheck = false;
   input.addEventListener("input", () => {
     if (section === "active") {
-      searchActiveQuery = input.value.trim().toLowerCase();
+      searchActiveQuery = input.value;
     } else if (section === "pinned") {
-      searchPinnedQuery = input.value.trim().toLowerCase();
+      searchPinnedQuery = input.value;
     } else {
-      searchAllQuery = input.value.trim().toLowerCase();
+      searchAllQuery = input.value;
     }
-    pendingFocusSection = section;
     render();
   });
   input.dataset.section = section;
@@ -637,13 +792,15 @@ function createSearchInput(section, value, placeholder) {
 function createInlineEmpty() {
   const el = document.createElement("div");
   el.className = "inline-empty";
-  el.textContent = "No matches";
+  el.textContent = t("ui_no_matches", "No matches");
   return el;
 }
 
 // ── Account element ──────────────────────────────────────────
 function createAccountEl({
   account,
+  originalName,
+  displayName,
   container,
   tabs,
   isPinned = false,
@@ -652,9 +809,11 @@ function createAccountEl({
 }, activeTabId) {
   const isActive = tabs.length > 0;
   // Synthetic container-only rows ("—") aren't AWS accounts — no env
-  const env = account.accountId !== "—" ? accountEnv(account.accountName) : null;
+  const env = account.accountId !== "—" ? accountEnv(originalName) : null;
   const div = document.createElement("div");
   div.className = `account-item${isActive ? " active" : ""}${env ? ` env-${env}` : ""}`;
+  const accountKey = `${config.mode}:${account.accountId === "—" ? container.cookieStoreId : account.accountId}`;
+  div.dataset.accountKey = accountKey;
 
   // Header row
   const header = document.createElement("div");
@@ -680,7 +839,7 @@ function createAccountEl({
   }
   const nameEl = document.createElement("span");
   nameEl.className = "account-name";
-  nameEl.textContent = account.accountName;
+  nameEl.textContent = displayName;
   nameRow.appendChild(nameEl);
 
   const idEl = document.createElement("div");
@@ -700,9 +859,13 @@ function createAccountEl({
       chip.className = "role-chip pinned";
       chip.textContent = pinned;
       chip.title = portalPinRole
-        ? "Pinned role — click to change"
-        : "Role pinned in the accounts list";
+        ? t("ui_pinned_role_click_to_change", "Pinned role — click to change")
+        : t("ui_role_pinned_in_the_accounts_list", "Role pinned in the accounts list");
       if (portalPinRole) {
+        keyedControl(chip, `choose-role:${accountKey}`);
+        chip.type = "button";
+        chip.setAttribute("aria-label", t("ui_change_role_for_value_current_value", "Change role for $1; current role $2", [displayName, pinned]));
+        chip.setAttribute("aria-expanded", String(rolePicks.has(account.accountId)));
         chip.classList.add("changeable");
         chip.addEventListener("click", (e) => {
           e.stopPropagation();
@@ -714,13 +877,17 @@ function createAccountEl({
       const chip = document.createElement("span");
       chip.className = "role-chip pinned";
       chip.textContent = portalRole;
-      chip.title = "Last role selected in the AWS portal";
+      chip.title = t("ui_last_role_selected_in_the_aws_portal", "Last role selected in the AWS portal");
       idEl.appendChild(chip);
     } else if (config.mode === "backend" && remembered) {
       const chip = document.createElement("button");
       chip.className = "role-chip";
       chip.textContent = remembered;
-      chip.title = "Remembered backend role — click to change";
+      chip.title = t("ui_remembered_backend_role_click_to_change", "Remembered backend role — click to change");
+      keyedControl(chip, `choose-role:${accountKey}`);
+      chip.type = "button";
+      chip.setAttribute("aria-label", t("ui_change_role_for_value_current_value", "Change role for $1; current role $2", [displayName, remembered]));
+      chip.setAttribute("aria-expanded", String(rolePicks.has(account.accountId)));
       chip.addEventListener("click", (e) => {
         e.stopPropagation();
         openRolePicker(account);
@@ -736,24 +903,31 @@ function createAccountEl({
   header.appendChild(info);
 
   if (pinAvailable && account.accountId !== "—") {
-    const pinBtn = document.createElement("button");
+    const pinBtn = keyedControl(document.createElement("button"), `pin:${accountKey}`);
     pinBtn.className = `pin-btn${isPinned ? " is-pinned" : ""}`;
     pinBtn.type = "button";
     pinBtn.textContent = isPinned ? "★" : "☆";
     pinBtn.title = isPinned
-      ? "Unpin account"
-      : "Pin account";
+      ? t("ui_unpin_account", "Remove from favorites")
+      : t("ui_pin_account", "Add to favorites");
     pinBtn.setAttribute(
       "aria-label",
       isPinned
-        ? `Unpin ${account.accountName}`
-        : `Pin ${account.accountName}`
+        ? t("ui_unpin_value", "Remove $1 from favorites", [displayName])
+        : t("ui_pin_value", "Add $1 to favorites", [displayName])
     );
     pinBtn.setAttribute("aria-pressed", String(isPinned));
     pinBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      pinBtn.disabled = true;
-      await setAccountPinned(account, !isPinned);
+      if (pinBtn.getAttribute("aria-disabled") === "true") return;
+      // Keep the focused control in the tab order while its request is
+      // pending; aria-disabled plus this guard prevents a duplicate request.
+      pinBtn.setAttribute("aria-disabled", "true");
+      try {
+        await setAccountPinned(account, !isPinned);
+      } finally {
+        pinBtn.setAttribute("aria-disabled", "false");
+      }
     });
     header.appendChild(pinBtn);
   }
@@ -766,10 +940,12 @@ function createAccountEl({
     header.appendChild(badge);
 
     // Close-all button
-    const closeAll = document.createElement("button");
+    const closeAll = keyedControl(document.createElement("button"), `close-all:${accountKey}`);
+    closeAll.type = "button";
     closeAll.className = "close-all-btn";
-    closeAll.title = "Close all tabs";
+    closeAll.title = t("ui_close_all_tabs", "Close all tabs");
     closeAll.textContent = "✕";
+    closeAll.setAttribute("aria-label", t("ui_close_all_tabs_for_value", "Close all tabs for $1", [displayName]));
     closeAll.addEventListener("click", async (e) => {
       e.stopPropagation();
       tabs.forEach((t) => removedTabIds.add(t.id));
@@ -781,10 +957,12 @@ function createAccountEl({
     // Launch button — always present so a misconfigured setup fails
     // loudly (the background reports exactly what's missing) instead
     // of rendering an inert row.
-    const btn = document.createElement("button");
+    const btn = keyedControl(document.createElement("button"), `launch:${accountKey}`);
+    btn.type = "button";
     btn.className = "launch-btn";
-    btn.title = "Launch in container";
+    btn.title = t("ui_launch_in_container", "Launch in container");
     btn.textContent = "▶";
+    btn.setAttribute("aria-label", t("ui_launch_value_in_container", "Launch $1 in its container", [displayName]));
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       launchAccount(account, btn);
@@ -806,25 +984,35 @@ function createAccountEl({
   if (rolePicks.has(account.accountId)) {
     const picker = document.createElement("div");
     picker.className = "role-picker";
-    for (const role of rolePicks.get(account.accountId)) {
-      const option = document.createElement("button");
+    picker.setAttribute("role", "group");
+    picker.setAttribute("aria-label", t("ui_choose_role_for_value", "Choose a role for $1", [displayName]));
+    picker.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      dismissRolePicker(account.accountId, accountKey);
+    });
+    for (const [index, role] of rolePicks.get(account.accountId).entries()) {
+      const option = keyedControl(document.createElement("button"), `role:${account.accountId}:${index}`);
+      option.type = "button";
       option.className = "role-option";
       option.textContent = role;
       option.addEventListener("click", (e) => {
         e.stopPropagation();
-        rolePicks.delete(account.accountId);
+        dismissRolePicker(account.accountId, accountKey);
         launchAccount(account, header.querySelector(".launch-btn"), role);
       });
       picker.appendChild(option);
     }
-    const dismiss = document.createElement("button");
+    const dismiss = keyedControl(document.createElement("button"), `dismiss-role:${accountKey}`);
+    dismiss.type = "button";
     dismiss.className = "role-option dismiss";
     dismiss.textContent = "✕";
-    dismiss.title = "Dismiss";
+    dismiss.title = t("ui_dismiss", "Dismiss");
+    dismiss.setAttribute("aria-label", t("ui_dismiss_role_choices_for_value", "Dismiss role choices for $1", [displayName]));
     dismiss.addEventListener("click", (e) => {
       e.stopPropagation();
-      rolePicks.delete(account.accountId);
-      render();
+      dismissRolePicker(account.accountId, accountKey);
     });
     picker.appendChild(dismiss);
     div.appendChild(picker);
@@ -847,38 +1035,29 @@ function createAccountEl({
 function createTabEl(tab, activeTabId) {
   const el = document.createElement("div");
   el.className = `tab-item${tab.id === activeTabId ? " is-active" : ""}`;
+  const switchButton = keyedControl(document.createElement("button"), `tab:${tab.id}`);
+  switchButton.type = "button";
+  switchButton.className = "tab-switch";
+  switchButton.setAttribute("aria-label", t("ui_switch_to_tab_value", "Switch to tab: $1", [tab.title || t("ui_loading", "Loading…")]));
+  if (tab.id === activeTabId) switchButton.setAttribute("aria-current", "true");
+  switchButton.addEventListener("click", () => switchToTab(tab.id));
 
-  // Favicon
-  if (
-    typeof tab.favIconUrl === "string" &&
-    (
-      tab.favIconUrl.startsWith("moz-extension://") ||
-      /^data:image\/(?:png|jpe?g|gif|webp|x-icon|vnd\.microsoft\.icon);base64,/i
-        .test(tab.favIconUrl)
-    )
-  ) {
-    const img = document.createElement("img");
-    img.className = "tab-favicon";
-    img.src = tab.favIconUrl;
-    img.onerror = () => {
-      img.replaceWith(faviconPlaceholder());
-    };
-    el.appendChild(img);
-  } else {
-    el.appendChild(faviconPlaceholder());
-  }
+  switchButton.appendChild(createTabFavicon(tab));
 
   // Title
   const title = document.createElement("span");
   title.className = "tab-title";
-  title.textContent = tab.title || "Loading…";
-  el.appendChild(title);
+  title.textContent = tab.title || t("ui_loading", "Loading…");
+  switchButton.appendChild(title);
+  el.appendChild(switchButton);
 
   // Close button
-  const closeBtn = document.createElement("button");
+  const closeBtn = keyedControl(document.createElement("button"), `close-tab:${tab.id}`);
+  closeBtn.type = "button";
   closeBtn.className = "tab-close";
-  closeBtn.title = "Close tab";
+  closeBtn.title = t("ui_close_tab", "Close tab");
   closeBtn.textContent = "×";
+  closeBtn.setAttribute("aria-label", t("ui_close_tab_value", "Close tab: $1", [tab.title || t("ui_loading", "Loading…")]));
   closeBtn.addEventListener("click", async (e) => {
     e.stopPropagation();
     removedTabIds.add(tab.id);
@@ -887,16 +1066,31 @@ function createTabEl(tab, activeTabId) {
   });
   el.appendChild(closeBtn);
 
-  // Click → switch to tab
-  el.addEventListener("click", () => switchToTab(tab.id));
-
   return el;
 }
 
-function faviconPlaceholder() {
+function createTabFavicon(tab) {
   const span = document.createElement("span");
-  span.className = "tab-favicon-placeholder";
-  span.textContent = "📄";
+  span.className = "tab-favicon tab-favicon-slot is-fallback";
+  span.setAttribute("aria-hidden", "true");
+  function showImage(src) {
+    if (!src) return;
+    const img = document.createElement("img");
+    img.alt = "";
+    img.className = "tab-favicon-image";
+    img.decoding = "async";
+    img.onload = () => span.classList.remove("is-fallback");
+    img.onerror = () => {
+      span.textContent = "";
+      span.classList.add("is-fallback");
+    };
+    // Embedded data or a browser-local image, never a remote <img> request.
+    img.src = src;
+    span.appendChild(img);
+  }
+  const source = faviconSourceForTab(tab);
+  if (source?.remote) void loadFavicon(tab).then(showImage);
+  else if (source) showImage(source.url);
   return span;
 }
 
@@ -932,12 +1126,12 @@ async function setAccountPinned(account, shouldPin) {
       (result && result.cancelled)
     ) return;
     if (!result || !result.ok) {
-      throw new Error((result && result.error) || "Pin update failed");
+      throw new Error((result && result.error) || t("ui_pin_update_failed", "Favorite update failed"));
     }
     notify(
       shouldPin
-        ? `Pinned ${account.accountName}`
-        : `Unpinned ${account.accountName}`,
+        ? t("ui_pinned_value", "Added $1 to favorites", [account.accountName])
+        : t("ui_unpinned_value", "Removed $1 from favorites", [account.accountName]),
       "success"
     );
     if (requestedMode === "portal") {
@@ -957,7 +1151,7 @@ async function setAccountPinned(account, shouldPin) {
       requestedRevision !== modeRevision ||
       requestedMode !== config.mode
     ) return;
-    notify(`Could not update pin: ${err.message}`, "error");
+    notify(t("ui_could_not_update_pin_value", "Could not update favorite: $1", [err.message]), "error");
     await render();
   }
 }
@@ -977,7 +1171,7 @@ async function openPortalAction() {
     !config.portalStartUrl.trim()
   ) {
     notify(
-      "Set the AWS Access Portal URL in Options first",
+      t("ui_set_the_aws_access_portal_url_in_options_first", "Set the AWS Access Portal URL in Options first"),
       "error",
       openOptionsAction
     );
@@ -986,7 +1180,7 @@ async function openPortalAction() {
 
   openPortalBtn.disabled = true;
   openPortalBtn.classList.add("loading");
-  notify("Opening AWS Portal…", "info");
+  notify(t("ui_opening_aws_portal", "Opening AWS Portal…"), "info");
   try {
     const result = await browser.runtime.sendMessage({
       type: "open-portal",
@@ -998,10 +1192,10 @@ async function openPortalAction() {
       (result && result.cancelled)
     ) return;
     if (result && result.ok) {
-      notify("AWS Portal ready", "success");
+      notify(t("ui_aws_portal_ready", "AWS Portal ready"), "success");
     } else {
       notify(
-        `${(result && result.error) || "Could not open AWS Portal"} — click here to open settings`,
+        t("ui_value_click_here_to_open_settings", "$1 — click here to open settings", [(result && result.error) || t("ui_could_not_open_aws_portal", "Could not open AWS Portal")]),
         "error",
         openOptionsAction
       );
@@ -1011,7 +1205,7 @@ async function openPortalAction() {
       requestedRevision !== modeRevision ||
       requestedMode !== config.mode
     ) return;
-    notify(`Could not open AWS Portal: ${err.message}`, "error");
+    notify(t("ui_could_not_open_aws_portal_value", "Could not open AWS Portal: $1", [err.message]), "error");
   } finally {
     openPortalBtn.classList.remove("loading");
     if (
@@ -1035,11 +1229,12 @@ openPortalBtn.addEventListener("click", () => {
 async function launchAccount(account, btn, role) {
   const requestedMode = config.mode;
   const requestedRevision = modeRevision;
+  const origin = document.activeElement;
   if (btn) {
     btn.classList.add("loading");
     btn.textContent = "↻";
   }
-  notify(`Opening ${account.accountName}…`, "info");
+  notify(t("ui_opening_value", "Opening $1…", [account.accountName]), "info");
 
   try {
     const resp = await browser.runtime.sendMessage({
@@ -1053,20 +1248,20 @@ async function launchAccount(account, btn, role) {
       requestedMode !== config.mode
     ) return;
     if (resp && resp.ok) {
-      notify(`Opened ${resp.account}`, "success");
+      notify(t("ui_opened_value", "Opened $1", [resp.account]), "success");
     } else if (resp && resp.needsLogin) {
-      notify("No portal session — click here to sign in", "error", signInAction);
+      notify(t("ui_no_portal_session_click_here_to_sign_in", "No portal session — click here to sign in"), "error", signInAction);
     } else if (resp && resp.needsOptions) {
-      notify(`${resp.error} — click here to open settings`, "error", openOptionsAction);
+      notify(t("ui_value_click_here_to_open_settings", "$1 — click here to open settings", [resp.error]), "error", openOptionsAction);
     } else if (resp && resp.chooseRole) {
       rolePicks.set(account.accountId, resp.chooseRole);
-      notify(`${account.accountName}: pick a role`, "info");
-      render();
+      notify(t("ui_value_pick_a_role", "$1: pick a role", [account.accountName]), "info");
+      await renderWithRoleFocus(account.accountId, origin);
     } else {
-      notify(`Failed: ${(resp && resp.error) || "no response"}`, "error");
+      notify(t("ui_failed_value", "Failed: $1", [(resp && resp.error) || t("ui_no_response", "no response")]), "error");
     }
   } catch (err) {
-    notify(`Failed: ${err.message}`, "error");
+    notify(t("ui_failed_value", "Failed: $1", [err.message]), "error");
   } finally {
     if (btn) {
       btn.classList.remove("loading");
@@ -1079,7 +1274,8 @@ async function launchAccount(account, btn, role) {
 async function openRolePicker(account) {
   const requestedMode = config.mode;
   const requestedRevision = modeRevision;
-  notify(`Loading roles for ${account.accountName}…`, "info");
+  const origin = document.activeElement;
+  notify(t("ui_loading_roles_for_value", "Loading roles for $1…", [account.accountName]), "info");
   try {
     const resp = await browser.runtime.sendMessage({
       type: "discover-roles",
@@ -1093,16 +1289,16 @@ async function openRolePicker(account) {
     if (resp && resp.ok) {
       rolePicks.set(account.accountId, resp.roles);
       notification.hidden = true;
-      render();
+      await renderWithRoleFocus(account.accountId, origin);
     } else if (resp && resp.needsLogin) {
-      notify("No portal session — click here to sign in", "error", signInAction);
+      notify(t("ui_no_portal_session_click_here_to_sign_in", "No portal session — click here to sign in"), "error", signInAction);
     } else if (resp && resp.needsOptions) {
-      notify(`${resp.error} — click here to open settings`, "error", openOptionsAction);
+      notify(t("ui_value_click_here_to_open_settings", "$1 — click here to open settings", [resp.error]), "error", openOptionsAction);
     } else {
-      notify(`Failed: ${(resp && resp.error) || "no response"}`, "error");
+      notify(t("ui_failed_value", "Failed: $1", [(resp && resp.error) || t("ui_no_response", "no response")]), "error");
     }
   } catch (err) {
-    notify(`Failed: ${err.message}`, "error");
+    notify(t("ui_failed_value", "Failed: $1", [err.message]), "error");
   }
 }
 
@@ -1148,7 +1344,7 @@ browser.tabs.onRemoved.addListener((tabId) => {
 browser.tabs.onCreated.addListener(scheduleRender);
 browser.tabs.onActivated.addListener(scheduleRender);
 browser.tabs.onUpdated.addListener((_id, changeInfo) => {
-  if (changeInfo.title || changeInfo.status === "complete") scheduleRender();
+  if (changeInfo.title || changeInfo.url || Object.hasOwn(changeInfo, "favIconUrl") || changeInfo.status === "complete") scheduleRender();
 });
 browser.contextualIdentities.onCreated.addListener(scheduleRender);
 browser.contextualIdentities.onRemoved.addListener(scheduleRender);
@@ -1158,6 +1354,15 @@ browser.contextualIdentities.onUpdated.addListener(scheduleRender);
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   const keys = Object.keys(changes);
+  const originalNameKeys = keys.filter((key) => key.startsWith("containerOriginalName/"));
+  if (originalNameKeys.length > 0) containerOriginalNamesRevision += 1;
+  for (const key of originalNameKeys) {
+    const storeId = key.slice("containerOriginalName/".length);
+    const value = changes[key].newValue;
+    containerOriginalNameRevisions.set(storeId, containerOriginalNamesRevision);
+    if (typeof value === "string") containerOriginalNames[storeId] = value;
+    else delete containerOriginalNames[storeId];
+  }
   if (changes[ONBOARDING_KEY]) {
     onboardingResolved = true;
     if (isOnboardingPending(changes[ONBOARDING_KEY].newValue)) {
@@ -1176,7 +1381,6 @@ browser.storage.onChanged.addListener((changes, area) => {
       searchActiveQuery = "";
       searchPinnedQuery = "";
       searchAllQuery = "";
-      pendingFocusSection = null;
       if (newMode === "portal" && backendRequestController) {
         backendRequestController.abort();
       }
@@ -1207,6 +1411,10 @@ browser.storage.onChanged.addListener((changes, area) => {
     k.startsWith("containerAccount/")
   )) {
     fullRefresh();
+  } else if (originalNameKeys.length > 0) {
+    // Bulk label updates carry only raw source metadata. Refresh the visible
+    // rows without reloading accounts or contacting the local helper again.
+    scheduleRender();
   }
 });
 
@@ -1229,25 +1437,43 @@ async function fullRefresh() {
     backendRequestController.abort();
   }
 
+  const originalNamesRevision = containerOriginalNamesRevision;
   const [nextAccounts, nextMetadata] = await Promise.all([
     readAccounts(nextConfig),
     readStoredMetadata(nextConfig.mode),
   ]);
   if (generation !== refreshGeneration) return;
 
+  // A helper response may finish after this refresh snapshotted metadata.
+  // Keep newer source-only updates (including removals) without another fetch.
+  for (const [storeId, revision] of containerOriginalNameRevisions) {
+    if (revision <= originalNamesRevision) continue;
+    if (Object.prototype.hasOwnProperty.call(containerOriginalNames, storeId)) {
+      nextMetadata.containerOriginalNames[storeId] = containerOriginalNames[storeId];
+    } else {
+      delete nextMetadata.containerOriginalNames[storeId];
+    }
+  }
+
   config = nextConfig;
   accounts = nextAccounts.accounts;
   backendOnline = nextAccounts.backendOnline;
   usingCache = nextAccounts.usingCache;
   backendAuthProblem = nextAccounts.backendAuthProblem;
+  const previousAccountsProblem = backendAccountsProblem;
+  backendAccountsProblem = nextAccounts.backendAccountsProblem || null;
   rememberedRoles = nextMetadata.rememberedRoles;
   portalRoles = nextMetadata.portalRoles;
   portalAccountOriginalNames = nextMetadata.portalAccountOriginalNames;
   backendPinnedAccountIds = nextMetadata.backendPinnedAccountIds;
   accountContainers = nextMetadata.accountContainers;
   containerAccounts = nextMetadata.containerAccounts;
+  containerOriginalNames = nextMetadata.containerOriginalNames;
   updateStatus();
   updatePortalToolbar();
+  if (backendAccountsProblem && backendAccountsProblem !== previousAccountsProblem) {
+    notify(backendAccountsProblem, "error", () => browser.runtime.openOptionsPage());
+  }
 
   if (nextAccounts.cacheChanged) {
     browser.storage.local.set({
@@ -1264,6 +1490,7 @@ async function fullRefresh() {
 }
 
 // ── Init ─────────────────────────────────────────────────────
+localizeDocument();
 // Never let cosmetics break init (e.g. stale cached HTML after update)
 try {
   const versionEl = document.getElementById("brand-version");

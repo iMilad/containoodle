@@ -2,15 +2,21 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <title>Containoodle</title>
   <link rel="stylesheet" href="sidebar.css">
 </head>
 <body>
   <div id="sidebar">
     <header>
-      <div class="brand" title="Containoodle — isolated AWS console sessions in Firefox">
+      <div class="brand" title="Containoodle — isolated AWS console sessions in Firefox" data-i18n-title="ui_containoodle_isolated_aws_console_sessions_in_firefox">
         <img class="brand-icon" src="../icons/icon-96.png" alt="">
-        <span>Containoodle</span>
-        <span class="brand-version" id="brand-version"></span>
+        <div class="brand-copy">
+          <div class="brand-name-row">
+            <span>Containoodle</span>
+            <span class="brand-version" id="brand-version"></span>
+          </div>
+          <span class="brand-subtitle" data-i18n="ui_aws_console_containers">AWS Console Containers</span>
+        </div>
       </div>
     </header>
 
@@ -19,8 +25,8 @@
         type="button"
         id="open-portal-btn"
         aria-describedby="portal-toolbar-hint"
-      >↗ AWS Portal</button>
-      <span id="portal-toolbar-hint" hidden>Set the portal URL in Options first.</span>
+       data-i18n="ui_aws_portal">↗ AWS Portal</button>
+      <span id="portal-toolbar-hint" hidden data-i18n="ui_set_the_portal_url_in_options_first">Set the portal URL in Options first.</span>
     </div>
 
     <section
@@ -30,32 +36,33 @@
       aria-describedby="onboarding-description"
       hidden
     >
-      <h1 id="onboarding-heading">Set up Containoodle</h1>
-      <p id="onboarding-description">Choose how Containoodle should open AWS console sessions.</p>
+      <h1 id="onboarding-heading" data-i18n="ui_set_up_containoodle">Set up Containoodle</h1>
+      <p id="onboarding-description" data-i18n="ui_choose_how_containoodle_should_open_aws_console_sessions">Choose how Containoodle should open AWS console sessions.</p>
       <button
         type="button"
         id="onboarding-open-setup"
         aria-describedby="onboarding-description"
-      >Open setup</button>
+       data-i18n="ui_open_setup">Open setup</button>
     </section>
 
     <div id="notification" hidden></div>
+    <div id="sidebar-announcement" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
 
     <div id="account-list"></div>
 
     <div id="loading-state" class="visible">
-      <div class="spinner"></div>
-      <div>Loading…</div>
+      <div class="spinner" aria-hidden="true"></div>
+      <div data-i18n="ui_loading">Loading…</div>
     </div>
 
     <footer>
       <div id="status">
         <span id="status-dot" class="dot offline"></span>
-        <span id="status-text">Connecting…</span>
+        <span id="status-text" role="status" aria-live="polite" aria-atomic="true" data-i18n="ui_connecting">Connecting…</span>
       </div>
       <div class="footer-buttons">
-        <button id="options-btn" title="Containoodle options">⚙</button>
-        <button id="refresh-btn" title="Refresh">↻</button>
+        <button id="options-btn" type="button" title="Containoodle options" aria-label="Containoodle options" data-i18n-title="ui_containoodle_options" data-i18n-aria-label="ui_containoodle_options">⚙</button>
+        <button id="refresh-btn" type="button" title="Refresh" aria-label="Refresh" data-i18n-title="ui_refresh" data-i18n-aria-label="ui_refresh">↻</button>
       </div>
     </footer>
   </div>

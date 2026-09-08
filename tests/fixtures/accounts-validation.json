@@ -1,0 +1,312 @@
+[
+  {
+    "name": "empty account list",
+    "valid": true,
+    "document": []
+  },
+  {
+    "name": "minimal valid account",
+    "valid": true,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__"
+      }
+    ]
+  },
+  {
+    "name": "optional metadata preserved",
+    "valid": true,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "role": "__CONTAINOODLE_TEST_ROLE__",
+        "region": "xx-test-1",
+        "extra": "test-only"
+      }
+    ]
+  },
+  {
+    "name": "multi-component region",
+    "valid": true,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "region": "xx-test-extra-1"
+      }
+    ]
+  },
+  {
+    "name": "Unicode display name",
+    "valid": true,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__TEST_Ü_🧪__"
+      }
+    ]
+  },
+  {
+    "name": "BOM-only display name",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "\ufeff"
+      }
+    ]
+  },
+  {
+    "name": "U0085 is not JavaScript trim whitespace",
+    "valid": true,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "\u0085"
+      }
+    ]
+  },
+  {
+    "name": "unpaired high surrogate display name",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__TEST_\ud800__"
+      }
+    ]
+  },
+  {
+    "name": "unpaired low surrogate display name",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__TEST_\udc00__"
+      }
+    ]
+  },
+  {
+    "name": "non-array object",
+    "valid": false,
+    "document": {
+      "accountId": "000000000000",
+      "accountName": "__CONTAINOODLE_TEST_ACCOUNT__"
+    }
+  },
+  {
+    "name": "null document",
+    "valid": false,
+    "document": null
+  },
+  {
+    "name": "string document",
+    "valid": false,
+    "document": "test-only"
+  },
+  {
+    "name": "null entry",
+    "valid": false,
+    "document": [
+      null
+    ]
+  },
+  {
+    "name": "array entry",
+    "valid": false,
+    "document": [
+      []
+    ]
+  },
+  {
+    "name": "numeric entry",
+    "valid": false,
+    "document": [
+      0
+    ]
+  },
+  {
+    "name": "numeric account ID",
+    "valid": false,
+    "document": [
+      {
+        "accountId": 111111111111,
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__"
+      }
+    ]
+  },
+  {
+    "name": "Unicode digits ID",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "٠٠٠٠٠٠٠٠٠٠٠٠",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__"
+      }
+    ]
+  },
+  {
+    "name": "trailing newline ID",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000\n",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__"
+      }
+    ]
+  },
+  {
+    "name": "missing account ID",
+    "valid": false,
+    "document": [
+      {
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__"
+      }
+    ]
+  },
+  {
+    "name": "duplicate account IDs",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__"
+      },
+      {
+        "accountId": "000000000000",
+        "accountName": "__SECOND_TEST_NAME__"
+      }
+    ]
+  },
+  {
+    "name": "blank account name",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": " \t "
+      }
+    ]
+  },
+  {
+    "name": "control character name",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__TEST_\n_NAME__"
+      }
+    ]
+  },
+  {
+    "name": "null account name",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": null
+      }
+    ]
+  },
+  {
+    "name": "numeric role",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "role": 123
+      }
+    ]
+  },
+  {
+    "name": "null role",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "role": null
+      }
+    ]
+  },
+  {
+    "name": "empty role",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "role": ""
+      }
+    ]
+  },
+  {
+    "name": "Unicode role",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "role": "__TEST_Ü_ROLE__"
+      }
+    ]
+  },
+  {
+    "name": "trailing newline role",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "role": "__TEST_ROLE__\n"
+      }
+    ]
+  },
+  {
+    "name": "numeric region",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "region": 1
+      }
+    ]
+  },
+  {
+    "name": "null region",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "region": null
+      }
+    ]
+  },
+  {
+    "name": "trailing newline region",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "region": "xx-test-1\n"
+      }
+    ]
+  },
+  {
+    "name": "invalid region",
+    "valid": false,
+    "document": [
+      {
+        "accountId": "000000000000",
+        "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+        "region": "__TEST_INVALID_REGION__"
+      }
+    ]
+  }
+]

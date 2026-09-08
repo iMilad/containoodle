@@ -1,8 +1,9 @@
-/* Containoodle tab-group display naming.
+/* Containoodle account display naming.
  *
- * The account's original name remains the source of truth for container
- * identity, sidebar labels, and environment colours. This helper changes only
- * the automatically generated Firefox tab-group title.
+ * Apply one display rule to sidebar account labels, automatic container names,
+ * and automatic tab-group titles. The original account name remains the source
+ * of truth for metadata and environment colours; display names never determine
+ * account or container identity.
  */
 
 export const GROUP_NAME_PATTERN_MAX_LENGTH = 256;
@@ -154,7 +155,7 @@ export function validateGroupNameRule(pattern, replacement) {
   return { pattern: source, replacement: substitute };
 }
 
-export function automaticGroupTitle(originalName, pattern, replacement) {
+export function automaticAccountName(originalName, pattern, replacement) {
   const original = typeof originalName === "string" ? originalName : "";
   if (!original) return original;
 
@@ -173,3 +174,6 @@ export function automaticGroupTitle(originalName, pattern, replacement) {
     return original;
   }
 }
+
+// Keep existing tab-group callers compatible with the shared display rule.
+export const automaticGroupTitle = automaticAccountName;

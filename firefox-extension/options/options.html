@@ -3,12 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Containoodle settings</title>
+  <title data-i18n="ui_containoodle_settings">Containoodle settings</title>
   <link rel="stylesheet" href="options.css">
 </head>
 <body>
   <main>
-    <h1>Containoodle settings</h1>
+    <h1 data-i18n="ui_containoodle_settings">Containoodle settings</h1>
 
     <section
       id="onboarding"
@@ -17,20 +17,20 @@
       aria-describedby="onboarding-description"
       hidden
     >
-      <p class="onboarding-kicker">First-time setup</p>
-      <h2 id="onboarding-heading">Start here</h2>
+      <p class="onboarding-kicker" data-i18n="ui_first_time_setup">First-time setup</p>
+      <h2 id="onboarding-heading" data-i18n="ui_start_here">Start here</h2>
       <p id="onboarding-description" class="onboarding-description"></p>
-      <p class="onboarding-safety">Choosing a method only selects its setup panel. Firefox asks for site access later, when you use that panel's explicit setup button.</p>
+      <p class="onboarding-safety" data-i18n="ui_choosing_a_method_only_selects_its_setup_panel_firefox">Choosing a method only selects its setup panel. Firefox asks for site access later, when you use that panel's explicit setup button.</p>
       <div class="actions onboarding-actions">
-        <button type="button" id="onboarding-continue" class="linkish">Hide this guide for now</button>
+        <button type="button" id="onboarding-continue" class="linkish" data-i18n="ui_hide_this_guide_for_now">Hide this guide for now</button>
       </div>
       <p id="onboarding-status" class="status" role="status" aria-live="polite"></p>
     </section>
 
     <section id="connection-method" aria-labelledby="connection-method-heading">
-      <h2 id="connection-method-heading">Connection method</h2>
+      <h2 id="connection-method-heading" data-i18n="ui_connection_method">Connection method</h2>
       <fieldset class="mode-options">
-        <legend class="visually-hidden">Choose how Containoodle opens AWS console sessions</legend>
+        <legend class="visually-hidden" data-i18n="ui_choose_how_containoodle_opens_aws_console_sessions">Choose how Containoodle opens AWS console sessions</legend>
         <label class="radio" for="mode-backend">
           <input
             type="radio"
@@ -40,8 +40,8 @@
             aria-controls="backend-panel"
           >
           <span>
-            <strong>Local AWS CLI helper</strong>
-            <small>Use <code>server.py</code> with an existing AWS CLI SSO login when the access portal is unavailable.</small>
+            <strong data-i18n="ui_local_aws_cli_helper">Local AWS CLI helper</strong>
+            <small data-i18n="ui_use_value_with_an_existing_aws_cli_sso_login">Use <code data-i18n-slot="1">server.py</code> with an existing AWS CLI SSO login when the access portal is unavailable.</small>
           </span>
         </label>
         <label class="radio" for="mode-portal">
@@ -53,8 +53,8 @@
             aria-controls="portal-panel"
           >
           <span>
-            <strong>AWS access portal</strong>
-            <small>Choose an account and role in the portal; Containoodle moves that console launch into its isolated container.</small>
+            <strong data-i18n="ui_aws_access_portal">AWS access portal</strong>
+            <small data-i18n="ui_choose_an_account_and_role_in_the_portal_containoodle">Choose an account and role in the portal; Containoodle moves that console launch into its isolated container.</small>
           </span>
         </label>
       </fieldset>
@@ -67,11 +67,11 @@
       aria-labelledby="backend-heading"
       hidden
     >
-      <h2 id="backend-heading">Local AWS CLI helper</h2>
-      <p class="section-intro">Containoodle gets accounts and sign-in URLs from the helper running on this computer.</p>
+      <h2 id="backend-heading" data-i18n="ui_local_aws_cli_helper">Local AWS CLI helper</h2>
+      <p class="section-intro" data-i18n="ui_containoodle_gets_accounts_and_sign_in_urls_from_the">Containoodle gets accounts and sign-in URLs from the helper running on this computer.</p>
 
       <div class="field">
-        <label class="field-label" for="backend-url">Helper URL</label>
+        <label class="field-label" for="backend-url" data-i18n="ui_helper_url">Helper URL</label>
         <div class="row">
           <input
             type="text"
@@ -81,11 +81,11 @@
             aria-describedby="backend-url-help"
           >
         </div>
-        <p class="hint" id="backend-url-help">The URL, token, and profile are replaced only after a successful test, which also refreshes the account list.</p>
+        <p class="hint" id="backend-url-help" data-i18n="ui_the_url_token_and_profile_are_replaced_only_after">The URL, token, and profile are replaced only after a successful test, which also refreshes the account list.</p>
       </div>
 
       <div class="field">
-        <label class="field-label" for="backend-token">Helper access token</label>
+        <label class="field-label" for="backend-token" data-i18n="ui_helper_access_token">Helper access token</label>
         <input
           type="password"
           id="backend-token"
@@ -95,13 +95,13 @@
           maxlength="43"
           spellcheck="false"
           aria-describedby="backend-token-help backend-token-status"
-        >
-        <p class="hint" id="backend-token-help">Run <code>python3 server.py --show-token</code> to print the helper's persistent 43-character token. That command then exits, so start <code>python3 server.py</code> separately. Paste the token here once; it is stored only in this Firefox profile and never redisplayed after saving. Leave this field blank to test with the token already stored.</p>
-        <p class="status" id="backend-token-status" role="status" aria-live="polite">Checking saved token…</p>
+         data-i18n-placeholder="ui_paste_the_token_from_server_py_show_token">
+        <p class="hint" id="backend-token-help" data-i18n="ui_run_value_to_print_the_helper_s_persistent_43">Run <code data-i18n-slot="1">python3 server.py --show-token</code> to print the helper's persistent 43-character token. That command then exits, so start <code data-i18n-slot="2">python3 server.py</code> separately. Paste the token here once; it is stored only in this Firefox profile and never redisplayed after saving. Leave this field blank to test with the token already stored.</p>
+        <p class="status" id="backend-token-status" role="status" aria-live="polite" data-i18n="ui_checking_saved_token">Checking saved token…</p>
       </div>
 
       <div class="field">
-        <label class="field-label" for="backend-sso-profile">AWS CLI profile</label>
+        <label class="field-label" for="backend-sso-profile" data-i18n="ui_aws_cli_profile">AWS CLI profile</label>
         <input
           type="text"
           id="backend-sso-profile"
@@ -112,36 +112,36 @@
           spellcheck="false"
           aria-describedby="backend-sso-profile-help"
         >
-        <p class="hint" id="backend-sso-profile-help">Optional. Enter the local profile alias used with <code>aws sso login --profile …</code>. Leave it blank only when the helper can identify one valid SSO login.</p>
+        <p class="hint" id="backend-sso-profile-help" data-i18n="ui_optional_enter_the_local_profile_alias_used_with_value">Optional. Enter the local profile alias used with <code data-i18n-slot="1">aws sso login --profile …</code>. Leave it blank only when the helper can identify one valid SSO login.</p>
       </div>
       <div class="actions">
-        <button type="button" id="backend-save">Save &amp; test</button>
+        <button type="button" id="backend-save" data-i18n="ui_save_test">Save &amp; test</button>
       </div>
-      <p class="status" id="backend-status" role="status" aria-live="polite">Not tested yet</p>
+      <p class="status" id="backend-status" role="status" aria-live="polite" data-i18n="ui_not_tested_yet">Not tested yet</p>
 
       <div class="readiness-card" aria-labelledby="backend-accounts-heading">
         <div class="readiness-header">
-          <h3 id="backend-accounts-heading">Account cache</h3>
-          <button type="button" id="backend-refresh" class="linkish">Refresh accounts</button>
+          <h3 id="backend-accounts-heading" data-i18n="ui_account_cache">Account cache</h3>
+          <button type="button" id="backend-refresh" class="linkish" data-i18n="ui_refresh_accounts">Refresh accounts</button>
         </div>
-        <p class="status" id="backend-accounts-status" role="status" aria-live="polite">Checking cached accounts…</p>
-        <p class="hint">The helper refreshes this browser cache from <code>~/.aws/accounts.json</code>; edit the source file to change backend accounts.</p>
+        <p class="status" id="backend-accounts-status" role="status" aria-live="polite" data-i18n="ui_checking_cached_accounts">Checking cached accounts…</p>
+        <p class="hint" data-i18n="ui_the_helper_refreshes_this_browser_cache_from_value_edit">The helper refreshes this browser cache from <code data-i18n-slot="1">~/.aws/accounts.json</code>; edit the source file to change backend accounts.</p>
       </div>
 
       <details class="settings-details" id="console-permissions">
         <summary>
-          <span>Reuse an existing console session</span>
-          <small>Offered during your first helper setup</small>
+          <span data-i18n="ui_reuse_an_existing_console_session">Reuse an existing console session</span>
+          <small data-i18n="ui_offered_during_your_first_helper_setup">Offered during your first helper setup</small>
         </summary>
         <div class="details-body">
-          <p class="hint">When enabled, Containoodle can check whether this account's container is already signed in and reuse that session instead of starting another sign-in. It also suppresses the AWS cookie banner in new containers.</p>
-          <p class="hint">On your first local-helper <strong>Save &amp; test</strong>, Firefox asks once for access limited to <code>*.console.aws.amazon.com</code>. Accepting enables session reuse; declining does not block setup or normal backend launches. Containoodle will not ask automatically again, but you can use <strong>Allow session reuse</strong> below. Revoking access stops future checks but does not delete cookies already managed by Firefox.</p>
-          <p class="hint">An older broad AWS grant keeps working until you explicitly tighten or revoke it. If Firefox says the broad grant still covers a narrower request, use <strong>Revoke</strong>, then <strong>Allow session reuse</strong> again. Opening Options, updating Containoodle, and switching modes do not migrate existing permissions.</p>
+          <p class="hint" data-i18n="ui_when_enabled_containoodle_can_check_whether_this_account_s">When enabled, Containoodle can check whether this account's container is already signed in and reuse that session instead of starting another sign-in. It also suppresses the AWS cookie banner in new containers.</p>
+          <p class="hint" data-i18n="ui_on_your_first_local_helper_value_firefox_asks_once">On your first local-helper <strong data-i18n="ui_save_test" data-i18n-slot="1">Save &amp; test</strong>, Firefox asks once for access limited to <code data-i18n-slot="2">*.console.aws.amazon.com</code>. Accepting enables session reuse; declining does not block setup or normal backend launches. Containoodle will not ask automatically again, but you can use <strong data-i18n="ui_allow_session_reuse" data-i18n-slot="3">Allow session reuse</strong> below. Revoking access stops future checks but does not delete cookies already managed by Firefox.</p>
+          <p class="hint" data-i18n="ui_an_older_broad_aws_grant_keeps_working_until_you">An older broad AWS grant keeps working until you explicitly tighten or revoke it. If Firefox says the broad grant still covers a narrower request, use <strong data-i18n="ui_revoke" data-i18n-slot="1">Revoke</strong>, then <strong data-i18n="ui_allow_session_reuse" data-i18n-slot="2">Allow session reuse</strong> again. Opening Options, updating Containoodle, and switching modes do not migrate existing permissions.</p>
           <div class="actions">
-            <button type="button" id="console-grant">Allow session reuse</button>
-            <button type="button" id="console-revoke">Revoke</button>
+            <button type="button" id="console-grant" data-i18n="ui_allow_session_reuse">Allow session reuse</button>
+            <button type="button" id="console-revoke" data-i18n="ui_revoke">Revoke</button>
           </div>
-          <p class="status" id="console-status" role="status" aria-live="polite">Checking permission…</p>
+          <p class="status" id="console-status" role="status" aria-live="polite" data-i18n="ui_checking_permission">Checking permission…</p>
         </div>
       </details>
     </section>
@@ -153,11 +153,11 @@
       aria-labelledby="portal-heading"
       hidden
     >
-      <h2 id="portal-heading">AWS access portal</h2>
-      <p class="section-intro">Sign in normally, then choose an account and role. No local helper or AWS CLI is required.</p>
+      <h2 id="portal-heading" data-i18n="ui_aws_access_portal">AWS access portal</h2>
+      <p class="section-intro" data-i18n="ui_sign_in_normally_then_choose_an_account_and_role">Sign in normally, then choose an account and role. No local helper or AWS CLI is required.</p>
 
       <div class="field">
-        <label class="field-label" for="portal-url">Portal start URL</label>
+        <label class="field-label" for="portal-url" data-i18n="ui_portal_start_url">Portal start URL</label>
         <div class="row">
           <input
             type="text"
@@ -166,67 +166,67 @@
             spellcheck="false"
             aria-describedby="portal-url-help"
           >
-          <button type="button" id="portal-save">Grant access &amp; save</button>
+          <button type="button" id="portal-save" data-i18n="ui_grant_access_save">Grant access &amp; save</button>
         </div>
-        <p class="hint" id="portal-url-help">Firefox will ask for access only to this exact portal origin. Optional role choices for pinned sidebar accounts are managed separately below.</p>
+        <p class="hint" id="portal-url-help" data-i18n="ui_firefox_will_ask_for_access_only_to_this_exact">Firefox will ask for access only to this exact portal origin. Optional role choices for favorite sidebar accounts are managed separately below.</p>
       </div>
 
       <div class="readiness-card" id="portal-readiness" aria-labelledby="portal-readiness-heading">
         <div class="readiness-header">
-          <h3 id="portal-readiness-heading">Portal readiness</h3>
+          <h3 id="portal-readiness-heading" data-i18n="ui_portal_readiness">Portal readiness</h3>
           <div class="readiness-actions">
-            <button type="button" id="portal-refresh" class="linkish">Refresh status</button>
-            <button type="button" id="open-portal" class="linkish">Open portal</button>
+            <button type="button" id="portal-refresh" class="linkish" data-i18n="ui_refresh_status">Refresh status</button>
+            <button type="button" id="open-portal" class="linkish" data-i18n="ui_open_portal">Open portal</button>
           </div>
         </div>
-        <p class="status" id="portal-status" role="status" aria-live="polite">Checking portal access…</p>
-        <p class="hint">Containoodle needs permission for this portal and a signed-in portal session before it can hand off a launch.</p>
+        <p class="status" id="portal-status" role="status" aria-live="polite" data-i18n="ui_checking_portal_access">Checking portal access…</p>
+        <p class="hint" data-i18n="ui_containoodle_needs_permission_for_this_portal_and_a_signed">Containoodle needs permission for this portal and a signed-in portal session before it can hand off a launch.</p>
       </div>
 
       <details class="settings-details" id="portal-sidebar-settings">
         <summary>
-          <span>Pinned sidebar accounts</span>
-          <small>Keep portal accounts as direct-launch shortcuts</small>
+          <span data-i18n="ui_pinned_sidebar_accounts">Sidebar favorites</span>
+          <small data-i18n="ui_keep_portal_accounts_as_direct_launch_shortcuts">Keep portal accounts as direct-launch shortcuts</small>
         </summary>
         <div class="details-body">
-          <p class="hint">Open an account from the AWS access portal, then choose ☆ on its active row in the Containoodle sidebar. It changes to ★ and keeps the account as a direct-launch shortcut after its tabs are closed. Choosing ★ again removes only the shortcut.</p>
-          <p class="hint">Pinned accounts belong only to portal mode. Backend accounts continue to come only from the local helper.</p>
+          <p class="hint" data-i18n="ui_open_an_account_from_the_aws_access_portal_then">Open an account from the AWS access portal, then choose ☆ on its active row in the Containoodle sidebar. It changes to ★ and keeps the account as a direct-launch shortcut after its tabs are closed. Choosing ★ again removes only the shortcut.</p>
+          <p class="hint" data-i18n="ui_pinned_accounts_belong_only_to_portal_mode_backend_accounts">These favorites belong only to portal mode. Helper-mode favorites are saved separately from accounts supplied by the local helper.</p>
 
           <div class="readiness-card" aria-labelledby="portal-pins-heading">
-            <h3 id="portal-pins-heading">Pinned accounts</h3>
-            <p class="status" id="portal-pins-status" role="status" aria-live="polite">Checking pinned accounts…</p>
+            <h3 id="portal-pins-heading" data-i18n="ui_pinned_accounts">Favorites</h3>
+            <p class="status" id="portal-pins-status" role="status" aria-live="polite" data-i18n="ui_checking_pinned_accounts">Checking favorites…</p>
           </div>
 
           <div class="permission-block" aria-labelledby="role-discovery-heading">
-            <h3 id="role-discovery-heading">Role choices for pinned accounts</h3>
-            <p class="hint">Allow this only if you want Containoodle to ask the AWS access portal which roles you can choose when launching or changing a pinned shortcut. Firefox asks only for the detected regional <code>portal.sso.&lt;region&gt;.amazonaws.com</code> endpoint. Pinning and normal portal clicks work without it.</p>
-            <p class="hint">An older broad AWS API grant keeps working until you explicitly tighten or revoke it. If Firefox keeps only the broad grant after a narrower request, use <strong>Revoke</strong>, then <strong>Allow role choices</strong> again. Opening Options, updating Containoodle, and switching modes do not migrate existing permissions.</p>
+            <h3 id="role-discovery-heading" data-i18n="ui_role_choices_for_pinned_accounts">Role choices for favorites</h3>
+            <p class="hint" data-i18n="ui_allow_this_only_if_you_want_containoodle_to_ask">Allow this only if you want Containoodle to ask the AWS access portal which roles you can choose when launching or changing a favorite. Firefox asks only for the detected regional <code data-i18n-slot="1">portal.sso.&lt;region&gt;.amazonaws.com</code> endpoint. Saving favorites and normal portal clicks work without it.</p>
+            <p class="hint" data-i18n="ui_an_older_broad_aws_api_grant_keeps_working_until">An older broad AWS API grant keeps working until you explicitly tighten or revoke it. If Firefox keeps only the broad grant after a narrower request, use <strong data-i18n="ui_revoke" data-i18n-slot="1">Revoke</strong>, then <strong data-i18n="ui_allow_role_choices" data-i18n-slot="2">Allow role choices</strong> again. Opening Options, updating Containoodle, and switching modes do not migrate existing permissions.</p>
             <div class="actions">
-              <button type="button" id="role-discovery-grant">Allow role choices</button>
-              <button type="button" id="role-discovery-revoke">Revoke</button>
+              <button type="button" id="role-discovery-grant" data-i18n="ui_allow_role_choices">Allow role choices</button>
+              <button type="button" id="role-discovery-revoke" data-i18n="ui_revoke">Revoke</button>
             </div>
-            <p class="status" id="role-discovery-status" role="status" aria-live="polite">Checking permission…</p>
+            <p class="status" id="role-discovery-status" role="status" aria-live="polite" data-i18n="ui_checking_permission">Checking permission…</p>
           </div>
 
           <details class="settings-details" id="portal-region-settings">
             <summary>
-              <span>Advanced: SSO region override</span>
-              <small>Use only when automatic role lookup cannot detect it</small>
+              <span data-i18n="ui_advanced_sso_region_override">Advanced: SSO region override</span>
+              <small data-i18n="ui_use_only_when_automatic_role_lookup_cannot_detect_it">Use only when automatic role lookup cannot detect it</small>
             </summary>
             <div class="details-body">
               <div class="field">
-                <label class="field-label" for="sso-region">SSO region override</label>
+                <label class="field-label" for="sso-region" data-i18n="ui_sso_region_override">SSO region override</label>
                 <input
                   type="text"
                   id="sso-region"
                   placeholder="Leave blank for automatic detection"
                   spellcheck="false"
                   aria-describedby="sso-region-help"
-                >
-                <p class="hint" id="sso-region-help">This affects only role lookup for pinned accounts. Leave it blank unless automatic detection fails.</p>
+                 data-i18n-placeholder="ui_leave_blank_for_automatic_detection">
+                <p class="hint" id="sso-region-help" data-i18n="ui_this_affects_only_role_lookup_for_pinned_accounts_leave">This affects only role lookup for favorites. Leave it blank unless automatic detection fails.</p>
               </div>
               <div class="actions">
-                <button type="button" id="role-save">Save region override</button>
+                <button type="button" id="role-save" data-i18n="ui_save_region_override">Save region override</button>
               </div>
               <p class="status" id="role-settings-status" role="status" aria-live="polite"></p>
             </div>
@@ -235,20 +235,20 @@
       </details>
 
       <details class="settings-details" id="portal-privacy">
-        <summary>How portal access is used</summary>
+        <summary data-i18n="ui_how_portal_access_is_used">How portal access is used</summary>
         <div class="details-body">
-          <p class="hint">Containoodle copies your portal session cookie into the selected account container and verifies the copy before navigation. Optional sidebar role discovery sends that value directly to the AWS portal API. The value is never stored in extension storage or logged.</p>
-          <p class="hint">On the configured portal page, Containoodle reads the URL and displayed account name belonging to the console shortcut you click. It does not read forms, credentials, or the rest of the account list. Configuration stays in this Firefox profile.</p>
+          <p class="hint" data-i18n="ui_containoodle_copies_your_portal_session_cookie_into_the_selected">Containoodle copies your portal session cookie into the selected account container and verifies the copy before navigation. Optional sidebar role discovery sends that value directly to the AWS portal API. The value is never stored in extension storage or logged.</p>
+          <p class="hint" data-i18n="ui_on_the_configured_portal_page_containoodle_reads_the_url">On the configured portal page, Containoodle reads the URL and displayed account name belonging to the console shortcut you click. It does not read forms, credentials, or the rest of the account list. Configuration stays in this Firefox profile.</p>
         </div>
       </details>
     </section>
 
     <section id="group-naming" aria-labelledby="group-naming-heading">
-      <h2 id="group-naming-heading">Tab group names</h2>
-      <p class="section-intro">By default, Containoodle uses the original account name. Optionally transform automatic group titles with a JavaScript regular expression.</p>
+      <h2 id="group-naming-heading" data-i18n="ui_account_display_names">Account display names</h2>
+      <p class="section-intro" data-i18n="ui_use_one_javascript_regular_expression_for_sidebar_account_labels">Use one JavaScript regular expression for sidebar account labels, automatic container names, and automatic tab-group titles. It applies to all helper accounts and to open or favorite portal accounts.</p>
       <div class="form-grid">
         <div class="field">
-          <label class="field-label" for="group-name-pattern">Name regex</label>
+          <label class="field-label" for="group-name-pattern" data-i18n="ui_name_regex">Name regex</label>
           <input
             type="text"
             id="group-name-pattern"
@@ -257,10 +257,10 @@
             spellcheck="false"
             aria-describedby="group-name-pattern-help"
           >
-          <p class="hint" id="group-name-pattern-help">Enter the pattern without <code>/…/</code> delimiters. Leave it empty—or let it not match—to keep the original account name. Backtracking-prone constructs are rejected.</p>
+          <p class="hint" id="group-name-pattern-help" data-i18n="ui_enter_the_pattern_without_value_delimiters_leave_it_empty">Enter the pattern without <code data-i18n-slot="1">/…/</code> delimiters. Leave it empty—or let it not match—to keep the original account name. Backtracking-prone constructs are rejected.</p>
         </div>
         <div class="field">
-          <label class="field-label" for="group-name-replacement">Replacement</label>
+          <label class="field-label" for="group-name-replacement" data-i18n="ui_replacement">Replacement</label>
           <input
             type="text"
             id="group-name-replacement"
@@ -269,15 +269,15 @@
             spellcheck="false"
             aria-describedby="group-name-replacement-help"
           >
-          <p class="hint" id="group-name-replacement-help">Use <code>$1</code>, <code>$2</code>, or named captures such as <code>$&lt;name&gt;</code>. An empty or overlong result falls back to the original name.</p>
+          <p class="hint" id="group-name-replacement-help" data-i18n="ui_use_value_value_or_named_captures_such_as_value">Use <code data-i18n-slot="1">$1</code>, <code data-i18n-slot="2">$2</code>, or named captures such as <code data-i18n-slot="3">$&lt;name&gt;</code>. An empty or overlong result falls back to the original name.</p>
         </div>
       </div>
       <div class="actions">
-        <button type="button" id="group-name-save">Save naming rule</button>
-        <button type="button" id="group-name-reset">Reset existing titles to automatic</button>
+        <button type="button" id="group-name-save" data-i18n="ui_save_naming_rule">Save naming rule</button>
+        <button type="button" id="group-name-reset" data-i18n="ui_reset_tab_group_titles_to_automatic">Reset tab-group titles to automatic</button>
       </div>
       <p class="status" id="group-name-status" role="status" aria-live="polite"></p>
-      <p class="hint">Saving changes future automatic updates. Resetting removes existing Containoodle group-title overrides and recalculates those titles from the account names and the saved rule. Container names, sidebar labels, and environment colours are unchanged.</p>
+      <p class="hint" data-i18n="ui_saving_updates_sidebar_labels_and_automatic_container_and_tab">Saving updates sidebar labels and automatic container and tab-group names. Original account data, account IDs, sessions, and environment colours are unchanged. Manually renamed containers and tab groups keep their custom names. Resetting clears only tab-group title overrides and recalculates those titles from the saved rule; custom container names are not reset.</p>
     </section>
   </main>
 

@@ -1,0 +1,1061 @@
+{
+  "extension_description": {
+    "message": "Keep AWS console sessions separated in Firefox containers and organize their tabs by account.",
+    "description": "Extension description displayed by Firefox."
+  },
+  "toggle_sidebar": {
+    "message": "Toggle Containoodle sidebar",
+    "description": "Keyboard shortcut description."
+  },
+  "locale_code": {
+    "message": "en",
+    "description": "Language code for this catalog. Translate to the target language code."
+  },
+  "locale_direction": {
+    "message": "ltr",
+    "description": "Text direction for this catalog: ltr or rtl."
+  },
+  "ui_containoodle_settings": {
+    "message": "Containoodle settings",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_first_time_setup": {
+    "message": "First-time setup",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_start_here": {
+    "message": "Start here",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_choosing_a_method_only_selects_its_setup_panel_firefox": {
+    "message": "Choosing a method only selects its setup panel. Firefox asks for site access later, when you use that panel's explicit setup button.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_hide_this_guide_for_now": {
+    "message": "Hide this guide for now",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_connection_method": {
+    "message": "Connection method",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_choose_how_containoodle_opens_aws_console_sessions": {
+    "message": "Choose how Containoodle opens AWS console sessions",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_local_aws_cli_helper": {
+    "message": "Local AWS CLI helper",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_use_value_with_an_existing_aws_cli_sso_login": {
+    "message": "Use $value1$ with an existing AWS CLI SSO login when the access portal is unavailable.",
+    "description": "Interface text. Existing markup slots: $1 is code (server.py). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_aws_access_portal": {
+    "message": "AWS access portal",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_choose_an_account_and_role_in_the_portal_containoodle": {
+    "message": "Choose an account and role in the portal; Containoodle moves that console launch into its isolated container.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_containoodle_gets_accounts_and_sign_in_urls_from_the": {
+    "message": "Containoodle gets accounts and sign-in URLs from the helper running on this computer.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_helper_url": {
+    "message": "Helper URL",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_the_url_token_and_profile_are_replaced_only_after": {
+    "message": "The URL, token, and profile are replaced only after a successful test, which also refreshes the account list.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_helper_access_token": {
+    "message": "Helper access token",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_paste_the_token_from_server_py_show_token": {
+    "message": "Paste the token from server.py --show-token",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_run_value_to_print_the_helper_s_persistent_43": {
+    "message": "Run $value1$ to print the helper's persistent 43-character token. That command then exits, so start $value2$ separately. Paste the token here once; it is stored only in this Firefox profile and never redisplayed after saving. Leave this field blank to test with the token already stored.",
+    "description": "Interface text. Existing markup slots: $1 is code (python3 server.py --show-token). Keep each placeholder exactly once. $2 is code (python3 server.py). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      },
+      "value2": {
+        "content": "$2"
+      }
+    }
+  },
+  "ui_checking_saved_token": {
+    "message": "Checking saved token…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_aws_cli_profile": {
+    "message": "AWS CLI profile",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_optional_enter_the_local_profile_alias_used_with_value": {
+    "message": "Optional. Enter the local profile alias used with $value1$. Leave it blank only when the helper can identify one valid SSO login.",
+    "description": "Interface text. Existing markup slots: $1 is code (aws sso login --profile …). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_save_test": {
+    "message": "Save & test",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_not_tested_yet": {
+    "message": "Not tested yet",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_account_cache": {
+    "message": "Account cache",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_refresh_accounts": {
+    "message": "Refresh accounts",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_checking_cached_accounts": {
+    "message": "Checking cached accounts…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_the_helper_refreshes_this_browser_cache_from_value_edit": {
+    "message": "The helper refreshes this browser cache from $value1$; edit the source file to change backend accounts.",
+    "description": "Interface text. Existing markup slots: $1 is code (~/.aws/accounts.json). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_reuse_an_existing_console_session": {
+    "message": "Reuse an existing console session",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_offered_during_your_first_helper_setup": {
+    "message": "Offered during your first helper setup",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_when_enabled_containoodle_can_check_whether_this_account_s": {
+    "message": "When enabled, Containoodle can check whether this account's container is already signed in and reuse that session instead of starting another sign-in. It also suppresses the AWS cookie banner in new containers.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_on_your_first_local_helper_value_firefox_asks_once": {
+    "message": "On your first local-helper $value1$, Firefox asks once for access limited to $value2$. Accepting enables session reuse; declining does not block setup or normal backend launches. Containoodle will not ask automatically again, but you can use $value3$ below. Revoking access stops future checks but does not delete cookies already managed by Firefox.",
+    "description": "Interface text. Existing markup slots: $1 is strong (Save & test). Keep each placeholder exactly once. $2 is code (*.console.aws.amazon.com). Keep each placeholder exactly once. $3 is strong (Allow session reuse). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      },
+      "value2": {
+        "content": "$2"
+      },
+      "value3": {
+        "content": "$3"
+      }
+    }
+  },
+  "ui_allow_session_reuse": {
+    "message": "Allow session reuse",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_an_older_broad_aws_grant_keeps_working_until_you": {
+    "message": "An older broad AWS grant keeps working until you explicitly tighten or revoke it. If Firefox says the broad grant still covers a narrower request, use $value1$, then $value2$ again. Opening Options, updating Containoodle, and switching modes do not migrate existing permissions.",
+    "description": "Interface text. Existing markup slots: $1 is strong (Revoke). Keep each placeholder exactly once. $2 is strong (Allow session reuse). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      },
+      "value2": {
+        "content": "$2"
+      }
+    }
+  },
+  "ui_revoke": {
+    "message": "Revoke",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_checking_permission": {
+    "message": "Checking permission…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_sign_in_normally_then_choose_an_account_and_role": {
+    "message": "Sign in normally, then choose an account and role. No local helper or AWS CLI is required.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_start_url": {
+    "message": "Portal start URL",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_grant_access_save": {
+    "message": "Grant access & save",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_firefox_will_ask_for_access_only_to_this_exact": {
+    "message": "Firefox will ask for access only to this exact portal origin. Optional role choices for favorite sidebar accounts are managed separately below.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_readiness": {
+    "message": "Portal readiness",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_refresh_status": {
+    "message": "Refresh status",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_open_portal": {
+    "message": "Open portal",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_checking_portal_access": {
+    "message": "Checking portal access…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_containoodle_needs_permission_for_this_portal_and_a_signed": {
+    "message": "Containoodle needs permission for this portal and a signed-in portal session before it can hand off a launch.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_pinned_sidebar_accounts": {
+    "message": "Sidebar favorites",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_keep_portal_accounts_as_direct_launch_shortcuts": {
+    "message": "Keep portal accounts as direct-launch shortcuts",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_open_an_account_from_the_aws_access_portal_then": {
+    "message": "Open an account from the AWS access portal, then choose ☆ on its active row in the Containoodle sidebar. It changes to ★ and keeps the account as a direct-launch shortcut after its tabs are closed. Choosing ★ again removes only the shortcut.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_pinned_accounts_belong_only_to_portal_mode_backend_accounts": {
+    "message": "These favorites belong only to portal mode. Helper-mode favorites are saved separately from accounts supplied by the local helper.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_pinned_accounts": {
+    "message": "Favorites",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_checking_pinned_accounts": {
+    "message": "Checking favorites…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_role_choices_for_pinned_accounts": {
+    "message": "Role choices for favorites",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_allow_this_only_if_you_want_containoodle_to_ask": {
+    "message": "Allow this only if you want Containoodle to ask the AWS access portal which roles you can choose when launching or changing a favorite. Firefox asks only for the detected regional $value1$ endpoint. Saving favorites and normal portal clicks work without it.",
+    "description": "Interface text. Existing markup slots: $1 is code (portal.sso.<region>.amazonaws.com). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_an_older_broad_aws_api_grant_keeps_working_until": {
+    "message": "An older broad AWS API grant keeps working until you explicitly tighten or revoke it. If Firefox keeps only the broad grant after a narrower request, use $value1$, then $value2$ again. Opening Options, updating Containoodle, and switching modes do not migrate existing permissions.",
+    "description": "Interface text. Existing markup slots: $1 is strong (Revoke). Keep each placeholder exactly once. $2 is strong (Allow role choices). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      },
+      "value2": {
+        "content": "$2"
+      }
+    }
+  },
+  "ui_allow_role_choices": {
+    "message": "Allow role choices",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_advanced_sso_region_override": {
+    "message": "Advanced: SSO region override",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_use_only_when_automatic_role_lookup_cannot_detect_it": {
+    "message": "Use only when automatic role lookup cannot detect it",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_sso_region_override": {
+    "message": "SSO region override",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_leave_blank_for_automatic_detection": {
+    "message": "Leave blank for automatic detection",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_this_affects_only_role_lookup_for_pinned_accounts_leave": {
+    "message": "This affects only role lookup for favorites. Leave it blank unless automatic detection fails.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_save_region_override": {
+    "message": "Save region override",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_how_portal_access_is_used": {
+    "message": "How portal access is used",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_containoodle_copies_your_portal_session_cookie_into_the_selected": {
+    "message": "Containoodle copies your portal session cookie into the selected account container and verifies the copy before navigation. Optional sidebar role discovery sends that value directly to the AWS portal API. The value is never stored in extension storage or logged.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_on_the_configured_portal_page_containoodle_reads_the_url": {
+    "message": "On the configured portal page, Containoodle reads the URL and displayed account name belonging to the console shortcut you click. It does not read forms, credentials, or the rest of the account list. Configuration stays in this Firefox profile.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_account_display_names": {
+    "message": "Account display names",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_use_one_javascript_regular_expression_for_sidebar_account_labels": {
+    "message": "Use one JavaScript regular expression for sidebar account labels, automatic container names, and automatic tab-group titles. It applies to all helper accounts and to open or favorite portal accounts.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_name_regex": {
+    "message": "Name regex",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_enter_the_pattern_without_value_delimiters_leave_it_empty": {
+    "message": "Enter the pattern without $value1$ delimiters. Leave it empty—or let it not match—to keep the original account name. Backtracking-prone constructs are rejected.",
+    "description": "Interface text. Existing markup slots: $1 is code (/…/). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_replacement": {
+    "message": "Replacement",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_use_value_value_or_named_captures_such_as_value": {
+    "message": "Use $value1$, $value2$, or named captures such as $value3$. An empty or overlong result falls back to the original name.",
+    "description": "Interface text. Existing markup slots: $1 is code ($1). Keep each placeholder exactly once. $2 is code ($2). Keep each placeholder exactly once. $3 is code ($<name>). Keep each placeholder exactly once.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      },
+      "value2": {
+        "content": "$2"
+      },
+      "value3": {
+        "content": "$3"
+      }
+    }
+  },
+  "ui_save_naming_rule": {
+    "message": "Save naming rule",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_reset_tab_group_titles_to_automatic": {
+    "message": "Reset tab-group titles to automatic",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_saving_updates_sidebar_labels_and_automatic_container_and_tab": {
+    "message": "Saving updates sidebar labels and automatic container and tab-group names. Original account data, account IDs, sessions, and environment colours are unchanged. Manually renamed containers and tab groups keep their custom names. Resetting clears only tab-group title overrides and recalculates those titles from the saved rule; custom container names are not reset.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_containoodle_isolated_aws_console_sessions_in_firefox": {
+    "message": "Containoodle — isolated AWS console sessions in Firefox",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_aws_portal": {
+    "message": "↗ AWS Portal",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_set_the_portal_url_in_options_first": {
+    "message": "Set the portal URL in Options first.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_set_up_containoodle": {
+    "message": "Set up Containoodle",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_choose_how_containoodle_should_open_aws_console_sessions": {
+    "message": "Choose how Containoodle should open AWS console sessions.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_open_setup": {
+    "message": "Open setup",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_loading": {
+    "message": "Loading…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_connecting": {
+    "message": "Connecting…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_containoodle_options": {
+    "message": "Containoodle options",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_refresh": {
+    "message": "Refresh",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_one_account_cached": {
+    "message": "$value1$ account cached · from local helper",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_many_accounts_cached": {
+    "message": "$value1$ accounts cached · from local helper",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_cache_updated": {
+    "message": "$value1$ · updated $value2$",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      },
+      "value2": {
+        "content": "$2"
+      }
+    }
+  },
+  "ui_one_pinned_account": {
+    "message": "$value1$ favorite available in the sidebar",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_many_pinned_accounts": {
+    "message": "$value1$ favorites available in the sidebar",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_no_accounts_pinned_yet_open_one_from_the_portal": {
+    "message": "No favorites yet — open an account from the portal, then choose ☆ in the sidebar",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_could_not_reset_tab_group_titles": {
+    "message": "Could not reset tab group titles",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_existing_tab_group_titles_reset_to_automatic_naming": {
+    "message": "Existing tab group titles reset to automatic naming",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_could_not_save_account_display_naming": {
+    "message": "Could not save account display naming",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_account_display_naming_saved": {
+    "message": "Account display naming saved",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_sso_region_override_saved": {
+    "message": "SSO region override saved",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_invalid_sso_region_expected_e_g_eu_west_1": {
+    "message": "Invalid SSO region (expected e.g. eu-west-1)",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_sign_in_and_refresh_readiness_before_allowing_role_choices": {
+    "message": "Sign in and refresh readiness before allowing role choices",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_permission_change_failed": {
+    "message": "Permission change failed",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_could_not_open_portal": {
+    "message": "Could not open portal",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_could_not_save_portal_access_value": {
+    "message": "Could not save portal access: $value1$",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_permission_was_declined_portal_url_was_not_saved": {
+    "message": "Permission was declined · portal URL was not saved",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_permission_was_declined_the_existing_portal_is_unchanged": {
+    "message": "Permission was declined · the existing portal is unchanged",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_could_not_inspect_portal_readiness": {
+    "message": "Could not inspect portal readiness",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_access_and_source_session_detected_each_launch_verifies": {
+    "message": "Portal access and source session detected · each launch verifies its container copy",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_access_granted_sign_in_required": {
+    "message": "Portal access granted · sign in required",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_url_saved_portal_permission_not_granted": {
+    "message": "Portal URL saved · portal permission not granted",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_url_not_configured": {
+    "message": "Portal URL not configured",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_connection_is_ready_but_setup_status_could_not_be": {
+    "message": "Connection is ready, but setup status could not be saved",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_could_not_inspect_console_permission": {
+    "message": "Could not inspect console permission",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_firefox_kept_the_older_broad_grant_revoke_then_allow": {
+    "message": "Firefox kept the older broad grant · revoke, then allow again to finish tightening",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_permission_request_failed": {
+    "message": "Permission request failed",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_permission_was_declined": {
+    "message": "Permission was declined",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_disabled_normal_backend_launches_still_work": {
+    "message": "Disabled — normal backend launches still work",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_enabled_repeated_backend_launches_can_reuse_a_signed_in": {
+    "message": "Enabled — repeated backend launches can reuse a signed-in session",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_enabled_with_older_broad_access_tighten_it_without_blocking": {
+    "message": "Enabled with older broad access · tighten it without blocking normal launches",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_enabled_finish_tightening_to_remove_older_broad_access": {
+    "message": "Enabled · finish tightening to remove older broad access",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_tighten_access": {
+    "message": "Tighten access",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_finish_tightening": {
+    "message": "Finish tightening",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_not_allowed_pinning_and_normal_portal_clicks_still_work": {
+    "message": "Not allowed — pinning and normal portal clicks still work",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_allowed_containoodle_can_load_role_choices_for_pinned_accounts": {
+    "message": "Allowed — Containoodle can load role choices for favorites",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_allowed_with_older_broad_access_tighten_it_without_affecting": {
+    "message": "Allowed with older broad access · tighten it without affecting portal clicks",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_allowed_finish_tightening_to_remove_older_broad_access": {
+    "message": "Allowed · finish tightening to remove older broad access",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_session_detected_but_the_sso_region_could_not": {
+    "message": "Portal session detected, but the SSO region could not be detected · set it under Advanced: SSO region override",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_existing_role_access_is_still_granted_sign_in_and": {
+    "message": "Existing role access is still granted · sign in and refresh to tighten it, or revoke it now",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_a_previously_granted_role_access_permission_is_still_stored": {
+    "message": "A previously granted role-access permission is still stored · set the SSO region below to tighten it, or revoke it now",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_local_helper_is_unreachable": {
+    "message": "Local helper is unreachable",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_helper_authentication_failed": {
+    "message": "Helper authentication failed",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_the_helper_access_token_was_rejected": {
+    "message": "The helper access token was rejected",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_connected_to_local_helper_value_accounts_refreshed": {
+    "message": "Connected to local helper · $value1$ accounts refreshed",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_helper_connected_but_the_account_cache_could_not_be": {
+    "message": "Helper connected, but the account cache could not be updated",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_connection_settings_changed_elsewhere_review_them_and_try_again": {
+    "message": "Connection settings changed elsewhere · review them and try again",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_helper_connected_but_settings_could_not_be_saved": {
+    "message": "Helper connected, but settings could not be saved",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_local_helper_returned_an_unexpected_response": {
+    "message": "Local helper returned an unexpected response",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_local_helper_returned_http_value": {
+    "message": "Local helper returned HTTP $value1$",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_the_local_helper_rejected_this_request": {
+    "message": "The local helper rejected this request",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_authentication_failed": {
+    "message": "Authentication failed",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_refreshing_accounts": {
+    "message": "Refreshing accounts…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_testing_local_helper": {
+    "message": "Testing local helper…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_helper_access_token_required": {
+    "message": "Helper access token required",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_no_helper_access_token_is_stored": {
+    "message": "No helper access token is stored",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_enter_the_43_character_token_from_server_py_show": {
+    "message": "Enter the 43-character token from server.py --show-token",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_the_helper_access_token_is_invalid": {
+    "message": "The helper access token is invalid",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_a_helper_access_token_is_stored": {
+    "message": "A helper access token is stored",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_no_accounts_cached": {
+    "message": "No accounts cached",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_could_not_save_the_connection_method": {
+    "message": "Could not save the connection method",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_aws_access_portal_is_selected_enter_its_start_url": {
+    "message": "AWS access portal is selected. Enter its start URL, grant that exact site access, then sign in and refresh readiness.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_local_helper_is_selected_start_server_py_enter_its": {
+    "message": "Local helper is selected. Start server.py, enter its URL and access token, then choose Save & test.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_choose_local_aws_cli_helper_or_aws_access_portal": {
+    "message": "Choose Local AWS CLI helper or AWS access portal below. Containoodle will then show only the setup you need.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_failed_value": {
+    "message": "Failed: $value1$",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_no_response": {
+    "message": "no response",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_value_click_here_to_open_settings": {
+    "message": "$value1$ — click here to open settings",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_no_portal_session_click_here_to_sign_in": {
+    "message": "No portal session — click here to sign in",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_loading_roles_for_value": {
+    "message": "Loading roles for $value1$…",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_value_pick_a_role": {
+    "message": "$value1$: pick a role",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_opened_value": {
+    "message": "Opened $value1$",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_opening_value": {
+    "message": "Opening $value1$…",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_could_not_open_aws_portal_value": {
+    "message": "Could not open AWS Portal: $value1$",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_could_not_open_aws_portal": {
+    "message": "Could not open AWS Portal",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_aws_portal_ready": {
+    "message": "AWS Portal ready",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_opening_aws_portal": {
+    "message": "Opening AWS Portal…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_set_the_aws_access_portal_url_in_options_first": {
+    "message": "Set the AWS Access Portal URL in Options first",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_could_not_update_pin_value": {
+    "message": "Could not update favorite: $value1$",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_unpinned_value": {
+    "message": "Removed $value1$ from favorites",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_pinned_value": {
+    "message": "Added $value1$ to favorites",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_pin_update_failed": {
+    "message": "Favorite update failed",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_close_tab": {
+    "message": "Close tab",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_dismiss": {
+    "message": "Dismiss",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_launch_in_container": {
+    "message": "Launch in container",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_close_all_tabs": {
+    "message": "Close all tabs",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_pin_value": {
+    "message": "Add $value1$ to favorites",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_unpin_value": {
+    "message": "Remove $value1$ from favorites",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_pin_account": {
+    "message": "Add to favorites",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_unpin_account": {
+    "message": "Remove from favorites",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_remembered_backend_role_click_to_change": {
+    "message": "Remembered backend role — click to change",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_last_role_selected_in_the_aws_portal": {
+    "message": "Last role selected in the AWS portal",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_role_pinned_in_the_accounts_list": {
+    "message": "Role pinned in the accounts list",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_pinned_role_click_to_change": {
+    "message": "Pinned role — click to change",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_no_matches": {
+    "message": "No matches",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_filter_other_accounts": {
+    "message": "Filter other accounts…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_other_accounts_value": {
+    "message": "Other accounts ($value1$)",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_filter_pinned_accounts": {
+    "message": "Filter favorites…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_pinned_accounts_value": {
+    "message": "Favorites ($value1$)",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_filter_active": {
+    "message": "Filter active…",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_aws_console_containers": {
+    "message": "AWS Console Containers",
+    "description": "Small product-purpose subtitle below Containoodle in the sidebar."
+  },
+  "ui_open_tabs_now": {
+    "message": "Open tabs now",
+    "description": "Explains the Active section: accounts with open tabs, not proof of an authenticated AWS session."
+  },
+  "ui_saved_shortcuts_no_open_tabs": {
+    "message": "Saved shortcuts · no open tabs",
+    "description": "Explains Favorites: saved accounts without open tabs. An open favorite appears only in Active."
+  },
+  "ui_active_value": {
+    "message": "Active ($value1$)",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_set_the_aws_access_portal_url_in_containoodle_options": {
+    "message": "Set the AWS Access Portal URL in Containoodle Options first",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_focus_the_aws_access_portal_tab_or_open_it": {
+    "message": "Focus the AWS Access Portal tab, or open it",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_containoodle_offline": {
+    "message": "Containoodle offline",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_offline_value_cached": {
+    "message": "Offline · $value1$ cached",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_connected_value_accounts": {
+    "message": "Connected · $value1$ accounts",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_helper_access_token_rejected": {
+    "message": "Helper access token rejected",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_value_pinned": {
+    "message": "Portal · $value1$ favorites",
+    "description": "Options/sidebar interface text.",
+    "placeholders": {
+      "value1": {
+        "content": "$1"
+      }
+    }
+  },
+  "ui_portal_ready": {
+    "message": "Portal · ready",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_portal_not_configured": {
+    "message": "Portal · not configured",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_local_helper_access_token_was_rejected": {
+    "message": "Local helper access token was rejected",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_local_helper_access_token_is_missing_or_invalid": {
+    "message": "Local helper access token is missing or invalid",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_setup_required": {
+    "message": "Setup required",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_add_your_aws_access_portal_and_confirm_it_is": {
+    "message": "Add your AWS access portal and confirm it is ready before opening accounts.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_finish_portal_setup": {
+    "message": "Finish portal setup",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_connect_and_test_the_local_aws_cli_helper_before": {
+    "message": "Connect and test the local AWS CLI helper before opening accounts.",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_finish_helper_setup": {
+    "message": "Finish helper setup",
+    "description": "Options/sidebar interface text."
+  },
+  "ui_local_helper_timed_out_check_server_py_and_try_again": {
+    "message": "Local helper timed out. Check server.py and try again.",
+    "description": "Shown when a complete local-helper request exceeds the request deadline. Keep the server.py filename unchanged."
+  },
+  "ui_change_role_for_value_current_value": {
+    "message": "Change role for $account$; current role $role$",
+    "description": "Accessible label for the role picker button. Account and role are user data; do not translate them.",
+    "placeholders": { "account": { "content": "$1" }, "role": { "content": "$2" } }
+  },
+  "ui_close_all_tabs_for_value": {
+    "message": "Close all tabs for $account$",
+    "description": "Accessible label for the button that closes all tabs belonging to an account.",
+    "placeholders": { "account": { "content": "$1" } }
+  },
+  "ui_launch_value_in_container": {
+    "message": "Launch $account$ in its container",
+    "description": "Accessible label for an account launch button.",
+    "placeholders": { "account": { "content": "$1" } }
+  },
+  "ui_choose_role_for_value": {
+    "message": "Choose a role for $account$",
+    "description": "Accessible label for the group of role-choice buttons.",
+    "placeholders": { "account": { "content": "$1" } }
+  },
+  "ui_dismiss_role_choices_for_value": {
+    "message": "Dismiss role choices for $account$",
+    "description": "Accessible label for closing an inline role picker without launching anything.",
+    "placeholders": { "account": { "content": "$1" } }
+  },
+  "ui_switch_to_tab_value": {
+    "message": "Switch to tab: $title$",
+    "description": "Accessible label for focusing a Firefox tab. The title is user data.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "ui_close_tab_value": {
+    "message": "Close tab: $title$",
+    "description": "Accessible label for closing one Firefox tab. The title is user data.",
+    "placeholders": { "title": { "content": "$1" } }
+  }
+}

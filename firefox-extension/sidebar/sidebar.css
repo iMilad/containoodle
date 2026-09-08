@@ -11,7 +11,7 @@
 
   --text-primary:   #f0f4fc;
   --text-secondary: #8b96b0;
-  --text-muted:     #4a5568;
+  --text-muted:     #929db3;
 
   --accent:        #6366f1;
   --accent-glow:   rgba(99, 102, 241, 0.3);
@@ -26,7 +26,7 @@
   --env-dev:  #34d399;
   --env-qa:   #fbbf24;
   --env-prod: #f87171;
-  --env-test: #6b7280;
+  --env-test: #929db3;
 
   --border:      rgba(255, 255, 255, 0.06);
   --border-hover: rgba(99, 102, 241, 0.3);
@@ -40,6 +40,24 @@
 
 /* ── Reset ────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent-light);
+  outline-offset: 2px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
 
 html, body {
   height: 100%;
@@ -70,15 +88,42 @@ header {
   font-weight: 700;
   letter-spacing: -0.01em;
   display: flex;
-  align-items: center;
+  flex-wrap: wrap;
+  align-items: flex-start;
   gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .brand-icon {
   width: 18px;
   height: 18px;
+  flex-shrink: 0;
   border-radius: 4px;
+  margin-top: 1px;
   filter: drop-shadow(0 0 6px var(--accent-glow));
+}
+
+.brand-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.brand-name-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+}
+
+.brand-subtitle {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
+  color: var(--text-secondary);
 }
 
 .brand-version {
@@ -244,7 +289,13 @@ header {
 #notification.success { background: rgba(52, 211, 153, 0.12); color: var(--success); }
 #notification.info    { background: rgba(99, 102, 241, 0.12); color: var(--accent-light); }
 
-#notification.clickable {
+.notification-action {
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  width: 100%;
   cursor: pointer;
   text-decoration: underline;
 }
@@ -265,9 +316,9 @@ header {
 }
 
 .section.section-active {
-  background: linear-gradient(180deg, rgba(255, 153, 0, 0.06) 0%, rgba(255, 153, 0, 0) 100%);
-  border-top: 1px solid rgba(255, 153, 0, 0.18);
-  border-bottom: 1px solid rgba(255, 153, 0, 0.18);
+  background: linear-gradient(180deg, rgba(129, 140, 248, 0.09), transparent);
+  border-inline-start: 2px solid var(--accent-light);
+  border-bottom: 1px solid rgba(129, 140, 248, 0.18);
   padding-bottom: 6px;
   margin-bottom: 8px;
 }
@@ -277,9 +328,11 @@ header {
 }
 
 .section.section-pinned {
-  margin: 4px 0 8px;
-  padding-bottom: 4px;
-  border-bottom: 1px solid var(--border);
+  margin: 12px 6px;
+  padding: 2px 0 6px;
+  border: 1px solid rgba(255, 153, 0, 0.24);
+  border-radius: 8px;
+  background: rgba(255, 153, 0, 0.035);
 }
 
 .section-pinned .section-header {
@@ -288,44 +341,78 @@ header {
 
 /* ── Section headers ──────────────────────────────────────────── */
 .section-header {
-  padding: 8px 12px 4px;
+  width: 100%;
+  border: none;
+  background: none;
+  font-family: inherit;
+  text-align: start;
+  padding: 8px 10px 6px;
   font-size: 10px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
   color: var(--text-muted);
   cursor: pointer;
   user-select: none;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 7px;
   transition: color var(--transition);
 }
 
 .section-active .section-header {
-  color: var(--aws-orange);
-  font-size: 11px;
-  letter-spacing: 0.1em;
+  color: #a5b4fc;
   padding-top: 10px;
 }
 
-.section-active .section-header::before {
-  content: "●";
-  font-size: 8px;
-  color: var(--aws-orange);
-  filter: drop-shadow(0 0 4px rgba(255, 153, 0, 0.6));
-  margin-right: 2px;
+.section-symbol {
+  flex: 0 0 14px;
+  font-size: 13px;
+  text-align: center;
+}
+
+.section-active .section-symbol {
+  font-size: 9px;
+}
+
+.section-heading {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.section-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.section-description {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 400;
+  line-height: 1.4;
 }
 
 .section-header:hover {
   color: var(--text-secondary);
 }
 
+.section-header:focus-visible {
+  outline-offset: -2px;
+}
+
 .section-active .section-header:hover {
+  color: #c7d2fe;
+}
+
+.section-pinned .section-header:hover {
   color: #ffb84d;
 }
 
 .section-chevron {
+  flex: 0 0 auto;
   font-size: 7px;
   transition: transform 150ms ease;
   display: inline-block;
@@ -456,15 +543,25 @@ header {
 .env-badge-test { color: var(--env-test); background: rgba(107, 114, 128, 0.20); }
 
 .account-id {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 6px;
   font-size: 10px;
   color: var(--text-secondary);
   font-family: var(--mono);
   letter-spacing: 0.02em;
+  overflow-wrap: anywhere;
 }
 
 /* Role chip — pinned role (static) or remembered pick (clickable) */
 .role-chip {
-  margin-left: 6px;
+  display: inline-block;
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
   font-family: var(--mono);
   font-size: 9px;
   color: var(--text-muted);
@@ -525,7 +622,8 @@ header {
   background: var(--aws-orange-dim);
 }
 
-.pin-btn:disabled {
+.pin-btn:disabled,
+.pin-btn[aria-disabled="true"] {
   opacity: 0.45;
   cursor: wait;
 }
@@ -539,6 +637,11 @@ header {
 }
 
 .role-option {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -594,7 +697,8 @@ header {
   flex-shrink: 0;
 }
 
-.account-header:hover .launch-btn {
+.account-header:hover .launch-btn,
+.account-header:focus-within .launch-btn {
   opacity: 1;
 }
 
@@ -623,7 +727,8 @@ header {
   flex-shrink: 0;
 }
 
-.account-header:hover .close-all-btn {
+.account-header:hover .close-all-btn,
+.account-header:focus-within .close-all-btn {
   opacity: 1;
 }
 
@@ -639,13 +744,29 @@ header {
 .tab-item {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 6px;
+  gap: 2px;
+  padding: 0 4px 0 0;
   border-radius: 4px;
   cursor: pointer;
   font-size: 11px;
   color: var(--text-secondary);
   transition: background var(--transition), color var(--transition);
+}
+
+.tab-switch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
 }
 
 .tab-item:hover {
@@ -655,9 +776,9 @@ header {
 
 .tab-item.is-active {
   color: #fff;
-  background: linear-gradient(90deg, var(--accent) 0%, #4f46e5 100%);
+  background: linear-gradient(90deg, #5b5fe5 0%, #4f46e5 100%);
   border-left: 3px solid #c7d2fe;
-  padding-left: 5px;
+  padding-left: 0;
   font-weight: 600;
   box-shadow: 0 2px 8px rgba(99, 102, 241, 0.45);
 }
@@ -680,19 +801,44 @@ header {
   color: #fff;
 }
 
+.tab-item.is-active .tab-switch:focus-visible,
+.tab-item.is-active .tab-close:focus-visible {
+  outline-color: #fff;
+  outline-offset: -2px;
+}
+
 .tab-favicon {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 2px;
   flex-shrink: 0;
   object-fit: contain;
 }
 
-.tab-favicon-placeholder {
-  font-size: 12px;
-  flex-shrink: 0;
-  width: 14px;
-  text-align: center;
+.tab-favicon-slot {
+  position: relative;
+  display: block;
+  pointer-events: none;
+}
+
+.tab-favicon-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.tab-favicon-slot.is-fallback::before {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  opacity: 0.45;
+}
+
+.tab-favicon-slot.is-fallback .tab-favicon-image {
+  opacity: 0;
 }
 
 .tab-title {
@@ -715,7 +861,8 @@ header {
   flex-shrink: 0;
 }
 
-.tab-item:hover .tab-close { opacity: 1; }
+.tab-item:hover .tab-close,
+.tab-item:focus-within .tab-close { opacity: 1; }
 .tab-close:hover { color: var(--error); }
 
 /* ── Loading state ────────────────────────────────────────────── */
@@ -747,8 +894,10 @@ header {
 /* ── Footer ───────────────────────────────────────────────────── */
 footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
+  gap: 6px;
   padding: 6px 10px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
@@ -756,10 +905,13 @@ footer {
 
 #status {
   display: flex;
+  flex: 1 1 120px;
+  min-width: 0;
   align-items: center;
   gap: 6px;
   font-size: 10px;
   color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 #status-text.setup {
@@ -768,6 +920,7 @@ footer {
 }
 
 .dot {
+  flex-shrink: 0;
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -779,6 +932,8 @@ footer {
 
 .footer-buttons {
   display: flex;
+  flex: 0 0 auto;
+  margin-inline-start: auto;
   align-items: center;
   gap: 6px;
 }
@@ -813,6 +968,30 @@ footer {
   animation: spin 0.6s linear;
 }
 
+/* In a narrow/zoomed sidebar, keep details above the action buttons instead
+   of allowing fixed-size controls to squeeze account names down to zero.
+   DOM order and all existing keyboard/click handlers stay unchanged. */
+@media (max-width: 280px) {
+  .account-header {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .account-info {
+    flex: 1 0 calc(100% - 13px); /* 7px dot plus the 6px gap */
+  }
+
+  .account-name-row {
+    flex-wrap: wrap;
+  }
+
+  .account-name {
+    flex: 1 1 7rem;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
 /* ── Animations ───────────────────────────────────────────────── */
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -823,7 +1002,8 @@ footer {
     border-color: CanvasText;
   }
 
-  #onboarding-open-setup:focus-visible {
+  button:focus-visible,
+  input:focus-visible {
     outline-color: Highlight;
   }
 

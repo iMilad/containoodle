@@ -1,6 +1,6 @@
 # Containoodle privacy policy
 
-Effective date: 25 August 2026
+Effective date: 8 September 2026
 
 Containoodle has no advertising, analytics, telemetry, or hosted service. The
 developer does not receive your configuration, account information, browsing
@@ -16,7 +16,7 @@ activity, and website content.
 - The exact AWS Access Portal URL you configure.
 - AWS account IDs, displayed account names, roles, regions, and the account or role
   shortcut you choose.
-- URLs, titles, and locally available icons for tabs in Firefox containers, used to
+- URLs, titles, and browser-reported favicons for tabs in Firefox containers, used to
   render and organize the sidebar.
 - The AWS portal authentication cookie needed to open the selected account in its
   Firefox container.
@@ -51,11 +51,25 @@ non-loopback helper addresses and responses that do not carry a valid proof.
 No data is sold, used for advertising or profiling, or sent to a Containoodle-operated
 server.
 
+For sidebar favicons, Containoodle uses the original image reported by Firefox.
+Embedded or extension-local images need no network request. For an AWS console
+tab, it may fetch a static image from an AWS console or `awsstatic.com` host.
+These requests omit cookies and referrers, refuse redirects and query-string
+URLs, and do not carry helper or AWS authentication values. AWS still receives
+the image URL and ordinary connection information such as your IP address.
+There is no third-party favicon lookup service. If the image cannot be fetched
+anonymously, a neutral placeholder appears; Containoodle does not request broader
+permissions or retry with authentication. This does not change session launches.
+
 ## Storage and retention
 
 Extension preferences and account metadata remain in this Firefox profile in
 `browser.storage.local` until changed or until the add-on's local data is removed.
 Containoodle does not use browser sync.
+
+Fetched favicons are held only in a bounded in-memory cache while the sidebar
+document is open, not in extension storage. Successful entries expire after
+five minutes; failed requests are held for 30 seconds to avoid repeated retries.
 
 The extension's helper access token, optional AWS CLI profile alias, and opaque SSO
 identity key also remain in `browser.storage.local`; they are not browser-synced.
