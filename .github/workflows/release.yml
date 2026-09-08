@@ -48,6 +48,12 @@ jobs:
       - name: Build and verify reproducible XPI
         run: npm run build:ext
 
+      - name: Publish the tagged privacy disclosure to the existing AMO listing
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: node scripts/sync-amo-privacy.mjs --publish
+
       # Submit the same tagged version to the existing public AMO listing.
       # AMO performs validation and review; listed releases are installed
       # and updated through addons.mozilla.org rather than a GitHub XPI.

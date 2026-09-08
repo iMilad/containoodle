@@ -35,12 +35,15 @@ or Firefox signature settings to install it.
 ## Validation and scope
 
 The maintainer reported a successful test and authorized release on 2026-09-08.
-Local release gates passed 412 JavaScript and 114 Python tests, extension lint
+Local release gates passed 416 JavaScript and 114 Python tests, extension lint
 with zero findings, and byte-for-byte reproducible packaging. The accepted local
 XPI SHA-256 is `449492d64c861808176530c981702fe86b6c7c8d878a37205631ed9b0d14e5a7`.
 Actual Firefox 155.0.1 and Developer Edition 156 each passed 29 synthetic/offline
 check groups. This is not an independent assertion that every live AWS workflow
 or signed in-place update has been verified.
+
+Release automation also publishes the tagged privacy disclosure to the existing
+AMO listing. Its four additional synthetic tests do not change the accepted XPI.
 
 The full dependency audit retains two explicitly contained build-only upstream
 advisories, expiring 2026-10-05. These dependencies are not shipped in the XPI;

@@ -30,6 +30,11 @@ not sign, upload, publish, or contact AMO. CI tests Python 3.10 and 3.14 separat
 the tag-release workflow reuses those CI gates before publication. A pull request
 should pass those checks too. Match manifest, package, and lockfile versions.
 
+The tagged release also synchronizes `PRIVACY.md` to Containoodle's existing AMO
+privacy-policy field before submission. This release-only step uses the existing
+GitHub signing secrets without printing them and changes no EULA or other listing
+metadata. It refuses a mismatched tag/add-on identity; local tests mock its requests.
+
 Account validation fixtures are shared between JavaScript and Python. Helper tests
 must keep account/config/cache paths, AWS CLI subprocesses, and federation/network
 access isolated from the developer's real environment.
