@@ -4,8 +4,10 @@ import io
 import json
 import os
 import runpy
+import socket
 import tempfile
 import threading
+import traceback
 import unittest
 import urllib.error
 import urllib.parse
@@ -16,6 +18,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import server
+
+
+REAL_HELPER_SERVER = server.ContainoodleHTTPServer
 
 
 TEST_ACCOUNT_ID = "0" * 12
@@ -75,8 +80,8 @@ def setUpModule():
             side_effect=AssertionError("unexpected federation request"),
         ),
         patch.object(
-            server.http.server,
-            "HTTPServer",
+            server,
+            "ContainoodleHTTPServer",
             side_effect=AssertionError("unexpected server socket creation"),
         ),
     ])
@@ -101,8 +106,8 @@ class FakeUrlResponse:
     def __exit__(self, exc_type, exc_value, traceback):
         return False
 
-    def read(self):
-        return self.payload
+    def read(self, size=-1):
+        return self.payload if size < 0 else self.payload[:size]
 
 
 class RecordingHandler(server.ContainoodleHandler):
@@ -362,6 +367,31 @@ class HelperTokenFileTests(unittest.TestCase):
 
 
 class HelperStartupTests(unittest.TestCase):
+    def test_missing_or_invalid_accounts_fail_safely_before_binding(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            accounts_file = Path(temporary_directory) / "accounts.json"
+            cases = (
+                (None, "accounts.json not found"),
+                ('{"__CONTAINOODLE_TEST_PRIVATE_VALUE__":', "accounts.json is invalid"),
+                ('{}', "accounts.json must contain an array of accounts"),
+            )
+            for document, expected_message in cases:
+                if document is not None:
+                    accounts_file.write_text(document, encoding="utf-8")
+                with (
+                    self.subTest(message=expected_message),
+                    patch.object(server, "ACCOUNTS_FILE", accounts_file),
+                    patch.object(server, "_load_or_create_helper_token", return_value=TEST_HELPER_TOKEN),
+                    patch.object(server, "ContainoodleHTTPServer") as http_server,
+                    patch("builtins.print") as print_message,
+                ):
+                    result = server.main([])
+                self.assertEqual(result, 1)
+                http_server.assert_not_called()
+                print_message.assert_called_once_with(
+                    f"Accounts unavailable: {expected_message}", file=server.sys.stderr,
+                )
+
     def test_invalid_token_state_fails_before_binding_the_server(self):
         with (
             patch.object(
@@ -369,7 +399,7 @@ class HelperStartupTests(unittest.TestCase):
                 "_load_or_create_helper_token",
                 side_effect=RuntimeError("synthetic token failure"),
             ),
-            patch.object(server.http.server, "HTTPServer") as http_server,
+            patch.object(server, "ContainoodleHTTPServer") as http_server,
             patch("builtins.print") as print_message,
         ):
             result = server.main([])
@@ -390,7 +420,7 @@ class HelperStartupTests(unittest.TestCase):
 
             with (
                 patch.object(server, "HELPER_TOKEN_FILE", token_file),
-                patch.object(server.http.server, "HTTPServer") as http_server,
+                patch.object(server, "ContainoodleHTTPServer") as http_server,
                 patch("builtins.print"),
             ):
                 result = server.main([])
@@ -405,7 +435,7 @@ class HelperStartupTests(unittest.TestCase):
                 "_load_or_create_helper_token",
                 return_value=TEST_HELPER_TOKEN,
             ),
-            patch.object(server.http.server, "HTTPServer") as http_server,
+            patch.object(server, "ContainoodleHTTPServer") as http_server,
             patch("builtins.print") as print_message,
         ):
             result = server.main(["--show-token"])
@@ -418,7 +448,7 @@ class HelperStartupTests(unittest.TestCase):
         fake_server = Mock()
         fake_server.serve_forever.side_effect = KeyboardInterrupt
         accounts_file = Mock()
-        accounts_file.exists.return_value = True
+        accounts_file.read_text.return_value = "[]"
         with server._AUTH_CHALLENGE_LOCK:
             server._AUTH_CHALLENGES[TEST_CHALLENGE] = {
                 "deadline": 999_999.0,
@@ -434,8 +464,8 @@ class HelperStartupTests(unittest.TestCase):
             ),
             patch.object(server, "ACCOUNTS_FILE", accounts_file),
             patch.object(
-                server.http.server,
-                "HTTPServer",
+                server,
+                "ContainoodleHTTPServer",
                 return_value=fake_server,
             ),
             patch("builtins.print") as print_message,
@@ -497,6 +527,130 @@ class TokenExpiryTests(unittest.TestCase):
                     server._check_token_expiry({"expiresAt": expires_at})
 
 
+class HelperConnectionTests(unittest.TestCase):
+    def fake_server(self, slots=2):
+        helper = object.__new__(REAL_HELPER_SERVER)
+        helper._request_slots = threading.BoundedSemaphore(slots)
+        helper.shutdown_request = Mock()
+        return helper
+
+    def test_every_accepted_socket_has_a_timeout_and_setup_failure_closes_it(self):
+        helper = self.fake_server()
+        peer = ("127.0.0.1", 0)
+        for failure in (None, OSError("__CONTAINOODLE_TEST_SOCKET_ERROR__")):
+            connection = Mock()
+            connection.settimeout.side_effect = failure
+            with (
+                self.subTest(failure=failure is not None),
+                patch.object(server.http.server.HTTPServer, "get_request", return_value=(connection, peer)),
+            ):
+                if failure is None:
+                    self.assertEqual(helper.get_request(), (connection, peer))
+                    connection.close.assert_not_called()
+                else:
+                    with self.assertRaises(OSError):
+                        helper.get_request()
+                    connection.close.assert_called_once_with()
+            connection.settimeout.assert_called_once_with(server.REQUEST_SOCKET_TIMEOUT_SECONDS)
+
+    def test_worker_limit_rejects_excess_connections_and_releases_completed_slots(self):
+        helper = self.fake_server()
+        requests = [Mock() for _ in range(3)]
+        peer = ("127.0.0.1", 0)
+        with patch.object(server.socketserver.ThreadingMixIn, "process_request") as start_worker:
+            for request in requests:
+                helper.process_request(request, peer)
+            self.assertEqual(start_worker.call_count, 2)
+            helper.shutdown_request.assert_called_once_with(requests[2])
+            with patch.object(server.socketserver.ThreadingMixIn, "process_request_thread") as finish_worker:
+                helper.process_request_thread(requests[0], peer)
+            finish_worker.assert_called_once_with(requests[0], peer)
+            helper.process_request(requests[2], peer)
+            self.assertEqual(start_worker.call_count, 3)
+
+    def test_worker_start_and_processing_failures_do_not_leak_slots(self):
+        peer = ("127.0.0.1", 0)
+        request = Mock()
+        helper = self.fake_server(slots=1)
+        with (
+            patch.object(server.socketserver.ThreadingMixIn, "process_request", side_effect=RuntimeError("synthetic start failure")),
+            self.assertRaises(RuntimeError),
+        ):
+            helper.process_request(request, peer)
+        helper.shutdown_request.assert_called_once_with(request)
+        self.assertTrue(helper._request_slots.acquire(blocking=False))
+        with (
+            patch.object(server.socketserver.ThreadingMixIn, "process_request_thread", side_effect=RuntimeError("synthetic worker failure")),
+            self.assertRaises(RuntimeError),
+        ):
+            helper.process_request_thread(request, peer)
+        self.assertTrue(helper._request_slots.acquire(blocking=False))
+
+    def test_preopened_idle_socket_does_not_block_an_authenticated_helper_handshake(self):
+        accepted = threading.Event()
+        idle_closed = threading.Event()
+
+        class ObservedServer(REAL_HELPER_SERVER):
+            idle_request = None
+
+            def get_request(self):
+                result = super().get_request()
+                if self.idle_request is None:
+                    self.idle_request = result[0]
+                accepted.set()
+                return result
+
+            def shutdown_request(self, request):
+                try:
+                    super().shutdown_request(request)
+                finally:
+                    if request is self.idle_request:
+                        idle_closed.set()
+
+        # The sole live listener in this suite uses an OS-selected loopback port.
+        # Module guards still reject AWS subprocesses and federation requests.
+        with patch.object(server, "REQUEST_SOCKET_TIMEOUT_SECONDS", 1):
+            helper = ObservedServer(("127.0.0.1", 0), server.ContainoodleHandler)
+            helper_thread = threading.Thread(target=helper.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            idle = None
+            try:
+                port = helper.server_address[1]
+                self.assertNotEqual(port, 8421)
+                with (
+                    patch.object(server, "PORT", port),
+                    patch.object(server.ContainoodleHandler, "log_request"),
+                    patch.object(server.ContainoodleHandler, "log_error"),
+                ):
+                    helper_thread.start()
+                    idle = socket.create_connection(("127.0.0.1", port), timeout=2)
+                    self.assertTrue(accepted.wait(timeout=2), "idle socket was not accepted")
+                    with socket.create_connection(("127.0.0.1", port), timeout=2) as active:
+                        active.sendall((
+                            "GET /auth/challenge HTTP/1.0\r\n"
+                            f"Host: 127.0.0.1:{port}\r\n"
+                            f"Origin: {TEST_EXTENSION_ORIGIN}\r\n\r\n"
+                        ).encode("ascii"))
+                        reply = bytearray()
+                        while chunk := active.recv(4096):
+                            reply.extend(chunk)
+                    header, body = bytes(reply).split(b"\r\n\r\n", 1)
+                    self.assertIn(b" 200 ", header)
+                    payload = json.loads(body)
+                    self.assertFalse(idle_closed.is_set(), "valid request must complete while the idle socket is still open")
+                    self.assertEqual(payload["serverProof"], server._server_proof(
+                        payload["challenge"], payload["expiresAt"], f"127.0.0.1:{port}", TEST_EXTENSION_ORIGIN,
+                    ))
+                    self.assertEqual(idle.recv(1), b"", "idle connection must expire")
+            finally:
+                if idle is not None:
+                    idle.close()
+                if helper_thread.is_alive():
+                    helper.shutdown()
+                    helper_thread.join(timeout=3)
+                helper.server_close()
+            self.assertFalse(helper_thread.is_alive())
+
+
 class SsoCacheSelectionTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -552,6 +706,71 @@ class SsoCacheSelectionTests(unittest.TestCase):
             )
 
         self.assertEqual(namespace["AWS_CONFIG_FILE"], configured_path)
+
+    def test_mixed_region_routes_use_selected_sso_region_and_keep_console_destination(self):
+        sso_region = "eu-central-1"
+        console_region = "ap-southeast-2"
+        accounts_file = self.root / "accounts.json"
+        accounts_file.write_text(json.dumps([{
+            "accountId": TEST_ACCOUNT_ID,
+            "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+            "role": TEST_ROLE_ALPHA,
+            "region": console_region,
+        }]), encoding="utf-8")
+        modern_config = (
+            f"[profile {TEST_PROFILE_ALPHA}]\nsso_session = {TEST_SESSION_ALPHA}\n"
+            f"[sso-session {TEST_SESSION_ALPHA}]\nsso_start_url = {TEST_START_URL_ALPHA}\nsso_region = {sso_region}\n"
+        )
+        legacy_config = (
+            f"[profile {TEST_PROFILE_ALPHA}]\nsso_start_url = {TEST_START_URL_ALPHA}\nsso_region = {sso_region}\n"
+        )
+        credentials = {
+            "accessKeyId": "__CONTAINOODLE_TEST_SESSION_ID__",
+            "secretAccessKey": "__CONTAINOODLE_TEST_SESSION_KEY__",
+            "sessionToken": "__CONTAINOODLE_TEST_SESSION_TOKEN__",
+        }
+        for mode, profile, namespace, config in (
+            ("modern", TEST_PROFILE_ALPHA, TEST_SESSION_ALPHA, modern_config),
+            ("legacy", TEST_PROFILE_ALPHA, TEST_START_URL_ALPHA, legacy_config),
+            ("automatic", None, TEST_START_URL_ALPHA, ""),
+        ):
+            for cache_file in self.cache_directory.iterdir():
+                cache_file.unlink()
+            self.write_namespace_cache(namespace, self.usable_cache(region=sso_region))
+            self.config_file.write_text(config, encoding="utf-8")
+            for route in ("roles", "generate-url"):
+                with self.subTest(mode=mode, route=route):
+                    query = {"account": TEST_ACCOUNT_ID}
+                    if profile is not None:
+                        query["profile"] = profile
+                    selected = self.select(profile)
+                    self.assertEqual(selected["region"], sso_region)
+                    query["identity"] = selected["identityKey"]
+                    handler = RecordingHandler(path=f"/{route}?{urllib.parse.urlencode(query)}", origin=TEST_EXTENSION_ORIGIN)
+                    output = {"roleList": [{"roleName": TEST_ROLE_ALPHA}]} if route == "roles" else {"roleCredentials": credentials}
+                    with (
+                        patch.object(server, "ACCOUNTS_FILE", accounts_file),
+                        patch.object(server, "AWS_CONFIG_FILE", self.config_file),
+                        patch.object(server, "SSO_CACHE_DIR", self.cache_directory),
+                        patch.object(server, "datetime", FixedDateTime),
+                        patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(output), stderr="")) as run,
+                        patch.object(server.urllib.request, "urlopen", return_value=FakeUrlResponse(b'{"SigninToken":"__CONTAINOODLE_TEST_SIGNIN_TOKEN__"}')) as federation,
+                    ):
+                        handler.do_GET()
+                    self.assertEqual(handler.response_status, 200)
+                    body = handler.json_body()
+                    command = run.call_args.args[0]
+                    self.assertEqual(command[command.index("--region") + 1], sso_region)
+                    self.assertEqual(command[command.index("--access-token") + 1], TEST_ACCESS_TOKEN_ALPHA)
+                    self.assertEqual(command[2], "list-account-roles" if route == "roles" else "get-role-credentials")
+                    if route == "roles":
+                        self.assertEqual(body["roles"], [TEST_ROLE_ALPHA])
+                        federation.assert_not_called()
+                    else:
+                        container = urllib.parse.parse_qs(body["containerUrl"].split(":", 1)[1])
+                        signin = urllib.parse.parse_qs(urllib.parse.urlparse(container["url"][0]).query)
+                        self.assertEqual(signin["Destination"], [f"https://{console_region}.console.aws.amazon.com/console/home?region={console_region}"])
+                        self.assertEqual(federation.call_count, 1)
 
     def test_resolves_modern_profile_to_the_session_cache_namespace(self):
         self.config_file.write_text(
@@ -786,6 +1005,49 @@ sso_region = eu-west-1
 
 
 class AwsCliContractTests(unittest.TestCase):
+    def test_both_cli_calls_have_a_finite_timeout_and_sanitize_timeout_details(self):
+        calls = (
+            (server._get_role_credentials, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, TEST_ROLE_ALPHA, "eu-west-1")),
+            (server._list_account_roles, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1")),
+        )
+        self.assertGreater(server.AWS_CLI_TIMEOUT_SECONDS, 0)
+        self.assertLessEqual(server.AWS_CLI_TIMEOUT_SECONDS, 30)
+        for function, arguments in calls:
+            with self.subTest(operation=function.__name__):
+                failure = server.subprocess.TimeoutExpired(
+                    cmd=["aws", "--access-token", TEST_ACCESS_TOKEN_ALPHA],
+                    timeout=server.AWS_CLI_TIMEOUT_SECONDS,
+                    output="__CONTAINOODLE_TEST_SECRET_STDOUT__",
+                    stderr="__CONTAINOODLE_TEST_SECRET_STDERR__",
+                )
+                with (
+                    patch.object(server.subprocess, "run", side_effect=failure) as run,
+                    patch("builtins.print") as print_message,
+                ):
+                    try:
+                        function(*arguments)
+                    except server.AwsRequestTimeout as error:
+                        rendered = "".join(traceback.format_exception(error))
+                        self.assertEqual(str(error), "AWS CLI request timed out")
+                    else:
+                        self.fail("CLI timeout must fail closed")
+                self.assertEqual(run.call_args.kwargs["timeout"], server.AWS_CLI_TIMEOUT_SECONDS)
+                for secret in (TEST_ACCESS_TOKEN_ALPHA, "__CONTAINOODLE_TEST_SECRET_STDOUT__", "__CONTAINOODLE_TEST_SECRET_STDERR__"):
+                    self.assertNotIn(secret, rendered)
+                print_message.assert_not_called()
+
+    def test_both_cli_calls_sanitize_process_launch_failures(self):
+        for function, arguments in (
+            (server._get_role_credentials, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, TEST_ROLE_ALPHA, "eu-west-1")),
+            (server._list_account_roles, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1")),
+        ):
+            with (
+                self.subTest(operation=function.__name__),
+                patch.object(server.subprocess, "run", side_effect=OSError(TEST_ACCESS_TOKEN_ALPHA)),
+                self.assertRaisesRegex(RuntimeError, "^AWS CLI could not be run$"),
+            ):
+                function(*arguments)
+
     def test_get_role_credentials_maps_the_aws_cli_response(self):
         completed = SimpleNamespace(
             returncode=0,
@@ -819,12 +1081,14 @@ class AwsCliContractTests(unittest.TestCase):
                 "--account-id", TEST_ACCOUNT_ID,
                 "--role-name", TEST_ROLE_ALPHA,
                 "--region", "eu-west-1",
+                "--output", "json",
             ],
             capture_output=True,
             text=True,
+            timeout=server.AWS_CLI_TIMEOUT_SECONDS,
         )
 
-    def test_get_role_credentials_strips_and_surfaces_a_cli_failure(self):
+    def test_get_role_credentials_never_surfaces_cli_stderr(self):
         completed = SimpleNamespace(
             returncode=255,
             stdout="",
@@ -835,7 +1099,7 @@ class AwsCliContractTests(unittest.TestCase):
             patch.object(server.subprocess, "run", return_value=completed),
             self.assertRaisesRegex(
                 RuntimeError,
-                "get-role-credentials failed: synthetic CLI failure$",
+                "^AWS CLI request failed$",
             ),
         ):
             server._get_role_credentials(
@@ -850,7 +1114,7 @@ class AwsCliContractTests(unittest.TestCase):
 
         with (
             patch.object(server.subprocess, "run", return_value=completed),
-            self.assertRaises(json.JSONDecodeError),
+            self.assertRaisesRegex(RuntimeError, "^AWS CLI returned an invalid response$"),
         ):
             server._get_role_credentials(
                 "synthetic-access-token",
@@ -891,6 +1155,7 @@ class AwsCliContractTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            timeout=server.AWS_CLI_TIMEOUT_SECONDS,
         )
 
     def test_list_account_roles_defaults_to_an_empty_list(self):
@@ -905,7 +1170,7 @@ class AwsCliContractTests(unittest.TestCase):
 
         self.assertEqual(roles, [])
 
-    def test_list_account_roles_strips_and_surfaces_a_cli_failure(self):
+    def test_list_account_roles_never_surfaces_cli_stderr(self):
         completed = SimpleNamespace(
             returncode=1,
             stdout="",
@@ -916,7 +1181,7 @@ class AwsCliContractTests(unittest.TestCase):
             patch.object(server.subprocess, "run", return_value=completed),
             self.assertRaisesRegex(
                 RuntimeError,
-                "list-account-roles failed: synthetic role-list failure$",
+                "^AWS CLI request failed$",
             ),
         ):
             server._list_account_roles(
@@ -930,7 +1195,7 @@ class AwsCliContractTests(unittest.TestCase):
 
         with (
             patch.object(server.subprocess, "run", return_value=completed),
-            self.assertRaises(json.JSONDecodeError),
+            self.assertRaisesRegex(RuntimeError, "^AWS CLI returned an invalid response$"),
         ):
             server._list_account_roles(
                 "synthetic-access-token",
@@ -940,6 +1205,56 @@ class AwsCliContractTests(unittest.TestCase):
 
 
 class FederationUrlTests(unittest.TestCase):
+    def test_federation_connect_and_read_timeouts_never_expose_the_session(self):
+        credentials = {
+            "sessionId": "__CONTAINOODLE_TEST_SESSION_ID__",
+            "sessionKey": "__CONTAINOODLE_TEST_SESSION_KEY__",
+            "sessionToken": "__CONTAINOODLE_TEST_SESSION_TOKEN__",
+        }
+        failure_message = " ".join(credentials.values())
+        failures = (
+            ("connect", TimeoutError(failure_message)),
+            ("wrapped connect", urllib.error.URLError(TimeoutError(failure_message))),
+            ("read", TimeoutError(failure_message)),
+        )
+        self.assertGreater(server.FEDERATION_TIMEOUT_SECONDS, 0)
+        self.assertLessEqual(server.FEDERATION_TIMEOUT_SECONDS, 15)
+        for operation, failure in failures:
+            response = FakeUrlResponse(b"")
+            urlopen_side_effect = failure if operation != "read" else None
+            with (
+                self.subTest(operation=operation),
+                patch.object(server.urllib.request, "urlopen", return_value=response, side_effect=urlopen_side_effect) as urlopen,
+                patch.object(response, "read", side_effect=failure) as read,
+                patch("builtins.print") as print_message,
+            ):
+                try:
+                    server._build_signin_url(credentials, "eu-west-1")
+                except server.AwsRequestTimeout as error:
+                    rendered = "".join(traceback.format_exception(error))
+                    self.assertEqual(str(error), "AWS federation request timed out")
+                else:
+                    self.fail("Federation timeout must fail closed")
+            self.assertEqual(urlopen.call_args.kwargs["timeout"], server.FEDERATION_TIMEOUT_SECONDS)
+            if operation == "read":
+                read.assert_called_once_with(server.FEDERATION_RESPONSE_LIMIT_BYTES + 1)
+            for secret in credentials.values():
+                self.assertNotIn(secret, rendered)
+            self.assertNotIn("Action=getSigninToken", rendered)
+            print_message.assert_not_called()
+
+    def test_federation_rejects_oversized_replies_before_parsing(self):
+        response = FakeUrlResponse(b"x" * (server.FEDERATION_RESPONSE_LIMIT_BYTES + 1))
+        with (
+            patch.object(server.urllib.request, "urlopen", return_value=response),
+            patch.object(response, "read", wraps=response.read) as read,
+            patch.object(server.json, "loads") as loads,
+            self.assertRaisesRegex(RuntimeError, "^AWS federation response is too large$"),
+        ):
+            server._build_signin_url({"sessionToken": "__CONTAINOODLE_TEST_TOKEN__"}, "eu-west-1")
+        read.assert_called_once_with(server.FEDERATION_RESPONSE_LIMIT_BYTES + 1)
+        loads.assert_not_called()
+
     def test_build_signin_url_round_trips_credentials_destination_and_token(self):
         credentials = {
             "sessionId": "SYNTHETIC-ID",
@@ -955,7 +1270,7 @@ class FederationUrlTests(unittest.TestCase):
             login_url = server._build_signin_url(credentials, "eu-west-1")
 
         token_url = urlopen.call_args.args[0]
-        urlopen.assert_called_once_with(token_url)
+        urlopen.assert_called_once_with(token_url, timeout=server.FEDERATION_TIMEOUT_SECONDS)
         parsed_token_url = urllib.parse.urlparse(token_url)
         self.assertEqual(parsed_token_url.scheme, "https")
         self.assertEqual(parsed_token_url.netloc, "signin.aws.amazon.com")
@@ -980,14 +1295,14 @@ class FederationUrlTests(unittest.TestCase):
             ["https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1"],
         )
 
-    def test_build_signin_url_propagates_a_network_failure(self):
+    def test_build_signin_url_sanitizes_a_network_failure(self):
         with (
             patch.object(
                 server.urllib.request,
                 "urlopen",
                 side_effect=urllib.error.URLError("synthetic offline failure"),
             ) as urlopen,
-            self.assertRaises(urllib.error.URLError),
+            self.assertRaisesRegex(RuntimeError, "^AWS federation request failed$"),
         ):
             server._build_signin_url(
                 {
@@ -1005,7 +1320,7 @@ class FederationUrlTests(unittest.TestCase):
 
         with (
             patch.object(server.urllib.request, "urlopen", return_value=response),
-            self.assertRaises(json.JSONDecodeError),
+            self.assertRaisesRegex(RuntimeError, "^AWS federation returned an invalid response$"),
         ):
             server._build_signin_url(
                 {
@@ -1020,6 +1335,7 @@ class FederationUrlTests(unittest.TestCase):
         selection = {
             "accessToken": TEST_ACCESS_TOKEN_ALPHA,
             "identityKey": "a" * 64,
+            "region": "eu-central-1",
         }
         credentials = {
             "sessionId": "SYNTHETIC-ID",
@@ -1060,7 +1376,7 @@ class FederationUrlTests(unittest.TestCase):
             TEST_ACCESS_TOKEN_ALPHA,
             TEST_ACCOUNT_ID,
             TEST_ROLE_ALPHA,
-            "eu-west-1",
+            "eu-central-1",
         )
         build_url.assert_called_once_with(credentials, "eu-west-1")
 
@@ -1116,7 +1432,7 @@ class AccountMetadataTests(unittest.TestCase):
         }
         self.accounts_file.write_text(json.dumps([
             expected,
-            {"accountId": TEST_OTHER_ACCOUNT_ID, "accountName": "synthetic-other"},
+            {"accountId": "1" * 12, "accountName": "synthetic-other"},
         ]))
         handler = RecordingHandler()
 
@@ -1124,13 +1440,132 @@ class AccountMetadataTests(unittest.TestCase):
             self.assertEqual(handler._get_account_meta(TEST_ACCOUNT_ID), expected)
             self.assertIsNone(handler._get_account_meta(TEST_UNKNOWN_ACCOUNT_ID))
 
-    def test_get_account_meta_treats_missing_or_invalid_json_as_unavailable(self):
+    def test_get_account_meta_distinguishes_bad_files_from_unknown_accounts(self):
         handler = RecordingHandler()
 
         with patch.object(server, "ACCOUNTS_FILE", self.accounts_file):
-            self.assertIsNone(handler._get_account_meta(TEST_ACCOUNT_ID))
+            with self.assertRaisesRegex(server.AccountsFileError, "^accounts.json not found$"):
+                handler._get_account_meta(TEST_ACCOUNT_ID)
             self.accounts_file.write_text("{")
-            self.assertIsNone(handler._get_account_meta(TEST_ACCOUNT_ID))
+            with self.assertRaisesRegex(server.AccountsFileError, "^accounts.json is invalid$"):
+                handler._get_account_meta(TEST_ACCOUNT_ID)
+
+
+class AccountsFileValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.accounts_file = Path(self.temporary_directory.name) / "accounts.json"
+        patcher = patch.object(server, "ACCOUNTS_FILE", self.accounts_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.account = {"accountId": TEST_ACCOUNT_ID, "accountName": "synthetic-account"}
+
+    def test_python_loader_matches_the_shared_javascript_schema_fixtures(self):
+        fixtures = json.loads(
+            (Path(__file__).parent / "fixtures" / "accounts-validation.json").read_text(encoding="utf-8")
+        )
+        for fixture in fixtures:
+            with self.subTest(case=fixture["name"]):
+                self.accounts_file.write_text(json.dumps(fixture["document"]), encoding="utf-8")
+                if fixture["valid"]:
+                    self.assertEqual(server._load_accounts(), fixture["document"])
+                else:
+                    with self.assertRaises(server.AccountsFileError):
+                        server._load_accounts()
+
+    def test_empty_file_list_is_valid_and_unknown_fields_are_preserved(self):
+        extended = {
+            **self.account,
+            "accountName": "  Synthetic 🚀 名稱  ",
+            "role": TEST_ROLE_ALPHA,
+            "region": "us-gov-west-1",
+            "customMetadata": {"synthetic": [True, 2, None]},
+        }
+        for accounts in ([], [self.account], [extended]):
+            with self.subTest(accounts=accounts):
+                self.accounts_file.write_text(json.dumps(accounts), encoding="utf-8")
+                self.assertEqual(server._load_accounts(), accounts)
+
+    def test_schema_rejects_invalid_document_and_entry_types(self):
+        for value in (None, True, 1, "synthetic", {}, {"accounts": [self.account]}):
+            with self.subTest(top_level=type(value).__name__):
+                self.accounts_file.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(server.AccountsFileError, "^accounts.json must contain an array of accounts$"):
+                    server._load_accounts()
+        for value in (None, True, 1, "synthetic", []):
+            with self.subTest(entry=type(value).__name__):
+                self.accounts_file.write_text(json.dumps([value]), encoding="utf-8")
+                with self.assertRaisesRegex(server.AccountsFileError, "^accounts.json entry 1 must be an object$"):
+                    server._load_accounts()
+
+    def test_schema_requires_exact_ascii_id_strings_and_nonempty_names(self):
+        invalid_fields = (
+            ("accountId", [None, 0, True, {}, [], "", "0" * 11, "0" * 13, "０" * 12, TEST_ACCOUNT_ID + "\n", " " + TEST_ACCOUNT_ID]),
+            ("accountName", [None, 0, True, {}, [], "", " \t\n", "x" * 257, "synthetic\x00name", "synthetic\nname", "synthetic\x7fname"]),
+            ("role", [None, 0, True, {}, [], "", "synthetic role", "ä", TEST_ROLE_ALPHA + "\n", "x" * 65]),
+            ("region", [None, 0, True, {}, [], "", "invalid-region", "EU-WEST-1", "eu-west-١", "eu-west-1\n"]),
+        )
+        for field, values in invalid_fields:
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.accounts_file.write_text(json.dumps([{**self.account, field: value}]), encoding="utf-8")
+                    with self.assertRaises(server.AccountsFileError) as raised:
+                        server._load_accounts()
+                    self.assertIn(field, raised.exception.public_message)
+        for field in ("accountId", "accountName"):
+            account = {key: value for key, value in self.account.items() if key != field}
+            self.accounts_file.write_text(json.dumps([account]), encoding="utf-8")
+            with self.assertRaises(server.AccountsFileError):
+                server._load_accounts()
+
+    def test_name_limit_counts_unicode_code_points_not_utf16_units(self):
+        for name in ("x" * 256, "🚀" * 256):
+            accounts = [{**self.account, "accountName": name}]
+            self.accounts_file.write_text(json.dumps(accounts), encoding="utf-8")
+            self.assertEqual(server._load_accounts(), accounts)
+        self.accounts_file.write_text(json.dumps([{**self.account, "accountName": "🚀" * 257}]), encoding="utf-8")
+        with self.assertRaises(server.AccountsFileError):
+            server._load_accounts()
+
+    def test_duplicate_ids_and_later_bad_rows_reject_even_a_matching_first_row(self):
+        handler = RecordingHandler()
+        for second in ({**self.account, "accountName": "synthetic-duplicate"}, {"accountName": "synthetic-invalid"}):
+            with self.subTest(second=second):
+                self.accounts_file.write_text(json.dumps([self.account, second]), encoding="utf-8")
+                with self.assertRaises(server.AccountsFileError):
+                    handler._get_account_meta(TEST_ACCOUNT_ID)
+        self.accounts_file.write_text(json.dumps([self.account, self.account]), encoding="utf-8")
+        with self.assertRaisesRegex(server.AccountsFileError, "^accounts.json entry 2: duplicate accountId$"):
+            server._load_accounts()
+
+    def test_parse_failures_are_generic_and_never_include_the_document(self):
+        for document in ('{"__CONTAINOODLE_TEST_PRIVATE_VALUE__":', "[NaN]", "[Infinity]", "[-Infinity]", "[" * 2000):
+            with self.subTest(case=document[:12]):
+                self.accounts_file.write_text(document, encoding="utf-8")
+                with self.assertRaisesRegex(server.AccountsFileError, "^accounts.json is invalid$"):
+                    server._load_accounts()
+        self.accounts_file.write_bytes(b"\xff__CONTAINOODLE_TEST_PRIVATE_VALUE__")
+        with self.assertRaisesRegex(server.AccountsFileError, "^accounts.json is invalid$"):
+            server._load_accounts()
+
+    def test_read_failures_are_generic(self):
+        for failure, message, status in (
+            (FileNotFoundError("__CONTAINOODLE_TEST_PRIVATE_PATH__"), "accounts.json not found", 404),
+            (PermissionError("__CONTAINOODLE_TEST_PRIVATE_PATH__"), "accounts.json could not be read", 500),
+            (IsADirectoryError("__CONTAINOODLE_TEST_PRIVATE_PATH__"), "accounts.json could not be read", 500),
+            (OSError("__CONTAINOODLE_TEST_PRIVATE_PATH__"), "accounts.json could not be read", 500),
+        ):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                patch.object(server, "ACCOUNTS_FILE") as accounts_file,
+            ):
+                accounts_file.read_text.side_effect = failure
+                with self.assertRaises(server.AccountsFileError) as raised:
+                    server._load_accounts()
+                self.assertEqual(raised.exception.public_message, message)
+                self.assertEqual(raised.exception.status, status)
+                accounts_file.read_text.assert_called_once_with(encoding="utf-8")
 
 
 class HandlerTransportTests(unittest.TestCase):
@@ -1928,6 +2363,163 @@ class HandlerRouteTests(unittest.TestCase):
                 {"error": "accounts.json is invalid"},
             )
 
+    def test_all_account_routes_reject_bad_files_before_sso_or_aws_work(self):
+        valid = {"accountId": TEST_ACCOUNT_ID, "accountName": "__CONTAINOODLE_TEST_ACCOUNT__"}
+        cases = (
+            ("{", "accounts.json is invalid"),
+            ("{}", "accounts.json must contain an array of accounts"),
+            ("[null]", "accounts.json entry 1 must be an object"),
+            (json.dumps([{**valid, "role": None}]), "accounts.json entry 1: invalid role"),
+            (json.dumps([{**valid, "region": 1}]), "accounts.json entry 1: invalid region"),
+            (json.dumps([{**valid, "accountName": "__TEST_\ud800__"}]), "accounts.json entry 1: accountName contains invalid Unicode"),
+            (json.dumps([{**valid, "accountName": "__TEST_\udc00__"}]), "accounts.json entry 1: accountName contains invalid Unicode"),
+            (json.dumps([valid, valid]), "accounts.json entry 2: duplicate accountId"),
+            (json.dumps([valid, {}]), "accounts.json entry 2: accountId must be a 12-digit string"),
+        )
+        for target in ("/accounts", f"/roles?account={TEST_ACCOUNT_ID}", f"/generate-url?account={TEST_ACCOUNT_ID}"):
+            for document, public_message in cases:
+                self.accounts_file.write_text(document, encoding="utf-8")
+                handler = RecordingHandler(path=target, origin=TEST_EXTENSION_ORIGIN)
+                with (
+                    self.subTest(target=target, error=public_message),
+                    patch.object(server, "ACCOUNTS_FILE", self.accounts_file),
+                    patch.object(server, "_select_sso_identity") as select_identity,
+                    patch.object(server.subprocess, "run") as run,
+                    patch.object(server.urllib.request, "urlopen") as urlopen,
+                    patch("builtins.print") as print_message,
+                ):
+                    handler.do_GET()
+                    self.assert_json_response(handler, 500, {"error": public_message})
+                select_identity.assert_not_called()
+                run.assert_not_called()
+                urlopen.assert_not_called()
+                print_message.assert_not_called()
+                self.assertNotIn(valid["accountName"], handler.wfile.getvalue().decode())
+
+    def test_all_account_routes_sanitize_read_failures_and_missing_files(self):
+        for target in ("/accounts", f"/roles?account={TEST_ACCOUNT_ID}", f"/generate-url?account={TEST_ACCOUNT_ID}"):
+            for failure, status, message in (
+                (PermissionError("__CONTAINOODLE_TEST_PRIVATE_PATH__"), 500, "accounts.json could not be read"),
+                (FileNotFoundError("__CONTAINOODLE_TEST_PRIVATE_PATH__"), 404, "accounts.json not found"),
+                (UnicodeError("__CONTAINOODLE_TEST_PRIVATE_VALUE__"), 500, "accounts.json is invalid"),
+            ):
+                handler = RecordingHandler(path=target)
+                with (
+                    self.subTest(target=target, failure=type(failure).__name__),
+                    patch.object(server, "ACCOUNTS_FILE") as accounts_file,
+                    patch.object(server, "_select_sso_identity") as select_identity,
+                    patch.object(server.subprocess, "run") as run,
+                    patch.object(server.urllib.request, "urlopen") as urlopen,
+                ):
+                    accounts_file.read_text.side_effect = failure
+                    handler.do_GET()
+                    self.assert_json_response(handler, status, {"error": message})
+                select_identity.assert_not_called()
+                run.assert_not_called()
+                urlopen.assert_not_called()
+
+    def test_aws_timeout_routes_return_signed_safe_errors_without_federating(self):
+        self.accounts_file.write_text(json.dumps([{
+            "accountId": TEST_ACCOUNT_ID,
+            "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+            "role": TEST_ROLE_ALPHA,
+        }]), encoding="utf-8")
+        selection = {"accessToken": TEST_ACCESS_TOKEN_ALPHA, "identityKey": "a" * 64, "region": "eu-west-1"}
+        for target in (f"/roles?account={TEST_ACCOUNT_ID}", f"/generate-url?account={TEST_ACCOUNT_ID}"):
+            handler = RecordingHandler(path=target, origin=TEST_EXTENSION_ORIGIN)
+            with (
+                self.subTest(target=target),
+                patch.object(server, "ACCOUNTS_FILE", self.accounts_file),
+                patch.object(server, "_select_sso_identity", return_value=selection),
+                patch.object(server.subprocess, "run", side_effect=server.subprocess.TimeoutExpired(
+                    ["aws", "--access-token", TEST_ACCESS_TOKEN_ALPHA],
+                    server.AWS_CLI_TIMEOUT_SECONDS,
+                    stderr="__CONTAINOODLE_TEST_PRIVATE_STDERR__",
+                )) as run,
+                patch.object(server.urllib.request, "urlopen") as urlopen,
+                patch("builtins.print") as print_message,
+            ):
+                handler.do_GET()
+                self.assert_json_response(handler, 504, {
+                    "error": "AWS request timed out. Check your connection and try again.",
+                })
+            run.assert_called_once()
+            urlopen.assert_not_called()
+            print_message.assert_not_called()
+            self.assertNotIn(TEST_ACCESS_TOKEN_ALPHA, handler.wfile.getvalue().decode())
+
+    def test_generate_route_sanitizes_federation_timeout_after_successful_cli(self):
+        self.accounts_file.write_text(json.dumps([{
+            "accountId": TEST_ACCOUNT_ID,
+            "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
+            "role": TEST_ROLE_ALPHA,
+        }]), encoding="utf-8")
+        selection = {"accessToken": TEST_ACCESS_TOKEN_ALPHA, "identityKey": "a" * 64, "region": "eu-west-1"}
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps({
+            "roleCredentials": {
+                "accessKeyId": "__CONTAINOODLE_TEST_SESSION_ID__",
+                "secretAccessKey": "__CONTAINOODLE_TEST_SESSION_KEY__",
+                "sessionToken": "__CONTAINOODLE_TEST_SESSION_TOKEN__",
+            },
+        }), stderr="")
+        handler = RecordingHandler(path=f"/generate-url?account={TEST_ACCOUNT_ID}", origin=TEST_EXTENSION_ORIGIN)
+        with (
+            patch.object(server, "ACCOUNTS_FILE", self.accounts_file),
+            patch.object(server, "_select_sso_identity", return_value=selection),
+            patch.object(server.subprocess, "run", return_value=completed),
+            patch.object(server.urllib.request, "urlopen", side_effect=TimeoutError("__CONTAINOODLE_TEST_SESSION_TOKEN__")),
+            patch("builtins.print") as print_message,
+        ):
+            handler.do_GET()
+        self.assert_json_response(handler, 504, {
+            "error": "AWS request timed out. Check your connection and try again.",
+        })
+        print_message.assert_not_called()
+
+    def test_generate_route_preserves_valid_file_metadata_through_the_pipeline(self):
+        account = {
+            "accountId": TEST_ACCOUNT_ID,
+            "accountName": "  __CONTAINOODLE_TEST_ACCOUNT__ 🚀  ",
+            "role": TEST_ROLE_ALPHA,
+            "region": "eu-central-1",
+            "customMetadata": "__CONTAINOODLE_TEST_EXTRA__",
+        }
+        self.accounts_file.write_text(json.dumps([account]), encoding="utf-8")
+        selection = {"accessToken": TEST_ACCESS_TOKEN_ALPHA, "identityKey": "a" * 64, "region": "eu-west-1"}
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps({
+            "roleCredentials": {
+                "accessKeyId": "__CONTAINOODLE_TEST_SESSION_ID__",
+                "secretAccessKey": "__CONTAINOODLE_TEST_SESSION_KEY__",
+                "sessionToken": "__CONTAINOODLE_TEST_SESSION_TOKEN__",
+            },
+        }), stderr="")
+        target = f"/generate-url?account={TEST_ACCOUNT_ID}&role={TEST_ROLE_QUERY}"
+        handler = RecordingHandler(path=target, origin=TEST_EXTENSION_ORIGIN)
+        with (
+            patch.object(server, "ACCOUNTS_FILE", self.accounts_file),
+            patch.object(server, "_select_sso_identity", return_value=selection),
+            patch.object(server.subprocess, "run", return_value=completed) as run,
+            patch.object(server.urllib.request, "urlopen", return_value=FakeUrlResponse(
+                b'{"SigninToken": "__CONTAINOODLE_TEST_SIGNIN_TOKEN__"}'
+            )),
+        ):
+            handler.do_GET()
+        body = handler.json_body()
+        self.assert_json_response(handler, 200, body)
+        self.assertEqual(body["account"], account["accountName"])
+        self.assertTrue(body["ok"])
+        container_fields = urllib.parse.parse_qs(body["containerUrl"].split(":", 1)[1])
+        self.assertEqual(container_fields["name"], [account["accountName"]])
+        login_fields = urllib.parse.parse_qs(urllib.parse.urlparse(container_fields["url"][0]).query)
+        self.assertEqual(login_fields["SigninToken"], ["__CONTAINOODLE_TEST_SIGNIN_TOKEN__"])
+        self.assertEqual(login_fields["Destination"], [
+            "https://eu-central-1.console.aws.amazon.com/console/home?region=eu-central-1",
+        ])
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--role-name") + 1], TEST_ROLE_QUERY)
+        self.assertEqual(command[command.index("--region") + 1], selection["region"])
+        self.assertEqual(json.loads(self.accounts_file.read_text(encoding="utf-8")), [account])
+
     def test_sso_identity_route_returns_only_the_opaque_identity_key(self):
         identity_key = "a" * 64
         target = "/sso-identity?" + urllib.parse.urlencode({
@@ -2114,10 +2706,11 @@ class HandlerRouteTests(unittest.TestCase):
             )
             select_identity.assert_not_called()
 
-    def test_roles_route_lists_roles_with_account_or_default_region(self):
+    def test_roles_route_uses_sso_region_independent_of_account_or_default_region(self):
         selection = {
             "accessToken": TEST_ACCESS_TOKEN_ALPHA,
             "identityKey": "a" * 64,
+            "region": "eu-west-1",
         }
         cases = (
             (
@@ -2163,7 +2756,7 @@ class HandlerRouteTests(unittest.TestCase):
                 list_roles.assert_called_once_with(
                     TEST_ACCESS_TOKEN_ALPHA,
                     TEST_ACCOUNT_ID,
-                    expected_region,
+                    selection["region"],
                 )
 
     def test_roles_route_binds_profile_and_expected_identity_before_aws_work(self):
@@ -2176,6 +2769,7 @@ class HandlerRouteTests(unittest.TestCase):
         selection = {
             "accessToken": TEST_ACCESS_TOKEN_ALPHA,
             "identityKey": identity_key,
+            "region": "eu-central-1",
         }
         handler = RecordingHandler(path=target)
         with (
@@ -2211,7 +2805,7 @@ class HandlerRouteTests(unittest.TestCase):
         list_roles.assert_called_once_with(
             TEST_ACCESS_TOKEN_ALPHA,
             TEST_ACCOUNT_ID,
-            server.DEFAULT_REGION,
+            selection["region"],
         )
 
     def test_roles_route_stops_before_aws_work_when_identity_changed(self):

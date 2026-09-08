@@ -2,7 +2,7 @@
 
 <img src="branding/containoodle-logo.png" width="160" height="160" alt="Containoodle logo">
 
-# Containoodle
+# Containoodle — AWS Console Containers
 
 **Two ways in. One organised Firefox.**
 
@@ -75,13 +75,15 @@ the reachable portal into the right container.
 | Capability | Behaviour |
 |---|---|
 | 🎯 **One click in** | Local helper mode launches from the Containoodle sidebar; portal mode lets you choose the account and role in the AWS Access Portal as usual. A sidebar button focuses or opens the configured portal. Either way, the console lands in the account's container. |
-| 🔀 **Two exclusive modes** | **Local helper** uses `server.py` and your AWS CLI SSO token. **Portal** uses the reachable AWS Access Portal with no helper or AWS CLI. Only one mode is active; account lists and remembered roles never cross between them. |
+| 🔀 **Two exclusive modes** | **Local helper** uses `server.py` with your existing AWS CLI SSO login. **Portal** uses the reachable AWS Access Portal with no helper or AWS CLI. Only one mode is active; account lists and remembered roles never cross between them. |
 | 🎭 **The right role** | Portal handoffs use the exact role you clicked. Portal shortcuts use only their saved portal role or optional portal role discovery. Backend launches use only backend account/role data and leave final fallback resolution to the helper. |
 | 🗂️ **Separated by design** | Each account gets one named container. AWS console cookies stay container-scoped; portal mode copies the scoped SSO authentication cookie needed to bootstrap the selected session. |
-| 📑 **Tab groups** | Every account's tabs land in their own Firefox tab group, colour-matched to the environment. Portal handoffs keep the displayed account name when it can be captured; an optional regex pattern and replacement can shorten automatic group titles. Manual titles always win. |
+| 📑 **Names and tab groups** | Every account's tabs land in their own Firefox tab group, colour-matched to the environment. An optional regex can shorten sidebar labels, automatic container names, and automatic group titles in either mode. Manual container and group names are preserved. |
 | 🚦 **Environment colours** | The account name decides the colour: **`dev` green · `qa` yellow · `prod` red · `test`/`eval` grey**. Anything unrecognised is treated as **prod (red)** — better a false alarm than a silent prod. |
 | 👁️ **Never lose the active tab** | The tab you're on is a solid indigo bar and the sidebar scrolls it into view. |
 | 🔌 **Live sidebar** | Containers and tabs are grouped per account and update as you open/close tabs. |
+| **Active vs. Favorites** | **Active** contains accounts with open tabs. **★ Favorites** is a distinct card for saved shortcuts with no open tabs. A starred account appears only in Active while open, then returns to Favorites when its last tab closes. |
+| **Original tab favicons** | Both modes show the page favicon reported by Firefox, including SVG. Static AWS favicon requests omit cookies/referrers and refuse redirects; no extra permissions are requested. Unavailable icons use a small neutral placeholder, not a guessed service drawing. |
 | 🔒 **Local helper** | The optional backend binds to `127.0.0.1` and requires a fresh proof derived from its private local secret before it reads account data or generates a session. It has no hosted Containoodle service or telemetry. Its session-generation calls go to AWS. |
 
 > **Why "Containoodle"?** It contains sessions, it sounds like a noodle, and naming
@@ -187,13 +189,20 @@ account-cache refresh in its active panel. Portal mode never reads that cache; i
 optional shortcuts are created and removed with the ☆/★ control on active sidebar
 rows. Backend mode never reads portal pins or portal role history.
 
-The **Tab group names** settings can optionally apply a JavaScript regex pattern and
-replacement to automatic group titles. A disabled or non-matching rule, or an empty
-result, keeps the original account name. A manually renamed group always takes
-precedence. Backtracking-prone constructs are rejected so a naming preference cannot
-freeze the extension. **Reset existing titles to automatic** removes stored Containoodle
-title overrides and recalculates current groups from the original account names and
-the saved rule.
+The **Account display names** settings can optionally apply one JavaScript regex
+pattern and replacement to sidebar account labels, automatic container names, and
+automatic tab-group titles. This covers all accounts loaded by the local helper and
+open or pinned accounts in portal mode. Saving a rule updates these displays without
+changing source account data, account IDs, sessions, or environment colours. Sidebar
+search accepts both original and displayed account names.
+
+A disabled or non-matching rule, or an empty or overlong result, keeps the original
+account name. Manually renamed containers and tab groups keep their custom names.
+Backtracking-prone constructs are rejected so a naming preference cannot freeze the
+extension. **Reset tab-group titles to automatic** removes only stored Containoodle
+tab-group title overrides and recalculates current groups from the original account
+names and the saved rule; it does not reset custom container names. Identical display
+names do not merge accounts or their isolated containers.
 
 In **both** modes, launched tabs are grouped per account (Firefox tab groups,
 env-coloured). A portal handoff always honors the role and destination you just
@@ -216,6 +225,14 @@ Open the sidebar with **View → Sidebar → Containoodle**, `Alt+Shift+A`, or
 opens the options page.
 
 ## Set up a connection
+
+On a genuinely new Firefox profile, the sidebar shows **Set up Containoodle**.
+Choose **Open setup**, then select one connection method. Selecting a method only
+saves that choice and reveals its existing setup controls; it does not request
+site access or contact AWS or the local helper. Helper onboarding finishes after
+a successful **Save & test**. Portal onboarding finishes after the exact portal
+origin is granted and a signed-in portal session is detected. Existing and
+upgraded profiles keep their current behavior and do not enter first-run setup.
 
 Switching modes does not merge account lists or remembered roles. Portal launches
 never use backend cache/session-reuse logic, and backend launches never use portal
@@ -268,6 +285,16 @@ Python standard library; no third-party Python packages are required.
    role available in your own environment. `role` and `region` are optional; when
    omitted, the helper uses its configured fallback values.
 
+   The file must be a JSON array. Each entry needs a unique 12-digit **string**
+   `accountId` and a nonblank `accountName` of at most 256 Unicode characters,
+   without control characters or invalid Unicode. Optional `role` values must
+   contain 1–64 ASCII letters, digits, or `_+=,.@-`; optional `region` values
+   must use a region-shaped value such as `eu-west-1`. Unknown fields are
+   preserved. These checks validate the format, not AWS account access.
+   The helper checks the complete file at startup and on account-based requests;
+   it rejects malformed or duplicate entries before calling AWS. Invalid helper
+   responses are also rejected by the extension without replacing a working cache.
+
 3. Create or refresh the intended IAM Identity Center session:
 
    ```bash
@@ -318,6 +345,17 @@ helper fallback. An already mapped, still-signed-in Firefox container can avoid
 minting a new federation URL through the separately granted session-reuse path,
 but the helper must still be running so the extension can verify that the saved
 SSO identity has not changed. Portal mode does not require this token.
+
+Updating from a recent authenticated-helper version does **not** rotate the helper
+token. Restart the updated helper; keep the token already saved in the same Firefox
+profile. `--show-token` displays that persistent token and exits; it does not start
+the server. An AWS SSO login refresh does not change the helper token either.
+
+Each AWS CLI subprocess has a 30-second timeout and explicitly requests JSON
+output. Federation uses a 15-second socket-operation timeout and a 64-KiB response
+limit; that socket timeout is not a total end-to-end deadline. Failures return
+sanitized, authenticated errors rather than raw AWS output, credentials, or
+sign-in URLs. No automatic retry mints a second session.
 
 #### Updating from v1.0.3 local-helper mode
 
@@ -389,7 +427,7 @@ revoke it.
 - **A pinned portal shortcut has the wrong role:** allow portal role choices, then click the role chip on that pin and select the intended role.
 - **Portal readiness says sign-in is required:** sign in at the exact saved portal URL in a normal Firefox tab, then refresh readiness.
 - **The portal opens an ordinary tab or the container asks for login:** verify portal mode, the exact-origin grant, and the signed-in session; then reload the portal page and retry.
-- **A tab-group regex does not affect an older group:** use **Reset existing titles to automatic**. This intentionally removes stored manual Containoodle group-title overrides before recalculating them.
+- **A naming regex does not affect a manually renamed group:** use **Reset tab-group titles to automatic**. This removes stored manual Containoodle group-title overrides before recalculating them; custom container names are preserved.
 - **An unsigned XPI disappears after restart:** temporary add-ons are expected to do that. Use the Firefox Add-ons version on regular Firefox, or Developer Edition/Nightly for permanent unsigned testing.
 
 ## Security notes
@@ -412,6 +450,8 @@ hosted service. See the [privacy policy](PRIVACY.md) for the complete details.
 - The optional AWS CLI profile is a local alias used only to resolve the exact modern or legacy SSO cache namespace. Cache candidates are validated before use, multiple identities fail closed, and Containoodle never moves, rewrites, or deletes AWS CLI cache files.
 - No real account IDs, credentials, or internal account names are baked into the project. Runtime account metadata comes from `~/.aws`, the clicked AWS Access Portal page, or extension-local storage. Synthetic account IDs remain in examples and tests.
 - Container ownership is stored by AWS account ID and Firefox cookie-store ID. A pre-existing Firefox container with the same display name is not reused, so labels cannot merge two account sessions.
+- Helper session reuse additionally requires a per-container generation verified for the selected helper identity in the current extension background lifetime. Portal launches invalidate that record before copying cookies; unresolved older sign-in tabs block reuse. After an upgrade, reload, or Firefox restarting the background, the next helper launch signs in again. This conservative recovery preserves saved tokens, containers, and permissions; later verified launches can reuse the session.
+- SSO API calls use the selected identity's SSO region; the account's configured region controls the console destination. The helper bounds simultaneous requests to eight with a five-second socket idle timeout. Extension requests have a 60-second total deadline including authentication and response verification; timed-out refreshes preserve the valid account cache and saved configuration.
 - Host permissions are **opt-in at runtime and independently revocable**: core portal setup asks only for the exact configured portal origin. Optional role discovery requests only `https://portal.sso.<region>.amazonaws.com/*` for the detected or configured region. Optional backend session reuse requests only `https://*.console.aws.amazon.com/*`; the first backend **Save & test** offers it once, but declining or revoking it leaves helper mode functional and stops automatic re-prompts. Legacy broad grants remain effective for compatibility. Tightening removes one only after explicit user action plus proof that Firefox stored the narrow replacement; **Revoke** directly removes the feature's recognized grants. Startup, update, Options load, and mode switching do not migrate existing permissions; a newly accepted request is rolled back if its context changed while the prompt was open. Containoodle has no hosted backend and sends no analytics or telemetry to a Containoodle service.
 - Containoodle's complete data handling, retention, and deletion terms are in the [privacy policy](PRIVACY.md). Firefox's install prompt discloses the data categories the extension handles even though none of that data is sent to the developer.
 - In portal mode, a document-start handler on the exact configured portal reads the validated shortcut URL and the displayed account name associated with the role you click. It does not read forms, credentials, or the rest of the account list. A bounded tab-URL fallback may remove a proven portal-created child tab or return the source tab to the portal only after a successful handoff; redirected or unrelated tabs are left alone.
@@ -421,8 +461,9 @@ hosted service. See the [privacy policy](PRIVACY.md) for the complete details.
 ## Development
 
 ```bash
-node --version  # Node.js 20 or newer
+node --version  # Node.js 24 LTS or newer
 npm ci --ignore-scripts
+npm run audit:dependencies
 python3 -m py_compile server.py
 for js_file in $(git ls-files '*.js'); do node --check "$js_file"; done
 npm run check
@@ -430,6 +471,12 @@ npm run check
 
 - **CI** (`.github/workflows/ci.yml`) runs these checks, validates the manifest, runs `web-ext lint`, and smoke-builds an XPI on every push or pull request to `main`.
 - **Releases** (`.github/workflows/release.yml`) test and build a versioned unsigned GitHub XPI, submit that version to the listed AMO channel, and create the GitHub Release when a pushed `v*` tag matches `manifest.json`.
+
+Use the guarded `npm run lint:ext` entry point. The full dependency gate includes
+build tools and documents the temporary image-parser containment in
+[TOOLING_SECURITY.md](TOOLING_SECURITY.md). Local candidate preparation does not
+publish. Review instructions are in [REVIEWER_GUIDE.md](REVIEWER_GUIDE.md), and the
+one-pass acceptance checklist is [TESTING_1.2.0.md](TESTING_1.2.0.md).
 
 Before tagging, update the version in `firefox-extension/manifest.json` and
 `package.json`, then commit those changes. Replace `X.Y.Z` below with the same

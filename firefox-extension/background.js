@@ -11,6 +11,7 @@
    ═══════════════════════════════════════════════════════════════════ */
 
 import { accountEnv } from "./sidebar/env.js";
+import { validateAccounts } from "./shared/accounts.js";
 import {
   consoleDeepLink,
   portalCookieUrl,
@@ -24,7 +25,7 @@ import {
   canRemovePortalShortcutTab,
   planPortalTabHandoff,
 } from "./shared/portal.js";
-import { automaticGroupTitle } from "./shared/group-naming.js";
+import { automaticAccountName, automaticGroupTitle } from "./shared/group-naming.js";
 import {
   BACKEND_AUTH_TOKEN_KEY,
   BACKEND_SSO_IDENTITY_KEY,
@@ -42,6 +43,11 @@ import {
   BACKEND_SESSION_REUSE_ORIGIN,
   roleDiscoveryOrigin,
 } from "./shared/permissions.js";
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_STATES,
+  onboardingStateForLifecycle,
+} from "./shared/onboarding.js";
 
 const DEFAULT_CONFIG = {
   mode: "backend",
@@ -52,12 +58,15 @@ const DEFAULT_CONFIG = {
   groupNameReplacement: "",
 };
 
+const RESOLVE_CONNECTION_ONBOARDING = "resolve-connection-onboarding";
+
 const ENV_CONTAINER_COLOR = { prod: "red", qa: "yellow", dev: "green", test: "toolbar" };
 const ENV_GROUP_COLOR = { prod: "red", qa: "yellow", dev: "green", test: "grey" };
 const REGION_RE = /^[a-z]{2}-[a-z]+-\d$/;
 const BACKEND_SESSION_REUSE_ORIGINS = [BACKEND_SESSION_REUSE_ORIGIN];
 let storageMigrationPromise = null;
 let connectionModeRevision = 0;
+let connectionOnboardingInitialization = null;
 
 function ensureStorageMigration() {
   if (!storageMigrationPromise) {
@@ -92,7 +101,7 @@ async function getConfig() {
 
 async function getBackendAccounts() {
   const { accountsCache } = await browser.storage.local.get("accountsCache");
-  return Array.isArray(accountsCache) ? accountsCache : [];
+  return validateAccounts(accountsCache).accounts || [];
 }
 
 async function getBackendAuthToken() {
@@ -439,19 +448,49 @@ async function availableOwnedContainerName(name, mappedStoreId = null) {
   return candidate;
 }
 
-async function reconcileMappedContainer(identity, accountId, name, env) {
+function isLegacyAutomaticContainerName(currentName, originalName) {
+  if (currentName === originalName) return true;
+  const escapedName = String(originalName).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escapedName} · Containoodle(?: \\([1-9]\\d*\\))?$`)
+    .test(currentName);
+}
+
+async function reconcileMappedContainer(
+  identity, accountId, name, env, config, { updateColor = true } = {},
+) {
+  const originalKey = `containerOriginalName/${identity.cookieStoreId}`;
+  const automaticKey = `containerAutomaticName/${identity.cookieStoreId}`;
+  const stored = await browser.storage.local.get([originalKey, automaticKey]);
+  const previousName = identity.name;
+  const wasAutomatic = typeof stored[automaticKey] === "string"
+    ? previousName === stored[automaticKey]
+    : isLegacyAutomaticContainerName(previousName, stored[originalKey] || name);
+  const automatic = wasAutomatic || isPlaceholderContainerName(previousName, accountId);
+  const displayName = automaticAccountName(
+    name, config.groupNamePattern, config.groupNameReplacement,
+  );
   const expectedColor = ENV_CONTAINER_COLOR[env] || "orange";
   const properties = {};
-  if (identity.color !== expectedColor) properties.color = expectedColor;
-  if (
-    name &&
-    identity.name !== name &&
-    isPlaceholderContainerName(identity.name, accountId)
-  ) {
-    properties.name = await availableOwnedContainerName(name, identity.cookieStoreId);
+  if (updateColor && identity.color !== expectedColor) properties.color = expectedColor;
+  if (name && automatic) {
+    const availableName = await availableOwnedContainerName(displayName, identity.cookieStoreId);
+    if (previousName !== availableName) properties.name = availableName;
   }
-  if (Object.keys(properties).length === 0) return identity;
-  return browser.contextualIdentities.update(identity.cookieStoreId, properties);
+
+  // Do not overwrite a user rename made while checking name availability.
+  const current = await browser.contextualIdentities.get(identity.cookieStoreId);
+  const nameUnchanged = current.name === previousName;
+  if (!nameUnchanged) delete properties.name;
+  const updated = Object.keys(properties).length > 0
+    ? await browser.contextualIdentities.update(identity.cookieStoreId, properties)
+    : current;
+  const values = {};
+  if (stored[originalKey] !== name) values[originalKey] = name;
+  if (automatic && nameUnchanged && stored[automaticKey] !== updated.name) {
+    values[automaticKey] = updated.name;
+  }
+  if (Object.keys(values).length > 0) await browser.storage.local.set(values);
+  return updated;
 }
 
 /* Read-only lookup used before a backend helper round-trip. A stale or rejected
@@ -469,6 +508,7 @@ async function getMappedContainer(accountId) {
 
 const findOrCreateContainer = synchronize(async (accountId, name, env, mode) => {
   return serializeContainerMutation(async () => {
+    const config = await getConfig();
     const mappingKey = `accountContainer/${accountId}`;
     const { [mappingKey]: mappedStoreId } = await browser.storage.local.get(mappingKey);
     if (typeof mappedStoreId === "string") {
@@ -479,6 +519,8 @@ const findOrCreateContainer = synchronize(async (accountId, name, env, mode) => 
         await browser.storage.local.remove([
           mappingKey,
           `containerAccount/${mappedStoreId}`,
+          `containerOriginalName/${mappedStoreId}`,
+          `containerAutomaticName/${mappedStoreId}`,
         ]);
       }
       if (identity) {
@@ -486,7 +528,7 @@ const findOrCreateContainer = synchronize(async (accountId, name, env, mode) => 
           [`containerAccount/${mappedStoreId}`]: accountId,
         });
         try {
-          return await reconcileMappedContainer(identity, accountId, name, env);
+          return await reconcileMappedContainer(identity, accountId, name, env, config);
         } catch {
           // A cosmetic update must not invalidate a proven account mapping.
           return identity;
@@ -496,7 +538,9 @@ const findOrCreateContainer = synchronize(async (accountId, name, env, mode) => 
 
     // Never adopt an unrelated Firefox container solely because its display
     // name matches. The account-id mapping, not the label, owns identity.
-    const containerName = await availableOwnedContainerName(name);
+    const containerName = await availableOwnedContainerName(automaticAccountName(
+      name, config.groupNamePattern, config.groupNameReplacement,
+    ));
 
     const identity = await browser.contextualIdentities.create({
       name: containerName,
@@ -506,11 +550,55 @@ const findOrCreateContainer = synchronize(async (accountId, name, env, mode) => 
     await browser.storage.local.set({
       [mappingKey]: identity.cookieStoreId,
       [`containerAccount/${identity.cookieStoreId}`]: accountId,
+      [`containerOriginalName/${identity.cookieStoreId}`]: name,
+      [`containerAutomaticName/${identity.cookieStoreId}`]: containerName,
     });
     if (mode === "backend") await seedConsentCookie(identity.cookieStoreId);
     return identity;
   });
 });
+
+function queueAutomaticContainerNameRefresh() {
+  return serializeContainerMutation(async () => {
+    try {
+      // Always read the current rule inside the queue, not a stale event snapshot.
+      const all = await browser.storage.local.get(null);
+      const config = { ...DEFAULT_CONFIG, ...(all.config || {}) };
+      if (!config.groupNamePattern && !Object.keys(all).some(
+        (key) => key.startsWith("containerAutomaticName/"),
+      )) return;
+      const sourceAccounts = config.mode === "portal"
+        ? all.portalPinnedAccounts
+        : validateAccounts(all.accountsCache).accounts;
+      const names = new Map((Array.isArray(sourceAccounts) ? sourceAccounts : [])
+        .filter((account) => account && typeof account.accountName === "string")
+        .map((account) => [String(account.accountId), account.accountName]));
+
+      for (const [key, storeId] of Object.entries(all)) {
+        const match = /^accountContainer\/(\d{12})$/.exec(key);
+        if (!match || typeof storeId !== "string") continue;
+        const accountId = match[1];
+        // Passive display updates never claim or repair ownership.
+        if (String(all[`containerAccount/${storeId}`]) !== accountId) continue;
+        const originalName = (config.mode === "portal"
+          ? all[`portalAccountOriginalName/${accountId}`] || names.get(accountId)
+          : names.get(accountId)) || all[`containerOriginalName/${storeId}`];
+        if (typeof originalName !== "string" || !originalName.trim()) continue;
+        try {
+          const identity = await browser.contextualIdentities.get(storeId);
+          await reconcileMappedContainer(
+            identity, accountId, originalName, accountEnv(originalName), config,
+            { updateColor: false },
+          );
+        } catch {
+          // A stale container or cosmetic failure must not affect other accounts.
+        }
+      }
+    } catch {
+      // Naming cannot block startup, authentication, or account launches.
+    }
+  });
+}
 
 /* Pre-seed the AWS console cookie-consent cookie (non-essential
    declined) so fresh containers never show the cookie banner.
@@ -681,7 +769,7 @@ function copiedPortalCookieMatches(candidate, source) {
    booleans, never the portal cookie value. Session detection shares the
    same FPI/partition selection as launch so Options cannot report a cookie
    jar that the handoff would reject. */
-async function portalReadiness() {
+async function portalReadiness({ allowRemoteRegionLookup = true } = {}) {
   const config = await getConfig();
   const result = {
     ok: true,
@@ -718,7 +806,7 @@ async function portalReadiness() {
     // Precompute the exact regional request target before the Options click.
     // Optional discovery failure must never make core portal readiness fail.
     let region = await knownPortalRegion(config);
-    if (!region && result.session) {
+    if (!region && result.session && allowRemoteRegionLookup) {
       try {
         region = await portalRegion(config);
       } catch {
@@ -1075,14 +1163,97 @@ async function openPortal(expectedMode) {
 /* ─── Backend mode ───────────────────────────────────────────────── */
 
 const BACKEND_REUSE_BIND_TIMEOUT_MS = 120_000;
-const pendingBackendReuseBindings = new Map();
+const sessionMutationQueues = new Map();
+const sessionLaunches = new Map();
+const invalidatedSessionGenerations = new Set();
+const verifiedSessionGenerations = new Set();
+let sessionLaunchesLoaded = null;
 
-function clearPendingBackendReuseBinding(tabId) {
-  const pending = pendingBackendReuseBindings.get(tabId);
-  if (!pending) return null;
-  pendingBackendReuseBindings.delete(tabId);
-  clearTimeout(pending.timer);
-  return pending;
+function sessionStateKey(storeId) {
+  return `containerSession/${storeId}`;
+}
+
+function serializeSessionMutation(storeId, operation) {
+  const previous = sessionMutationQueues.get(storeId) || Promise.resolve();
+  const result = previous.then(operation, operation);
+  const settled = result.catch(() => {});
+  sessionMutationQueues.set(storeId, settled);
+  void settled.then(() => {
+    if (sessionMutationQueues.get(storeId) === settled) {
+      sessionMutationQueues.delete(storeId);
+    }
+  });
+  return result;
+}
+
+function validSessionState(state) {
+  return Boolean(state && state.version === 1 &&
+    typeof state.generation === "string" &&
+    typeof state.accountId === "string" && Array.isArray(state.pending) &&
+    state.pending.every((pending) => pending && typeof pending === "object" &&
+      !Array.isArray(pending) && Number.isInteger(pending.tabId) &&
+      typeof pending.generation === "string"));
+}
+
+async function readSessionState(storeId) {
+  const key = sessionStateKey(storeId);
+  const stored = await browser.storage.local.get(key);
+  return validSessionState(stored[key]) ? stored[key] : null;
+}
+
+function sessionIsReusable(state, accountId, identityKey) {
+  return Boolean(validSessionState(state) && state.accountId === accountId &&
+    state.mode === "backend" && state.verified === true &&
+    state.identityKey === identityKey && state.pending.length === 0 &&
+    verifiedSessionGenerations.has(state.generation) &&
+    !invalidatedSessionGenerations.has(state.generation));
+}
+
+function noteSessionNavigation(tabId) {
+  const launch = sessionLaunches.get(tabId);
+  if (!launch) return;
+  launch.navigationRevision = (launch.navigationRevision || 0) + 1;
+  if (launch.verifyingGeneration) {
+    launch.canVerify = false;
+    invalidatedSessionGenerations.add(launch.verifyingGeneration);
+  }
+}
+
+async function ensureSessionLaunchesLoaded() {
+  if (!sessionLaunchesLoaded) {
+    sessionLaunchesLoaded = (async () => {
+      const stored = await browser.storage.local.get(null);
+      for (const [key, state] of Object.entries(stored)) {
+        if (!key.startsWith("containerSession/") || !validSessionState(state)) continue;
+        const cookieStoreId = key.slice("containerSession/".length);
+        for (const pending of state.pending) {
+          sessionLaunches.set(pending.tabId, { ...pending, cookieStoreId });
+        }
+      }
+      // A previous background may have stopped after committing verification
+      // but before recording a superseding navigation. Persisted verification
+      // is never reuse authority in this lifetime. Recover unresolved tabs
+      // from Firefox itself so a lost corrective write cannot erase their
+      // fence when a new helper sign-in starts.
+      for (const tab of await browser.tabs.query({})) {
+        const accountId = stored[`containerAccount/${tab.cookieStoreId}`];
+        if (!Number.isInteger(tab.id) || typeof accountId !== "string" ||
+          stored[`accountContainer/${accountId}`] !== tab.cookieStoreId ||
+          sessionLaunches.has(tab.id) ||
+          (tab.status === "complete" && isAwsConsoleUrl(tab.url))) continue;
+        sessionLaunches.set(tab.id, {
+          tabId: tab.id,
+          cookieStoreId: tab.cookieStoreId,
+          generation: crypto.randomUUID(),
+          canVerify: false,
+        });
+      }
+    })().catch((error) => {
+      sessionLaunchesLoaded = null;
+      throw error;
+    });
+  }
+  await sessionLaunchesLoaded;
 }
 
 function isAwsConsoleUrl(value) {
@@ -1105,71 +1276,172 @@ function isAwsConsoleUrl(value) {
   );
 }
 
-async function verifyPendingBackendReuseBinding(tabId) {
-  const candidate = pendingBackendReuseBindings.get(tabId);
-  if (!candidate) return;
-
-  let tab;
+async function settleSessionLaunch(tabId, removed = false) {
   try {
-    tab = await browser.tabs.get(tabId);
-  } catch {
-    clearPendingBackendReuseBinding(tabId);
-    return;
-  }
-  if (tab.status !== "complete") return;
-
-  // A completed non-console navigation is a failed federation attempt. Take
-  // this exact pending launch once so later browsing cannot retroactively bind
-  // it as a reusable session.
-  const pending = clearPendingBackendReuseBinding(tabId);
-  if (
-    !pending ||
-    tab.cookieStoreId !== pending.cookieStoreId ||
-    !isAwsConsoleUrl(tab.url)
-  ) return;
-
-  const mappingKey = `accountContainer/${pending.accountId}`;
-  const ownerKey = `containerAccount/${pending.cookieStoreId}`;
-  try {
-    if (!(await backendIdentityIsCurrent(pending.backendIdentity))) return;
-    const config = await getConfig();
-    if (config.mode !== "backend") return;
-    const stored = await browser.storage.local.get([mappingKey, ownerKey]);
-    if (
-      stored[mappingKey] !== pending.cookieStoreId ||
-      stored[ownerKey] !== pending.accountId
-    ) return;
-    if (!(await backendIdentityIsCurrent(pending.backendIdentity))) return;
-    if ((await getConfig()).mode !== "backend") return;
-    await browser.storage.local.set({
-      [`backendContainerIdentity/${pending.accountId}`]:
-        pending.backendIdentity.identityKey,
+    await ensureSessionLaunchesLoaded();
+    const launch = sessionLaunches.get(tabId);
+    if (!launch) return;
+    await serializeSessionMutation(launch.cookieStoreId, async () => {
+      // The generation check and final write share the same queue as every
+      // session-changing launch. An already-running verifier cannot restore
+      // ownership after a portal launch invalidates it.
+      if (sessionLaunches.get(tabId) !== launch) return;
+      const navigationRevision = launch.navigationRevision || 0;
+      const navigationUnchanged = () =>
+        navigationRevision === (launch.navigationRevision || 0);
+      let tab = null;
+      if (!removed) {
+        try { tab = await browser.tabs.get(tabId); } catch { /* Closed tab. */ }
+        if (tab && tab.status !== "complete") return;
+      }
+      const state = await readSessionState(launch.cookieStoreId);
+      if (!state) return;
+      const matching = state.pending.find((entry) =>
+        entry.tabId === tabId && entry.generation === launch.generation);
+      if (!matching) {
+        // A failed corrective write can also erase the durable pending entry
+        // in this same background lifetime. A loaded sign-in/error page can
+        // still retry, so retain every live non-console transition, whether
+        // it came from restart recovery or the current runtime.
+        if (tab && !isAwsConsoleUrl(tab.url)) return;
+        sessionLaunches.delete(tabId);
+        return;
+      }
+      if (tab && !isAwsConsoleUrl(tab.url)) {
+        // Portal SPAs can finish loading before they start federation. An
+        // error/sign-in document can also retry later. Keep their transition
+        // tracked until console navigation or close; a document completion
+        // alone does not prove that it can no longer change the cookie jar.
+        // A helper error page must never bind on a later manual navigation.
+        if (matching.canVerify !== false) {
+          await browser.storage.local.set({
+            [sessionStateKey(launch.cookieStoreId)]: {
+              ...state,
+              verified: false,
+              pending: state.pending.map((entry) => entry === matching
+                ? { ...entry, canVerify: false } : entry),
+            },
+          });
+        }
+        return;
+      }
+      launch.verifyingGeneration = state.generation;
+      const revokeNavigation = async () => {
+        launch.canVerify = false;
+        invalidatedSessionGenerations.add(state.generation);
+        await browser.storage.local.set({
+          [sessionStateKey(launch.cookieStoreId)]: {
+            ...state,
+            verified: false,
+            pending: state.pending.map((entry) => entry === matching
+              ? { ...entry, canVerify: false } : entry),
+          },
+        });
+      };
+      const pending = state.pending.filter((entry) => entry !== matching);
+      let verified = false;
+      if (tab && tab.cookieStoreId === launch.cookieStoreId &&
+        isAwsConsoleUrl(tab.url) && state.generation === launch.generation &&
+        state.mode === "backend" && pending.length === 0 &&
+        matching.canVerify !== false && launch.canVerify !== false &&
+        launch.backendIdentity && launch.expiresAt > Date.now()) {
+        const mappingKey = `accountContainer/${state.accountId}`;
+        const ownerKey = `containerAccount/${launch.cookieStoreId}`;
+        const stored = await browser.storage.local.get([mappingKey, ownerKey]);
+        verified = stored[mappingKey] === launch.cookieStoreId &&
+          stored[ownerKey] === state.accountId &&
+          await backendIdentityIsCurrent(launch.backendIdentity);
+      }
+      if (!navigationUnchanged()) {
+        await revokeNavigation();
+        return;
+      }
+      // A late older completion may have replaced the cookie jar. Even when
+      // it was a valid helper login, it cannot prove the newest session.
+      await browser.storage.local.set({
+        [sessionStateKey(launch.cookieStoreId)]: { ...state, pending, verified },
+      });
+      // Navigation events run synchronously even while this storage write is
+      // awaiting Firefox. Keep the launch tracked and revoke its generation
+      // before another queued launch can consume an outdated verification.
+      if (!navigationUnchanged()) {
+        await revokeNavigation();
+        return;
+      }
+      if (verified) verifiedSessionGenerations.add(state.generation);
+      sessionLaunches.delete(tabId);
     });
   } catch {
-    // Verification is deliberately fail-closed. The previous marker remains.
+    // Leave the persisted pending entry in place, which disables reuse.
   }
 }
 
-function scheduleBackendReuseBinding(tab, accountId, backendIdentity) {
-  if (!Number.isInteger(tab.id) || typeof tab.cookieStoreId !== "string") return;
-  clearPendingBackendReuseBinding(tab.id);
-  const pending = {
+async function beginSessionMutation(container, accountId, mode, backendIdentity) {
+  const storeId = container.cookieStoreId;
+  const previous = await readSessionState(storeId);
+  const pending = [...(previous?.pending || [])];
+  for (const launch of sessionLaunches.values()) {
+    if (launch.cookieStoreId !== storeId || pending.some((entry) =>
+      entry.tabId === launch.tabId && entry.generation === launch.generation)) continue;
+    pending.push({
+      tabId: launch.tabId,
+      generation: launch.generation,
+      canVerify: false,
+    });
+  }
+  const state = {
+    version: 1,
+    generation: crypto.randomUUID(),
     accountId,
-    cookieStoreId: tab.cookieStoreId,
-    backendIdentity,
-    timer: null,
+    mode,
+    identityKey: backendIdentity?.identityKey || null,
+    verified: false,
+    pending,
   };
-  pending.timer = setTimeout(() => {
-    if (pendingBackendReuseBindings.get(tab.id) === pending) {
-      clearPendingBackendReuseBinding(tab.id);
-    }
-  }, BACKEND_REUSE_BIND_TIMEOUT_MS);
-  pending.timer?.unref?.();
-  pendingBackendReuseBindings.set(tab.id, pending);
+  // Persist invalidation before cookie copying or any sign-in navigation.
+  // Older identity-only markers are intentionally never consulted.
+  await browser.storage.local.set({ [sessionStateKey(storeId)]: state });
+  return state;
+}
 
-  // The redirect may complete before tabs.create() resolves or before the
-  // listener observes its update. Inspect the exact created tab once now too.
-  void verifyPendingBackendReuseBinding(tab.id);
+async function navigateSessionTab(properties, state, backendIdentity, isCurrent) {
+  // A blank tab cannot change AWS sessions. Record its ID durably before
+  // navigating, so a suspended/restarted background cannot lose an old
+  // outstanding sign-in and later misattribute its session to a newer one.
+  const tab = await browser.tabs.create({ ...properties, url: "about:blank" });
+  const launch = { tabId: tab.id, generation: state.generation };
+  const removeBlankTab = async () => {
+    try {
+      const current = await browser.tabs.get(tab.id);
+      if (current.url === "about:blank" && current.cookieStoreId === properties.cookieStoreId) {
+        await browser.tabs.remove(tab.id);
+      }
+    } catch { /* Already closed or changed by the user. */ }
+  };
+  try {
+    await browser.storage.local.set({
+      [sessionStateKey(properties.cookieStoreId)]: {
+        ...state,
+        pending: [...state.pending, launch],
+      },
+    });
+    sessionLaunches.set(tab.id, {
+      ...launch,
+      cookieStoreId: properties.cookieStoreId,
+      backendIdentity,
+      expiresAt: Date.now() + BACKEND_REUSE_BIND_TIMEOUT_MS,
+    });
+    if (!(await isCurrent())) {
+      await removeBlankTab();
+      return null;
+    }
+    return await browser.tabs.update(tab.id, { url: properties.url });
+  } catch (error) {
+    // Never leave an empty staging tab behind on a storage/navigation error.
+    // If navigation did begin, retain the tracked tab and its reuse fence.
+    await removeBlankTab();
+    throw error;
+  }
 }
 
 async function backendSigninUrl(backendUrl, account, role, backendIdentity) {
@@ -1388,8 +1660,9 @@ async function resolveAccount(accountId, config) {
         rethrowBackendAuthenticationError(err);
       }
       if (res.status === 401) throw backendAuthRejectedError();
+      if (!res.ok) return undefined;
       const data = await res.json();
-      if (Array.isArray(data)) return data.find((a) => a.accountId === accountId);
+      return validateAccounts(data).accounts?.find((a) => a.accountId === accountId);
     } catch (err) {
       if (err && err.needsOptions) throw err;
       return undefined;
@@ -1417,6 +1690,9 @@ async function preflight(config) {
 
 async function launch(accountId, explicitRole, options = {}) {
   await ensureStorageMigration();
+  await ensureSessionLaunchesLoaded();
+  await Promise.all([...sessionLaunches.keys()].map((tabId) =>
+    settleSessionLaunch(tabId)));
   const config = await getConfig();
   const launchMode = config.mode;
   const launchModeRevision = connectionModeRevision;
@@ -1478,6 +1754,7 @@ async function launch(accountId, explicitRole, options = {}) {
   let resolvedRole = null;
   let backendIdentity = null;
   let freshBackendSignin = false;
+  let reusableSession = null;
 
   if (config.mode === "backend") {
     try {
@@ -1501,16 +1778,15 @@ async function launch(accountId, explicitRole, options = {}) {
       !(await backendIdentityIsCurrent(backendIdentity))
     ) return cancelled();
 
-    // A live console session is reusable only when it was created for this
-    // authenticated SSO identity. Legacy/unscoped metadata is preserved but
-    // deliberately ignored.
-    const reuseKey = `backendContainerIdentity/${account.accountId}`;
-    const { [reuseKey]: boundIdentity } = await browser.storage.local.get(
-      reuseKey
-    );
-    const reusableContainer = !explicitRole && boundIdentity === backendIdentity.identityKey
-      ? await getMappedContainer(account.accountId)
-      : null;
+    // Reuse requires a verified generation for this exact cookie jar, not an
+    // identity string left behind before another mode changed its session.
+    const mappedContainer = !explicitRole
+      ? await getMappedContainer(account.accountId) : null;
+    const session = mappedContainer
+      ? await readSessionState(mappedContainer.cookieStoreId) : null;
+    const reusableContainer = sessionIsReusable(
+      session, account.accountId, backendIdentity.identityKey,
+    ) ? mappedContainer : null;
     if (!(await backendIdentityIsCurrent(backendIdentity))) return cancelled();
     const liveRegion = reusableContainer
       ? await liveConsoleRegion(reusableContainer.cookieStoreId)
@@ -1525,6 +1801,10 @@ async function launch(accountId, explicitRole, options = {}) {
         config.mode
       );
       if (!(await modeIsCurrent())) return cancelled();
+      reusableSession = {
+        generation: session.generation,
+        cookieStoreId: reusableContainer.cookieStoreId,
+      };
       url = `https://${liveRegion}.console.aws.amazon.com/console/home?region=${liveRegion}`;
     } else {
       let role;
@@ -1631,16 +1911,6 @@ async function launch(accountId, explicitRole, options = {}) {
         error: `No role for ${account.accountName} — sign in to the portal so roles can be discovered, or choose a role for its pinned shortcut`,
       };
     }
-    let hasSession;
-    try {
-      if (!(await modeIsCurrent())) return cancelled();
-      hasSession = await copyPortalCookie(config.portalStartUrl, container.cookieStoreId);
-    } catch {
-      return { ok: false, needsOptions: true, error: "Portal access not granted" };
-    }
-    if (!hasSession) {
-      return { ok: false, needsLogin: true, error: "No portal session" };
-    }
     // A portal-click handoff keeps the portal's complete shortcut URL,
     // including an optional destination. Sidebar launches build one.
     url = portalLaunch
@@ -1657,10 +1927,47 @@ async function launch(accountId, explicitRole, options = {}) {
   ) return cancelled();
   const createProperties = { url, cookieStoreId: container.cookieStoreId };
   if (Number.isInteger(options.windowId)) createProperties.windowId = options.windowId;
-  const tab = await browser.tabs.create(createProperties);
-  if (config.mode === "backend" && freshBackendSignin) {
-    scheduleBackendReuseBinding(tab, account.accountId, backendIdentity);
+  let tab;
+  try {
+    const result = await serializeSessionMutation(container.cookieStoreId, async () => {
+      if (!(await modeIsCurrent()) || (backendIdentity &&
+        !(await backendIdentityIsCurrent(backendIdentity)))) return cancelled();
+      if (reusableSession) {
+        const current = await readSessionState(container.cookieStoreId);
+        if (container.cookieStoreId !== reusableSession.cookieStoreId ||
+          current?.generation !== reusableSession.generation ||
+          !sessionIsReusable(current, account.accountId, backendIdentity.identityKey)) {
+          return cancelled();
+        }
+        return { tab: await browser.tabs.create(createProperties) };
+      }
+      const state = await beginSessionMutation(
+        container, account.accountId, config.mode, backendIdentity,
+      );
+      if (config.mode === "portal") {
+        let hasSession;
+        try {
+          hasSession = await copyPortalCookie(config.portalStartUrl, container.cookieStoreId);
+        } catch {
+          return { ok: false, needsOptions: true, error: "Portal access not granted" };
+        }
+        if (!hasSession) return { ok: false, needsLogin: true, error: "No portal session" };
+      }
+      if (!(await modeIsCurrent()) || (backendIdentity &&
+        !(await backendIdentityIsCurrent(backendIdentity)))) return cancelled();
+      const created = await navigateSessionTab(
+        createProperties, state, backendIdentity,
+        async () => await modeIsCurrent() && (!backendIdentity ||
+          await backendIdentityIsCurrent(backendIdentity)),
+      );
+      return created ? { tab: created } : cancelled();
+    });
+    if (!result.tab) return result;
+    tab = result.tab;
+  } catch {
+    return { ok: false, error: "Could not safely open the account session — try again" };
   }
+  if (freshBackendSignin || config.mode === "portal") void settleSessionLaunch(tab.id);
   await addToGroup(tab, account, env);
   try {
     if (config.mode === "portal") {
@@ -1884,7 +2191,7 @@ async function refreshAutomaticGroupTitles(config) {
     const all = await browser.storage.local.get(null);
     const storedAccounts = config.mode === "portal"
       ? all.portalPinnedAccounts
-      : all.accountsCache;
+      : validateAccounts(all.accountsCache).accounts;
     const cachedNames = new Map(
       (Array.isArray(storedAccounts) ? storedAccounts : [])
         .filter((account) => account && typeof account.accountName === "string")
@@ -1894,9 +2201,14 @@ async function refreshAutomaticGroupTitles(config) {
       const match = /^tabGroups\/(\d{12})\/.+/.exec(key);
       if (!match || typeof groupId !== "number") return;
       const accountId = match[1];
-      const originalName = config.mode === "portal"
+      const mappedStoreId = all[`accountContainer/${accountId}`];
+      const containerOriginal = typeof mappedStoreId === "string" &&
+        String(all[`containerAccount/${mappedStoreId}`]) === accountId
+        ? all[`containerOriginalName/${mappedStoreId}`]
+        : null;
+      const originalName = (config.mode === "portal"
         ? all[`portalAccountOriginalName/${accountId}`] || cachedNames.get(accountId)
-        : cachedNames.get(accountId);
+        : cachedNames.get(accountId)) || containerOriginal;
       if (typeof originalName !== "string" || !originalName.trim()) return;
       const revision = manualGroupTitleRevision.get(groupId) || 0;
       const pendingManualWrite = manualGroupTitleWrites.get(groupId);
@@ -1982,8 +2294,8 @@ async function migrateLegacyStorage() {
     const activeAccounts = config.mode === "portal"
       ? (migratedPortalPins || [])
       : (
-          all.accountsCacheSource !== "manual" && Array.isArray(all.accountsCache)
-            ? all.accountsCache
+          all.accountsCacheSource !== "manual"
+            ? (validateAccounts(all.accountsCache).accounts || [])
             : []
         );
     const knownOriginalNames = new Map();
@@ -2055,7 +2367,49 @@ async function cleanupStaleGroups() {
   }
 }
 
+/* Mark only genuine, unconfigured installs for first-run setup. Existing
+   profiles are grandfathered on update (and on install-like development
+   reloads that retain config), so lifecycle events never change their mode
+   or permissions. A marker failure must not interfere with background work. */
+async function initializeConnectionOnboarding(details = {}) {
+  try {
+    const stored = await browser.storage.local.get([ONBOARDING_KEY, "config"]);
+    const nextState = onboardingStateForLifecycle({
+      reason: details.reason,
+      storedState: stored[ONBOARDING_KEY],
+      hasConfig: Object.prototype.hasOwnProperty.call(stored, "config"),
+    });
+    if (
+      nextState === ONBOARDING_STATES.CHOOSE ||
+      nextState === ONBOARDING_STATES.COMPLETE
+    ) {
+      await browser.storage.local.set({ [ONBOARDING_KEY]: nextState });
+    }
+  } catch {
+    // Onboarding is additive UI; storage failures must preserve core behavior.
+  }
+}
+
+function beginConnectionOnboarding(details) {
+  connectionOnboardingInitialization = initializeConnectionOnboarding(details);
+  return connectionOnboardingInitialization;
+}
+
+async function resolveConnectionOnboarding() {
+  try {
+    if (connectionOnboardingInitialization) {
+      await connectionOnboardingInitialization;
+    }
+    const stored = await browser.storage.local.get(ONBOARDING_KEY);
+    return { state: stored[ONBOARDING_KEY] };
+  } catch {
+    // The sidebar deliberately falls back to established behavior on failure.
+    return {};
+  }
+}
+
 browser.runtime.onStartup.addListener(cleanupStaleGroups);
+browser.runtime.onInstalled.addListener(beginConnectionOnboarding);
 browser.runtime.onInstalled.addListener(cleanupStaleGroups);
 browser.runtime.onStartup.addListener(seedKnownGroupTitles);
 browser.runtime.onInstalled.addListener(seedKnownGroupTitles);
@@ -2335,9 +2689,8 @@ browser.tabs.onCreated.addListener((tab) => {
 });
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (pendingBackendReuseBindings.has(tabId)) {
-    void verifyPendingBackendReuseBinding(tabId);
-  }
+  if (changeInfo.url || changeInfo.status === "loading") noteSessionNavigation(tabId);
+  if (changeInfo.status === "complete" || changeInfo.url) void settleSessionLaunch(tabId);
   if (!changeInfo.url) return;
   if (consumeNewTabFallback({ ...tab, id: tabId }, changeInfo.url)) return;
   const nativeFallback = portalNativeFallbacks.get(tabId);
@@ -2352,7 +2705,8 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {
-  clearPendingBackendReuseBinding(tabId);
+  noteSessionNavigation(tabId);
+  void settleSessionLaunch(tabId, true);
   portalHandoffPending.delete(tabId);
   clearNativeFallback(tabId);
   clearNewTabFallback(portalNewTabFallbacks.get(tabId));
@@ -2361,6 +2715,9 @@ browser.tabs.onRemoved.addListener((tabId) => {
 /* ─── Messages ───────────────────────────────────────────────────── */
 
 browser.runtime.onMessage.addListener((msg, sender) => {
+  if (msg && msg.type === RESOLVE_CONNECTION_ONBOARDING) {
+    return resolveConnectionOnboarding();
+  }
   if (msg && msg.type === "launch") {
     return launch(msg.accountId, msg.role, { expectedMode: msg.mode });
   }
@@ -2374,7 +2731,11 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     return setBackendPin(msg.accountId, msg.pinned, msg.mode);
   }
   if (msg && msg.type === "open-portal") return openPortal(msg.mode);
-  if (msg && msg.type === "portal-readiness") return portalReadiness();
+  if (msg && msg.type === "portal-readiness") {
+    return portalReadiness({
+      allowRemoteRegionLookup: msg.allowRemoteRegionLookup !== false,
+    });
+  }
   if (msg && msg.type === "reset-group-titles") return resetGroupTitles();
   if (msg && msg.type === "portal-interceptor-state") {
     return portalInterceptorState(sender && sender.tab);
@@ -2388,7 +2749,14 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 });
 
 browser.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes.config) return;
+  if (area !== "local") return;
+  if (!changes.config) {
+    if (Object.keys(changes).some((key) => key === "accountsCache" ||
+      key === "portalPinnedAccounts" || key.startsWith("portalAccountOriginalName/"))) {
+      void queueAutomaticContainerNameRefresh();
+    }
+    return;
+  }
   const oldMode = changes.config.oldValue?.mode;
   const newMode = changes.config.newValue?.mode;
   if (oldMode !== newMode) connectionModeRevision += 1;
@@ -2400,6 +2768,13 @@ browser.storage.onChanged.addListener((changes, area) => {
     before.groupNameReplacement !== after.groupNameReplacement
   ) {
     void queueAutomaticGroupTitleRefresh(after);
+  }
+  if (
+    before.mode !== after.mode ||
+    before.groupNamePattern !== after.groupNamePattern ||
+    before.groupNameReplacement !== after.groupNameReplacement
+  ) {
+    void queueAutomaticContainerNameRefresh();
   }
 });
 browser.permissions.onAdded.addListener(() => {
@@ -2418,6 +2793,7 @@ async function migrateAndRefreshGroupTitles() {
   if (result && result.clearedTitles > 0) {
     await queueAutomaticGroupTitleRefresh(await getConfig());
   }
+  await queueAutomaticContainerNameRefresh();
 }
 
 browser.runtime.onStartup.addListener(() => { void migrateAndRefreshGroupTitles(); });

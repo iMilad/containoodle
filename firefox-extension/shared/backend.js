@@ -2,6 +2,9 @@ export const DEFAULT_BACKEND_URL = "http://127.0.0.1:8421";
 export const BACKEND_AUTH_TOKEN_KEY = "backendAuthToken";
 export const BACKEND_SSO_PROFILE_KEY = "backendSsoProfile";
 export const BACKEND_SSO_IDENTITY_KEY = "backendSsoIdentityKey";
+// One deadline includes challenge, protected request, body and proof verification.
+// Allows the helper's bounded CLI (30s) and federation (15s) calls to finish.
+export const BACKEND_REQUEST_TIMEOUT_MS = 60_000;
 
 const BASE64URL_32_RE = /^[A-Za-z0-9_-]{43}$/;
 const BACKEND_PROOF_RE = /^[0-9a-f]{64}$/;
@@ -33,6 +36,23 @@ class BackendAuthenticationError extends Error {
   constructor(message = "Local helper authentication or trust verification failed") {
     super(message);
     this.name = "BackendAuthenticationError";
+  }
+}
+
+class BackendTimeoutError extends Error {
+  constructor() {
+    super("Local helper timed out. Check server.py and try again.");
+    this.name = "BackendTimeoutError";
+  }
+}
+
+export function isBackendTimeoutError(error) {
+  return error instanceof BackendTimeoutError;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("The request was cancelled", "AbortError");
   }
 }
 
@@ -348,6 +368,7 @@ async function parseChallengeResponse(response) {
 }
 
 async function authenticatedBackendFetch(request, keyBytes, origin, callerOptions) {
+  throwIfAborted(callerOptions.signal);
   const challengeResponse = await globalThis.fetch(
     `${request.origin}/auth/challenge`,
     {
@@ -359,7 +380,9 @@ async function authenticatedBackendFetch(request, keyBytes, origin, callerOption
       mode: "cors",
     },
   );
+  throwIfAborted(callerOptions.signal);
   const challenge = await parseChallengeResponse(challengeResponse);
+  throwIfAborted(callerOptions.signal);
   const key = await importHmacKey(keyBytes);
 
   const serverCanonical = canonical([
@@ -388,6 +411,7 @@ async function authenticatedBackendFetch(request, keyBytes, origin, callerOption
   headers.set("X-Containoodle-Challenge", challenge.challenge);
   headers.set("X-Containoodle-Request-Proof", await hmacHex(key, requestCanonical));
 
+  throwIfAborted(callerOptions.signal);
   const protectedResponse = await globalThis.fetch(request.href, {
     method: "GET",
     signal: callerOptions.signal,
@@ -397,6 +421,7 @@ async function authenticatedBackendFetch(request, keyBytes, origin, callerOption
     credentials: "omit",
     mode: "cors",
   });
+  throwIfAborted(callerOptions.signal);
   if (
     !protectedResponse ||
     !Number.isInteger(protectedResponse.status) ||
@@ -410,6 +435,7 @@ async function authenticatedBackendFetch(request, keyBytes, origin, callerOption
   }
 
   const bodyBytes = new Uint8Array(await protectedResponse.arrayBuffer());
+  throwIfAborted(callerOptions.signal);
   const bodyDigest = await sha256Hex(bodyBytes);
   const responseCanonical = canonical([
     "containoodle-response-v1",
@@ -426,6 +452,7 @@ async function authenticatedBackendFetch(request, keyBytes, origin, callerOption
   if (!(await verifyHmacHex(key, responseCanonical, responseProof || ""))) {
     throw backendAuthenticationFailure();
   }
+  throwIfAborted(callerOptions.signal);
 
   const nullBodyStatus = [204, 205, 304].includes(protectedResponse.status);
   try {
@@ -439,12 +466,45 @@ async function authenticatedBackendFetch(request, keyBytes, origin, callerOption
   }
 }
 
+async function withBackendDeadline(request, keyBytes, origin, callerOptions) {
+  const controller = new AbortController();
+  const callerSignal = callerOptions.signal;
+  const forwardAbort = () => controller.abort(
+    callerSignal.reason ?? new DOMException("The request was cancelled", "AbortError"),
+  );
+  let timer;
+  let rejectOnAbort;
+  try {
+    // The race also settles UI callers when a transport ignores cancellation.
+    // Checkpoints in the exchange prevent late work from sending another request.
+    const interrupted = new Promise((_, reject) => {
+      rejectOnAbort = () => reject(controller.signal.reason);
+      controller.signal.addEventListener("abort", rejectOnAbort, { once: true });
+    });
+    if (callerSignal) {
+      callerSignal.addEventListener("abort", forwardAbort, { once: true });
+      if (callerSignal.aborted) forwardAbort();
+    }
+    timer = setTimeout(() => controller.abort(new BackendTimeoutError()), BACKEND_REQUEST_TIMEOUT_MS);
+    return await Promise.race([
+      authenticatedBackendFetch(request, keyBytes, origin, {
+        ...callerOptions, signal: controller.signal,
+      }),
+      interrupted,
+    ]);
+  } finally {
+    clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", forwardAbort);
+    controller.signal.removeEventListener("abort", rejectOnAbort);
+  }
+}
+
 export function backendFetch(url, token, options = {}) {
   const normalized = normalizedBackendToken(token);
   const request = validateBackendRequestUrl(url, normalized.token);
   const origin = extensionOrigin();
   const callerOptions = validateBackendOptions(options, normalized.token);
-  return authenticatedBackendFetch(
+  return withBackendDeadline(
     request,
     normalized.keyBytes,
     origin,

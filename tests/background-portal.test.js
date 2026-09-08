@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
+import {
+  ONBOARDING_KEY,
+  ONBOARDING_STATES,
+} from "../firefox-extension/shared/onboarding.js";
 
 const START = "https://d-0000000000.awsapps.com/start";
 const ACCOUNT_ID = "0".repeat(12);
@@ -505,6 +509,7 @@ function makeBrowser(initialStorage = null) {
           beforeNextTabCreate = null;
           await callback(properties);
         }
+        while (tabs.has(nextTabId)) nextTabId += 1;
         const tab = {
           id: nextTabId++,
           windowId: properties.windowId ?? 1,
@@ -717,6 +722,70 @@ async function waitFor(check) {
   assert.ok(check(), "timed out waiting for background work");
 }
 
+function currentSession(fixture, accountId = ACCOUNT_ID) {
+  const storeId = fixture.storageData[`accountContainer/${accountId}`];
+  return fixture.storageData[`containerSession/${storeId}`];
+}
+
+async function primeVerifiedHelperSession(fixture, onMessage) {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = authenticatedBackendFetch({ responseForRequest: backendSigninResponse });
+  try {
+    const result = await onMessage({
+      type: "launch", accountId: ACCOUNT_ID, mode: "backend", role: TEST_HELPER_ROLE,
+    }, {});
+    assert.strictEqual(result.ok, true);
+    await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+    assert.strictEqual(currentSession(fixture).verified, true);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+  fixture.createdTabs.length = 0;
+  fixture.cookieReads.length = 0;
+  fixture.permissionContainsCalls.length = 0;
+}
+
+function addLiveConsoleCookies(fixture, storeId) {
+  fixture.addTargetPortalCookie(storeId, {
+    name: "noflush_Region",
+    value: "eu-west-1",
+    domain: ".console.aws.amazon.com",
+    hostOnly: false,
+    path: "/",
+    secure: true,
+  });
+  fixture.addTargetPortalCookie(storeId, {
+    name: "aws-signer-token_eu-west-1",
+    value: "__CONTAINOODLE_TEST_LIVE_SESSION__",
+    domain: ".console.aws.amazon.com",
+    hostOnly: false,
+    path: "/",
+    secure: true,
+    expirationDate: Math.ceil(Date.now() / 1000) + 3600,
+  });
+}
+
+async function changeConnectionMode(fixture, mode) {
+  const before = fixture.storageData.config;
+  const after = { ...before, mode };
+  fixture.storageData.config = after;
+  for (const listener of fixture.events.storageChanged.listeners) {
+    listener({ config: { oldValue: before, newValue: after } }, "local");
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+function backendSigninResponse() {
+  return { payload: {
+    ok: true,
+    containerUrl: `ext+container:name=Containoodle&url=${encodeURIComponent(BACKEND_SIGNIN_URL)}`,
+  } };
+}
+
+function generationRequestCount(requests) {
+  return requests.filter((request) => new URL(request.url).pathname === "/generate-url").length;
+}
+
 async function completeTabNavigation(
   fixture,
   tabId,
@@ -800,6 +869,204 @@ async function fireBackgroundLifecycle(event, details) {
   const rejection = settlements.find((result) => result.status === "rejected");
   if (rejection) throw rejection.reason;
 }
+
+test("connection onboarding lifecycle distinguishes new installs from existing profiles", async (t) => {
+  const cases = [
+    {
+      name: "fresh install",
+      initialStorage: {},
+      details: { reason: "install" },
+      expected: ONBOARDING_STATES.CHOOSE,
+    },
+    {
+      name: "install retaining configuration",
+      initialStorage: { config: { mode: "backend" } },
+      details: { reason: "install" },
+      expected: ONBOARDING_STATES.COMPLETE,
+    },
+    {
+      name: "update without a marker",
+      initialStorage: {},
+      details: { reason: "update", previousVersion: "1.1.1" },
+      expected: ONBOARDING_STATES.COMPLETE,
+    },
+    {
+      name: "invalid stored marker",
+      initialStorage: { [ONBOARDING_KEY]: "invalid-test-state" },
+      details: { reason: "install" },
+      expected: ONBOARDING_STATES.COMPLETE,
+    },
+  ];
+
+  for (const lifecycle of cases) {
+    await t.test(lifecycle.name, async () => {
+      const fixture = makeBrowser(lifecycle.initialStorage);
+      await loadBackground(fixture);
+      const configBefore = structuredClone(fixture.storageData.config);
+      const permissionChecksBefore = structuredClone(
+        fixture.permissionContainsCalls,
+      );
+      const originalSet = fixture.browser.storage.local.set;
+      let onboardingWrites = 0;
+      fixture.browser.storage.local.set = async (values) => {
+        if (Object.hasOwn(values, ONBOARDING_KEY)) onboardingWrites += 1;
+        return originalSet(values);
+      };
+
+      await fireBackgroundLifecycle(
+        fixture.events.runtimeInstalled,
+        lifecycle.details,
+      );
+
+      assert.strictEqual(
+        fixture.storageData[ONBOARDING_KEY],
+        lifecycle.expected,
+      );
+      assert.deepStrictEqual(fixture.storageData.config, configBefore);
+      assert.deepStrictEqual(
+        fixture.permissionContainsCalls,
+        permissionChecksBefore,
+      );
+      assert.deepStrictEqual(fixture.createdTabs, []);
+      assert.deepStrictEqual(fixture.cookieWrites, []);
+      assert.deepStrictEqual(fixture.cookieRemovals, []);
+      assert.strictEqual(onboardingWrites, 1);
+
+      await fireBackgroundLifecycle(
+        fixture.events.runtimeInstalled,
+        lifecycle.details,
+      );
+      assert.strictEqual(onboardingWrites, 1, "repeat lifecycle must not rewrite state");
+    });
+  }
+});
+
+test("sidebar onboarding resolution waits for the in-flight install marker", async () => {
+  const fixture = makeBrowser({});
+  const onMessage = await loadBackground(fixture);
+  const lifecycleListener = fixture.events.runtimeInstalled.listeners.find(
+    (listener) => listener.name === "beginConnectionOnboarding",
+  );
+  assert.ok(lifecycleListener, "missing connection onboarding lifecycle listener");
+
+  const originalGet = fixture.browser.storage.local.get;
+  let releaseLifecycleRead;
+  const lifecycleRead = new Promise((resolve) => {
+    releaseLifecycleRead = resolve;
+  });
+  let delayedLifecycleReads = 0;
+  fixture.browser.storage.local.get = async (keys) => {
+    if (
+      delayedLifecycleReads === 0 &&
+      Array.isArray(keys) &&
+      keys.length === 2 &&
+      keys.includes(ONBOARDING_KEY) &&
+      keys.includes("config")
+    ) {
+      delayedLifecycleReads += 1;
+      await lifecycleRead;
+    }
+    return originalGet(keys);
+  };
+
+  const permissionChecksBefore = structuredClone(
+    fixture.permissionContainsCalls,
+  );
+  const initialization = lifecycleListener({ reason: "install" });
+  let resolutionSettled = false;
+  const resolution = Promise.resolve(onMessage({
+    type: "resolve-connection-onboarding",
+  }, {})).then((result) => {
+    resolutionSettled = true;
+    return result;
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(delayedLifecycleReads, 1);
+  assert.strictEqual(resolutionSettled, false);
+  assert.strictEqual(Object.hasOwn(fixture.storageData, ONBOARDING_KEY), false);
+  assert.deepStrictEqual(
+    fixture.permissionContainsCalls,
+    permissionChecksBefore,
+  );
+  assert.deepStrictEqual(fixture.createdTabs, []);
+  assert.deepStrictEqual(fixture.cookieWrites, []);
+  assert.deepStrictEqual(fixture.cookieRemovals, []);
+
+  releaseLifecycleRead();
+  const [resolved] = await Promise.all([resolution, initialization]);
+  assert.deepStrictEqual(resolved, { state: ONBOARDING_STATES.CHOOSE });
+  assert.strictEqual(
+    fixture.storageData[ONBOARDING_KEY],
+    ONBOARDING_STATES.CHOOSE,
+  );
+});
+
+test("sidebar onboarding resolution preserves ordinary missing-marker behavior", async () => {
+  const fixture = makeBrowser({});
+  const onMessage = await loadBackground(fixture);
+
+  assert.deepStrictEqual(
+    await onMessage({ type: "resolve-connection-onboarding" }, {}),
+    { state: undefined },
+  );
+  assert.strictEqual(Object.hasOwn(fixture.storageData, ONBOARDING_KEY), false);
+  assert.deepStrictEqual(fixture.permissionContainsCalls, []);
+  assert.deepStrictEqual(fixture.createdTabs, []);
+  assert.deepStrictEqual(fixture.cookieWrites, []);
+  assert.deepStrictEqual(fixture.cookieRemovals, []);
+});
+
+test("connection onboarding preserves recognized state and ignores startup", async (t) => {
+  for (const state of Object.values(ONBOARDING_STATES)) {
+    await t.test(`preserves ${state}`, async () => {
+      const fixture = makeBrowser({ [ONBOARDING_KEY]: state });
+      await loadBackground(fixture);
+      const originalSet = fixture.browser.storage.local.set;
+      let onboardingWrites = 0;
+      fixture.browser.storage.local.set = async (values) => {
+        if (Object.hasOwn(values, ONBOARDING_KEY)) onboardingWrites += 1;
+        return originalSet(values);
+      };
+
+      await fireBackgroundLifecycle(
+        fixture.events.runtimeInstalled,
+        { reason: "update", previousVersion: "1.1.1" },
+      );
+
+      assert.strictEqual(fixture.storageData[ONBOARDING_KEY], state);
+      assert.strictEqual(onboardingWrites, 0);
+    });
+  }
+
+  await t.test("startup does not initialize missing state", async () => {
+    const fixture = makeBrowser({});
+    await loadBackground(fixture);
+    await fireBackgroundLifecycle(fixture.events.runtimeStartup);
+    assert.strictEqual(
+      Object.hasOwn(fixture.storageData, ONBOARDING_KEY),
+      false,
+    );
+  });
+});
+
+test("connection onboarding storage failure never rejects installation", async () => {
+  const fixture = makeBrowser({});
+  await loadBackground(fixture);
+  const originalSet = fixture.browser.storage.local.set;
+  fixture.browser.storage.local.set = async (values) => {
+    if (Object.hasOwn(values, ONBOARDING_KEY)) {
+      throw new Error("synthetic onboarding storage failure");
+    }
+    return originalSet(values);
+  };
+
+  await fireBackgroundLifecycle(
+    fixture.events.runtimeInstalled,
+    { reason: "install" },
+  );
+  assert.strictEqual(Object.hasOwn(fixture.storageData, ONBOARDING_KEY), false);
+});
 
 test("open portal focuses an exact default-store portal tab", async () => {
   const fixture = makeBrowser();
@@ -1077,7 +1344,7 @@ test("backend pin actions are inert in portal mode", async () => {
   assert.strictEqual(fetchCalls, 0);
 });
 
-test("portal account-name replacement changes only the automatic group title", async () => {
+test("portal account-name replacement changes automatic labels, not account identity or colors", async () => {
   const fixture = makeBrowser();
   fixture.storageData.portalPinnedAccounts = [];
   Object.assign(fixture.storageData.config, {
@@ -1092,7 +1359,12 @@ test("portal account-name replacement changes only the automatic group title", a
   );
 
   assert.strictEqual(groupForAccount(fixture).title, "data");
-  assert.strictEqual(fixture.identities[0].name, "corp-dev-data");
+  assert.strictEqual(fixture.identities[0].name, "data");
+  assert.strictEqual(
+    fixture.storageData[`containerOriginalName/${fixture.identities[0].cookieStoreId}`],
+    "corp-dev-data",
+  );
+  assert.strictEqual(fixture.storageData[`portalAccountOriginalName/${ACCOUNT_ID}`], "corp-dev-data");
   assert.strictEqual(fixture.identities[0].color, "green");
   assert.strictEqual(groupForAccount(fixture).color, "green");
   assert.strictEqual(
@@ -1190,7 +1462,7 @@ test("persisted manual group title overrides automatic account-name replacement"
     fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`],
     "My pinned AWS title"
   );
-  assert.strictEqual(fixture.identities[0].name, "corp-prod-billing");
+  assert.strictEqual(fixture.identities[0].name, "billing");
 });
 
 test("naming config changes retitle known automatic groups from portal pin fallback", async () => {
@@ -1302,6 +1574,382 @@ test("a naming change during portal launch wins over the launch config snapshot"
     { ok: true }
   );
   assert.strictEqual(groupForAccount(fixture).title, "new-payments");
+  await waitFor(() => fixture.identities[0].name === "new-payments");
+});
+
+function saveTestNamingRule(fixture, pattern, replacement) {
+  const oldConfig = fixture.storageData.config;
+  const newConfig = {
+    ...oldConfig,
+    groupNamePattern: pattern,
+    groupNameReplacement: replacement,
+  };
+  fixture.storageData.config = newConfig;
+  for (const listener of fixture.events.storageChanged.listeners) {
+    listener({ config: { oldValue: oldConfig, newValue: newConfig } }, "local");
+  }
+}
+
+async function handoffSyntheticNamedAccount(onMessage, accountName, accountId = ACCOUNT_ID) {
+  return onMessage({
+    type: "portal-shortcut-click",
+    url: `${START}/#/console?account_id=${accountId}&role_name=${TEST_PORTAL_ROLE}`,
+    disposition: "new-tab",
+    accountName,
+  }, { tab: SOURCE_TAB });
+}
+
+test("saving and clearing a rule renames existing automatic containers without replacing them", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.portalPinnedAccounts = [];
+  const onMessage = await loadBackground(fixture);
+  assert.deepStrictEqual(
+    await handoffSyntheticNamedAccount(onMessage, "example-prod-payments"), { ok: true },
+  );
+  const identity = fixture.identities[0];
+  const storeId = identity.cookieStoreId;
+  const tabId = fixture.createdTabs[0].id;
+  const originalStorage = structuredClone(fixture.storageData.portalPinnedAccounts);
+  const cookieWriteCount = fixture.cookieWrites.length;
+  saveTestNamingRule(fixture, "^example-prod-", "");
+  await waitFor(() => identity.name === "payments" && groupForAccount(fixture).title === "payments");
+  assert.strictEqual(identity.color, "red", "environment stays based on the original name");
+  assert.strictEqual(fixture.storageData[`accountContainer/${ACCOUNT_ID}`], storeId);
+  assert.strictEqual(fixture.storageData[`containerAccount/${storeId}`], ACCOUNT_ID);
+  assert.strictEqual(fixture.tabs.get(tabId).cookieStoreId, storeId);
+  assert.strictEqual(fixture.identities.length, 1);
+  assert.strictEqual(fixture.createdTabs.length, 1);
+  assert.strictEqual(fixture.cookieWrites.length, cookieWriteCount);
+  assert.deepStrictEqual(fixture.storageData.portalPinnedAccounts, originalStorage);
+
+  saveTestNamingRule(fixture, "", "");
+  await waitFor(() => identity.name === "example-prod-payments" &&
+    groupForAccount(fixture).title === "example-prod-payments");
+  assert.strictEqual(fixture.storageData[`containerOriginalName/${storeId}`], "example-prod-payments");
+});
+
+test("rules never merge same-label accounts or adopt unrelated Firefox containers", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.portalPinnedAccounts = [];
+  Object.assign(fixture.storageData.config, {
+    groupNamePattern: "^example-(?:dev|prod)-", groupNameReplacement: "",
+  });
+  fixture.identities.push({ name: "shared", cookieStoreId: "firefox-container-personal", color: "blue" });
+  const unrelatedBefore = structuredClone(fixture.identities[0]);
+  const onMessage = await loadBackground(fixture);
+  const otherId = "1".repeat(12);
+  assert.deepStrictEqual(await handoffSyntheticNamedAccount(onMessage, "example-dev-shared"), { ok: true });
+  assert.deepStrictEqual(await handoffSyntheticNamedAccount(onMessage, "example-prod-shared", otherId), { ok: true });
+  const firstStore = fixture.storageData[`accountContainer/${ACCOUNT_ID}`];
+  const secondStore = fixture.storageData[`accountContainer/${otherId}`];
+  assert.notStrictEqual(firstStore, secondStore);
+  assert.deepStrictEqual(fixture.identities[0], unrelatedBefore);
+  assert.deepStrictEqual(fixture.identities.slice(1).map((identity) => identity.name), [
+    "shared · Containoodle", "shared · Containoodle (2)",
+  ]);
+  assert.strictEqual(fixture.storageData[`containerAccount/${firstStore}`], ACCOUNT_ID);
+  assert.strictEqual(fixture.storageData[`containerAccount/${secondStore}`], otherId);
+  assert.strictEqual(groupForAccount(fixture).title, "shared");
+  assert.strictEqual(groupForAccount(fixture, otherId).title, "shared");
+});
+
+test("non-idempotent rules always use raw names across saves and background restart", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.portalPinnedAccounts = [];
+  Object.assign(fixture.storageData.config, { groupNamePattern: "^", groupNameReplacement: "Shown: " });
+  const onMessage = await loadBackground(fixture);
+  await handoffSyntheticNamedAccount(onMessage, "example-dev-data");
+  const identity = fixture.identities[0];
+  assert.strictEqual(identity.name, "Shown: example-dev-data");
+  saveTestNamingRule(fixture, "^", "Label: ");
+  await waitFor(() => identity.name === "Label: example-dev-data");
+  const restarted = makeBrowser(fixture.storageData);
+  restarted.identities.push(structuredClone(identity));
+  await loadBackground(restarted);
+  assert.strictEqual(restarted.identities[0].name, "Label: example-dev-data");
+  assert.strictEqual(restarted.identityUpdates.length, 0);
+});
+
+test("manual container names and manual group titles survive a saved rule and later launches", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.portalPinnedAccounts = [];
+  const onMessage = await loadBackground(fixture);
+  await handoffSyntheticNamedAccount(onMessage, "example-qa-audit");
+  fixture.identities[0].name = "My custom container";
+  fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`] = "My custom tab group";
+  saveTestNamingRule(fixture, "^example-qa-", "");
+  await handoffSyntheticNamedAccount(onMessage, "example-qa-audit");
+  assert.strictEqual(fixture.identities[0].name, "My custom container");
+  assert.strictEqual(groupForAccount(fixture).title, "My custom tab group");
+  assert.strictEqual(fixture.identities.length, 1);
+});
+
+test("a user rename during automatic container-name calculation is not overwritten", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.portalPinnedAccounts = [];
+  const onMessage = await loadBackground(fixture);
+  await handoffSyntheticNamedAccount(onMessage, "example-dev-data");
+  const originalQuery = fixture.browser.contextualIdentities.query;
+  let renamed = false;
+  fixture.browser.contextualIdentities.query = async (query) => {
+    if (query.name === "data" && !renamed) {
+      renamed = true;
+      fixture.identities[0].name = "User renamed during save";
+    }
+    return originalQuery(query);
+  };
+  saveTestNamingRule(fixture, "^example-dev-", "");
+  await waitFor(() => renamed);
+  await handoffSyntheticNamedAccount(onMessage, "example-dev-data");
+  assert.strictEqual(fixture.identities[0].name, "User renamed during save");
+});
+
+test("existing helper containers use backend originals on startup without auth or tab-group APIs", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = {
+    ...fixture.storageData.config, mode: "backend",
+    groupNamePattern: "^example-dev-", groupNameReplacement: "",
+  };
+  delete fixture.storageData.backendAuthToken;
+  fixture.storageData.accountsCache = [{ accountId: ACCOUNT_ID, accountName: "example-dev-data" }];
+  fixture.storageData[`portalAccountOriginalName/${ACCOUNT_ID}`] = "portal-prod-must-not-be-used";
+  const storeId = "firefox-container-existing-helper";
+  fixture.storageData[`accountContainer/${ACCOUNT_ID}`] = storeId;
+  fixture.storageData[`containerAccount/${storeId}`] = ACCOUNT_ID;
+  fixture.identities.push({ name: "example-dev-data", cookieStoreId: storeId, color: "green" });
+  delete fixture.browser.tabs.group;
+  delete fixture.browser.tabGroups;
+  await loadBackground(fixture);
+  await waitFor(() => fixture.identities[0].name === "data");
+  assert.strictEqual(fixture.storageData[`containerOriginalName/${storeId}`], "example-dev-data");
+  assert.strictEqual(fixture.identities[0].color, "green");
+  assert.strictEqual(fixture.createdTabs.length, 0);
+  assert.strictEqual(fixture.cookieWrites.length, 0);
+  assert.strictEqual(fixture.identities.length, 1);
+});
+
+test("legacy collision names migrate, while custom and unproven mappings stay untouched", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = {
+    ...fixture.storageData.config, groupNamePattern: "^example-qa-", groupNameReplacement: "",
+  };
+  fixture.storageData.portalPinnedAccounts = [];
+  const cases = [
+    { id: ACCOUNT_ID, store: "firefox-container-legacy", name: "example-qa-data · Containoodle (2)" },
+    { id: "1".repeat(12), store: "firefox-container-custom", name: "Custom legacy label" },
+    { id: "2".repeat(12), store: "firefox-container-unproven", name: "example-qa-data" },
+  ];
+  for (const entry of cases) {
+    fixture.storageData[`accountContainer/${entry.id}`] = entry.store;
+    fixture.storageData[`portalAccountOriginalName/${entry.id}`] = "example-qa-data";
+    if (entry.id !== cases[2].id) fixture.storageData[`containerAccount/${entry.store}`] = entry.id;
+    fixture.identities.push({ name: entry.name, cookieStoreId: entry.store, color: "yellow" });
+  }
+  await loadBackground(fixture);
+  await waitFor(() => fixture.identities[0].name === "data");
+  assert.strictEqual(fixture.identities[1].name, "Custom legacy label");
+  assert.strictEqual(fixture.identities[2].name, "example-qa-data");
+  assert.strictEqual(fixture.storageData[`containerAccount/${cases[2].store}`], undefined);
+});
+
+test("invalid and empty-result rules restore the original container label safely", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.portalPinnedAccounts = [];
+  const onMessage = await loadBackground(fixture);
+  await handoffSyntheticNamedAccount(onMessage, "example-dev-data");
+  saveTestNamingRule(fixture, "^example-dev-", "");
+  await waitFor(() => fixture.identities[0].name === "data");
+  saveTestNamingRule(fixture, "[", "ignored");
+  await waitFor(() => fixture.identities[0].name === "example-dev-data");
+  saveTestNamingRule(fixture, "^.*$", "");
+  await handoffSyntheticNamedAccount(onMessage, "example-dev-data");
+  assert.strictEqual(fixture.identities[0].name, "example-dev-data");
+});
+
+test("helper launches format container and group labels while retaining source accounts and request identities", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = {
+    ...fixture.storageData.config, mode: "backend",
+    groupNamePattern: "^example-prod-", groupNameReplacement: "",
+  };
+  fixture.storageData.accountsCache = [{
+    accountId: ACCOUNT_ID, accountName: "example-prod-helper", role: TEST_HELPER_ROLE,
+  }];
+  const accountsBefore = structuredClone(fixture.storageData.accountsCache);
+  const pinsBefore = structuredClone(fixture.storageData.portalPinnedAccounts);
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url) { requests.push(new URL(url)); },
+    async responseForRequest() {
+      return { payload: {
+        ok: true,
+        containerUrl: `ext+container:name=Containoodle&url=${encodeURIComponent(BACKEND_SIGNIN_URL)}`,
+      } };
+    },
+  });
+  const result = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(fixture.identities[0].name, "helper");
+  assert.strictEqual(fixture.identities[0].color, "red");
+  const group = groupForAccount(fixture, ACCOUNT_ID, fixture.createdTabs[0].windowId);
+  assert.strictEqual(group.title, "helper");
+  assert.strictEqual(group.color, "red");
+  const generate = requests.find((url) => url.pathname === "/generate-url");
+  assert.ok(generate);
+  assert.strictEqual(generate.searchParams.get("account"), ACCOUNT_ID);
+  assert.strictEqual(generate.searchParams.get("role"), TEST_HELPER_ROLE);
+  assert.deepStrictEqual(fixture.storageData.accountsCache, accountsBefore);
+  assert.deepStrictEqual(fixture.storageData.portalPinnedAccounts, pinsBefore);
+  const requestCount = requests.length;
+  // An active container still has its original name if its helper list is absent.
+  fixture.storageData.accountsCache = [];
+  saveTestNamingRule(fixture, "^example-prod-", "Renamed: ");
+  await waitFor(() => group.title === "Renamed: helper" &&
+    fixture.identities[0].name === "Renamed: helper");
+  assert.strictEqual(requests.length, requestCount, "cosmetic updates never authenticate or fetch accounts");
+});
+
+test("malformed helper cache and response cannot launch or fall back to portal pins", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  fixture.storageData.accountsCache = [
+    { accountId: ACCOUNT_ID, accountName: "__CONTAINOODLE_TEST_ACCOUNT__" },
+    { accountId: ACCOUNT_ID, accountName: "__CONTAINOODLE_TEST_DUPLICATE__" },
+  ];
+  const accountsBefore = structuredClone(fixture.storageData.accountsCache);
+  const pinsBefore = structuredClone(fixture.storageData.portalPinnedAccounts);
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url) { requests.push(new URL(url).pathname); },
+    async responseForRequest(url) {
+      assert.strictEqual(url.pathname, "/accounts", "invalid accounts must not request roles or a sign-in URL");
+      return { payload: accountsBefore };
+    },
+  });
+  assert.deepStrictEqual(
+    await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {}),
+    { ok: false, error: "Account not found — check the backend account list" },
+  );
+  assert.deepStrictEqual(requests, ["/auth/challenge", "/accounts"]);
+  assert.strictEqual(fixture.createdTabs.length, 0);
+  assert.strictEqual(fixture.identities.length, 0);
+  assert.deepStrictEqual(fixture.storageData.accountsCache, accountsBefore);
+  assert.deepStrictEqual(fixture.storageData.portalPinnedAccounts, pinsBefore);
+});
+
+test("invalid helper cache cannot overwrite trusted automatic names", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = {
+    ...fixture.storageData.config, mode: "backend",
+    groupNamePattern: "^example-dev-", groupNameReplacement: "",
+  };
+  fixture.storageData.accountsCache = [{
+    accountId: ACCOUNT_ID, accountName: "example-dev-stable", role: TEST_HELPER_ROLE,
+  }];
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url) { requests.push(new URL(url).pathname); },
+    async responseForRequest() {
+      return { payload: {
+        ok: true,
+        containerUrl: `ext+container:name=Containoodle&url=${encodeURIComponent(BACKEND_SIGNIN_URL)}`,
+      } };
+    },
+  });
+  assert.strictEqual((await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {})).ok, true);
+  const identity = fixture.identities[0];
+  const group = groupForAccount(fixture, ACCOUNT_ID, fixture.createdTabs[0].windowId);
+  const requestsBefore = requests.length;
+  fixture.storageData.accountsCache = [{
+    accountId: ACCOUNT_ID, accountName: "example-dev-invalid-cache", role: 42,
+  }];
+  const invalidCache = structuredClone(fixture.storageData.accountsCache);
+  saveTestNamingRule(fixture, "^example-dev-", "Updated: ");
+  await waitFor(() => identity.name === "Updated: stable" && group.title === "Updated: stable");
+  assert.strictEqual(fixture.storageData[`containerOriginalName/${identity.cookieStoreId}`], "example-dev-stable");
+  assert.deepStrictEqual(fixture.storageData.accountsCache, invalidCache);
+  assert.strictEqual(requests.length, requestsBefore);
+});
+
+test("invalid helper cache cannot erase a legacy manual group title", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+  delete fixture.storageData["migration/groupTitlesAutomaticV1"];
+  fixture.storageData.accountsCache = [{
+    accountId: ACCOUNT_ID, accountName: "__CONTAINOODLE_TEST_MANUAL_TITLE__", role: 42,
+  }];
+  fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`] = "__CONTAINOODLE_TEST_MANUAL_TITLE__";
+  await loadBackground(fixture);
+  await waitFor(() => fixture.storageData["migration/groupTitlesAutomaticV1"] === true);
+  assert.strictEqual(fixture.storageData[`tabGroupTitle/${ACCOUNT_ID}`], "__CONTAINOODLE_TEST_MANUAL_TITLE__");
+});
+
+test("a cosmetic container update failure leaves the proven container usable for launch", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.portalPinnedAccounts = [];
+  const onMessage = await loadBackground(fixture);
+  await handoffSyntheticNamedAccount(onMessage, "example-dev-data");
+  const storeId = fixture.identities[0].cookieStoreId;
+  fixture.browser.contextualIdentities.update = async () => {
+    throw new Error("synthetic cosmetic update failure");
+  };
+  saveTestNamingRule(fixture, "^example-dev-", "");
+  assert.deepStrictEqual(await handoffSyntheticNamedAccount(onMessage, "example-dev-data"), { ok: true });
+  assert.strictEqual(fixture.identities.length, 1);
+  assert.strictEqual(fixture.createdTabs.at(-1).cookieStoreId, storeId);
+  assert.strictEqual(fixture.storageData[`accountContainer/${ACCOUNT_ID}`], storeId);
+  assert.strictEqual(fixture.identities[0].name, "example-dev-data");
+  assert.strictEqual(groupForAccount(fixture).title, "data");
+});
+
+test("queued container naming uses the latest mode and preserves a concurrent manual rename", async (t) => {
+  for (const manualRename of [false, true]) {
+    await t.test(manualRename ? "manual rename" : "automatic name", async () => {
+      const fixture = makeBrowser();
+      fixture.storageData.config = { ...fixture.storageData.config, mode: "backend" };
+      fixture.storageData.accountsCache = [{ accountId: ACCOUNT_ID, accountName: "example-dev-helper" }];
+      fixture.storageData.portalPinnedAccounts = [{ accountId: ACCOUNT_ID, accountName: "example-prod-portal" }];
+      const storeId = "firefox-container-mode-test";
+      fixture.storageData[`accountContainer/${ACCOUNT_ID}`] = storeId;
+      fixture.storageData[`containerAccount/${storeId}`] = ACCOUNT_ID;
+      fixture.identities.push({ name: "example-dev-helper", cookieStoreId: storeId, color: "green" });
+      await loadBackground(fixture);
+      let release;
+      let entered;
+      const paused = new Promise((resolve) => { entered = resolve; });
+      const gate = new Promise((resolve) => { release = resolve; });
+      const originalQuery = fixture.browser.contextualIdentities.query;
+      let held = false;
+      fixture.browser.contextualIdentities.query = async (query) => {
+        if (query.name === "helper" && !held) {
+          held = true;
+          entered();
+          await gate;
+        }
+        return originalQuery(query);
+      };
+      saveTestNamingRule(fixture, "^example-(?:dev|prod)-", "");
+      await paused;
+      const oldConfig = fixture.storageData.config;
+      const newConfig = { ...oldConfig, mode: "portal", groupNameReplacement: "Latest: " };
+      fixture.storageData.config = newConfig;
+      if (manualRename) fixture.identities[0].name = "Concurrent custom label";
+      for (const listener of fixture.events.storageChanged.listeners) {
+        listener({ config: { oldValue: oldConfig, newValue: newConfig } }, "local");
+      }
+      release();
+      await waitFor(() => fixture.storageData[`containerOriginalName/${storeId}`] === "example-prod-portal");
+      assert.strictEqual(fixture.identities[0].name,
+        manualRename ? "Concurrent custom label" : "Latest: portal");
+      assert.strictEqual(fixture.identities[0].color, "green", "a cosmetic save does not recolor sessions");
+      assert.strictEqual(fixture.createdTabs.length, 0);
+      assert.strictEqual(fixture.cookieWrites.length, 0);
+      assert.strictEqual(fixture.storageData[`accountContainer/${ACCOUNT_ID}`], storeId);
+    });
+  }
 });
 
 test("portal mode never resolves a backend-cached account", async () => {
@@ -1593,9 +2241,9 @@ test("backend profile launches scope helper requests, roles, and reuse metadata 
     BACKEND_CONSOLE_URL,
   );
   await waitFor(
-    () => fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] ===
-      TEST_SSO_IDENTITY,
+    () => currentSession(fixture)?.verified === true,
   );
+  assert.strictEqual(currentSession(fixture).identityKey, TEST_SSO_IDENTITY);
 });
 
 test("an unexpected SSO identity response fails before roles, containers, or tabs", async () => {
@@ -1714,9 +2362,438 @@ test("a live backend session bound to another identity is bypassed and rebound a
     BACKEND_CONSOLE_URL,
   );
   await waitFor(
-    () => fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] ===
-      TEST_SSO_IDENTITY,
+    () => currentSession(fixture)?.verified === true,
   );
+  assert.strictEqual(currentSession(fixture).identityKey, TEST_SSO_IDENTITY);
+});
+
+test("a verified helper session is reused on the next ordinary launch", async () => {
+  const { fixture, onMessage, requests, result } = await launchFreshBackendForBinding();
+  const storeId = fixture.createdTabs[0].cookieStoreId;
+  addLiveConsoleCookies(fixture, storeId);
+  await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, true);
+  const again = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(again.ok, true);
+  assert.strictEqual(generationRequestCount(requests), 1);
+  assert.strictEqual(fixture.tabs.get(again.tabId).url, BACKEND_CONSOLE_URL);
+});
+
+test("legacy identity-only markers never authorize reuse, even for the current identity", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config.mode = "backend";
+  fixture.storageData.accountsCache[0].role = TEST_HELPER_ROLE;
+  const storeId = "firefox-container-__containoodle_test_legacy__";
+  fixture.identities.push({ cookieStoreId: storeId, name: "__containoodle_test_account__", color: "red" });
+  fixture.storageData[`accountContainer/${ACCOUNT_ID}`] = storeId;
+  fixture.storageData[`containerAccount/${storeId}`] = ACCOUNT_ID;
+  fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`] = TEST_SSO_IDENTITY;
+  addLiveConsoleCookies(fixture, storeId);
+  const onMessage = await loadBackground(fixture);
+  const requests = [];
+  globalThis.fetch = authenticatedBackendFetch({
+    onRequest(url) { requests.push({ url }); },
+    responseForRequest: backendSigninResponse,
+  });
+  const result = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(generationRequestCount(requests), 1);
+  assert.strictEqual(fixture.tabs.get(result.tabId).url, BACKEND_SIGNIN_URL);
+  assert.strictEqual(currentSession(fixture).verified, false);
+  assert.strictEqual(fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`], TEST_SSO_IDENTITY);
+});
+
+test("a portal session invalidates helper ownership before copying cookies and prevents later reuse", async () => {
+  const { fixture, onMessage, requests, result } = await launchFreshBackendForBinding();
+  const storeId = fixture.tabs.get(result.tabId).cookieStoreId;
+  addLiveConsoleCookies(fixture, storeId);
+  await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+  const helperGeneration = currentSession(fixture).generation;
+  assert.strictEqual(currentSession(fixture).verified, true);
+  const originalSetCookie = fixture.browser.cookies.set;
+  let copied = false;
+  fixture.browser.cookies.set = async (details) => {
+    if (details.name === "x-amz-sso_authn") {
+      copied = true;
+      assert.strictEqual(currentSession(fixture).verified, false);
+      assert.strictEqual(currentSession(fixture).mode, "portal");
+      assert.notStrictEqual(currentSession(fixture).generation, helperGeneration);
+    }
+    return originalSetCookie(details);
+  };
+  await changeConnectionMode(fixture, "portal");
+  const portal = await onMessage({
+    type: "launch", accountId: ACCOUNT_ID, role: TEST_PORTAL_ROLE, mode: "portal",
+  }, {});
+  assert.strictEqual(portal.ok, true);
+  assert.strictEqual(copied, true);
+  await completeTabNavigation(fixture, portal.tabId, BACKEND_CONSOLE_URL);
+  await changeConnectionMode(fixture, "backend");
+  const backend = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(backend.ok, true);
+  assert.strictEqual(generationRequestCount(requests), 2);
+  assert.strictEqual(fixture.tabs.get(backend.tabId).url, BACKEND_SIGNIN_URL);
+});
+
+test("an old helper completion after a portal handoff cannot claim the portal session", async () => {
+  const { fixture, onMessage, requests, result } = await launchFreshBackendForBinding();
+  const storeId = fixture.tabs.get(result.tabId).cookieStoreId;
+  addLiveConsoleCookies(fixture, storeId);
+  await changeConnectionMode(fixture, "portal");
+  const portal = await onMessage({
+    type: "launch", accountId: ACCOUNT_ID, role: TEST_PORTAL_ROLE, mode: "portal",
+  }, {});
+  assert.strictEqual(portal.ok, true);
+  await completeTabNavigation(fixture, portal.tabId, BACKEND_CONSOLE_URL);
+  await changeConnectionMode(fixture, "backend");
+  await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, false);
+  assert.strictEqual(currentSession(fixture).mode, "portal");
+  const again = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(again.ok, true);
+  assert.strictEqual(generationRequestCount(requests), 2);
+});
+
+test("overlapping helper and portal sign-ins cannot verify a newer session until older launches settle", async () => {
+  const { fixture, onMessage, requests, result: older } = await launchFreshBackendForBinding();
+  addLiveConsoleCookies(fixture, fixture.tabs.get(older.tabId).cookieStoreId);
+  await changeConnectionMode(fixture, "portal");
+  const portal = await onMessage({
+    type: "launch", accountId: ACCOUNT_ID, role: TEST_PORTAL_ROLE, mode: "portal",
+  }, {});
+  assert.strictEqual(portal.ok, true);
+  await changeConnectionMode(fixture, "backend");
+  const newer = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(newer.ok, true);
+  await completeTabNavigation(fixture, newer.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, false);
+  assert.strictEqual(currentSession(fixture).pending.length, 2);
+  await completeTabNavigation(fixture, portal.tabId, BACKEND_CONSOLE_URL);
+  await completeTabNavigation(fixture, older.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, false);
+  assert.deepStrictEqual(currentSession(fixture).pending, []);
+  const clean = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(clean.ok, true);
+  await completeTabNavigation(fixture, clean.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, true);
+  assert.strictEqual(generationRequestCount(requests), 3);
+  assert.strictEqual((await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {})).ok, true);
+  assert.strictEqual(generationRequestCount(requests), 3);
+});
+
+test("portal invalidation serializes after an already in-flight helper verification write", async () => {
+  const { fixture, onMessage, result } = await launchFreshBackendForBinding();
+  const originalSet = fixture.browser.storage.local.set;
+  let releaseWrite;
+  const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+  let writeStarted = false;
+  fixture.browser.storage.local.set = async (values) => {
+    if (Object.entries(values).some(([key, value]) =>
+      key.startsWith("containerSession/") && value.verified === true)) {
+      writeStarted = true;
+      await writeGate;
+    }
+    return originalSet(values);
+  };
+  await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+  await waitFor(() => writeStarted);
+  await changeConnectionMode(fixture, "portal");
+  let copied = false;
+  const originalCookieSet = fixture.browser.cookies.set;
+  fixture.browser.cookies.set = async (details) => {
+    if (details.name === "x-amz-sso_authn") {
+      copied = true;
+      assert.strictEqual(currentSession(fixture).verified, false);
+      assert.strictEqual(currentSession(fixture).mode, "portal");
+    }
+    return originalCookieSet(details);
+  };
+  const launchingPortal = onMessage({
+    type: "launch", accountId: ACCOUNT_ID, role: TEST_PORTAL_ROLE, mode: "portal",
+  }, {});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(copied, false, "cookie mutation must wait for the outstanding storage write");
+  releaseWrite();
+  assert.strictEqual((await launchingPortal).ok, true);
+  assert.strictEqual(copied, true);
+  assert.strictEqual(currentSession(fixture).verified, false);
+  await changeConnectionMode(fixture, "backend");
+  await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).mode, "portal");
+  assert.strictEqual(currentSession(fixture).verified, false);
+});
+
+test("a loaded portal SPA remains a session transition until its later console navigation", async () => {
+  const { fixture, onMessage, result } = await launchFreshBackendForBinding();
+  await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+  await changeConnectionMode(fixture, "portal");
+  const portal = await onMessage({
+    type: "launch", accountId: ACCOUNT_ID, role: TEST_PORTAL_ROLE, mode: "portal",
+  }, {});
+  assert.strictEqual(portal.ok, true);
+  await completeTabNavigation(fixture, portal.tabId, fixture.tabs.get(portal.tabId).url);
+  assert.strictEqual(currentSession(fixture).pending.length, 1);
+  await changeConnectionMode(fixture, "backend");
+  const backend = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(backend.ok, true);
+  await completeTabNavigation(fixture, backend.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, false);
+  await completeTabNavigation(fixture, portal.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, false);
+  assert.deepStrictEqual(currentSession(fixture).pending, []);
+});
+
+test("same-tab navigation during verification cannot publish or retire stale session ownership", async (t) => {
+  for (const phase of ["ownership-read", "verification-write"]) {
+    await t.test(phase, async () => {
+      const { fixture, onMessage, requests, result } = await launchFreshBackendForBinding();
+      addLiveConsoleCookies(fixture, fixture.tabs.get(result.tabId).cookieStoreId);
+      let interrupted = false;
+      const beginOtherSignin = () => {
+        if (interrupted) return;
+        interrupted = true;
+        const tab = fixture.tabs.get(result.tabId);
+        Object.assign(tab, { url: BACKEND_SIGNIN_URL, status: "loading" });
+        for (const listener of fixture.events.tabsUpdated.listeners) {
+          listener(tab.id, { url: tab.url, status: tab.status }, { ...tab });
+        }
+      };
+      const originalGet = fixture.browser.storage.local.get;
+      const originalSet = fixture.browser.storage.local.set;
+      fixture.browser.storage.local.get = async (keys) => {
+        const value = await originalGet(keys);
+        if (phase === "ownership-read" && Array.isArray(keys) &&
+          keys.length === 2 && keys[0] === `accountContainer/${ACCOUNT_ID}` &&
+          keys[1].startsWith("containerAccount/")) beginOtherSignin();
+        return value;
+      };
+      fixture.browser.storage.local.set = async (values) => {
+        if (phase === "verification-write" && Object.entries(values).some(([key, value]) =>
+          key.startsWith("containerSession/") && value.verified === true)) {
+          beginOtherSignin();
+        }
+        return originalSet(values);
+      };
+      await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+      await waitFor(() => interrupted && currentSession(fixture).verified === false);
+      assert.strictEqual(fixture.tabs.get(result.tabId).status, "loading");
+      assert.strictEqual(currentSession(fixture).pending.length, 1,
+        "the re-navigating tab must remain a tracked transition");
+      await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+      assert.strictEqual(currentSession(fixture).verified, false,
+        "a later sign-in cannot inherit the retired helper verification");
+      const again = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+      assert.strictEqual(again.ok, true);
+      assert.strictEqual(generationRequestCount(requests), 2);
+      assert.strictEqual(fixture.tabs.get(again.tabId).url, BACKEND_SIGNIN_URL);
+    });
+  }
+});
+
+test("session state storage failures prevent untracked sign-ins and clean up blank staging tabs", async (t) => {
+  for (const failure of ["invalidation", "tab-record"]) {
+    await t.test(failure, async () => {
+      const fixture = makeBrowser();
+      const onMessage = await loadBackground(fixture);
+      const originalSet = fixture.browser.storage.local.set;
+      fixture.browser.storage.local.set = async (values) => {
+        if (Object.entries(values).some(([key, value]) =>
+          key.startsWith("containerSession/") &&
+          (failure === "invalidation" || value.pending.length > 0))) {
+          throw new Error("__containoodle_test_storage_failure__");
+        }
+        return originalSet(values);
+      };
+      const result = await onMessage({
+        type: "launch", accountId: ACCOUNT_ID, role: TEST_PORTAL_ROLE, mode: "portal",
+      }, {});
+      assert.deepStrictEqual(result, {
+        ok: false, error: "Could not safely open the account session — try again",
+      });
+      assert.strictEqual(fixture.createdTabs.length, failure === "invalidation" ? 0 : 1);
+      assert.ok(fixture.createdTabs.every((tab) => tab.url === "about:blank"));
+      assert.strictEqual(fixture.tabs.size, 1, "only the existing source portal tab remains");
+      if (failure === "invalidation") {
+        assert.strictEqual(fixture.cookieWrites.length, 0);
+        assert.strictEqual(fixture.cookieRemovals.length, 0);
+      }
+    });
+  }
+});
+
+test("closing an older pending sign-in allows the newest completed helper session to verify", async () => {
+  const { fixture, onMessage, result: older } = await launchFreshBackendForBinding();
+  const newer = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(newer.ok, true);
+  assert.strictEqual(currentSession(fixture).pending.length, 2);
+  await removeTabWithEvent(fixture, older.tabId);
+  await completeTabNavigation(fixture, newer.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, true);
+  assert.deepStrictEqual(currentSession(fixture).pending, []);
+});
+
+test("session-changing navigation is recorded before it starts and cancels on a mode switch", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config.mode = "backend";
+  fixture.storageData.accountsCache[0].role = TEST_HELPER_ROLE;
+  const onMessage = await loadBackground(fixture);
+  globalThis.fetch = authenticatedBackendFetch({ responseForRequest: backendSigninResponse });
+  const originalUpdate = fixture.browser.tabs.update;
+  fixture.browser.tabs.update = async (tabId, properties) => {
+    if (properties.url === BACKEND_SIGNIN_URL) {
+      const state = currentSession(fixture);
+      assert.strictEqual(state.verified, false);
+      assert.ok(state.pending.some((entry) => entry.tabId === tabId));
+    }
+    return originalUpdate(tabId, properties);
+  };
+  const first = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(first.ok, true);
+  const createdBefore = fixture.createdTabs.length;
+  fixture.beforeNextTabCreate(async (properties) => {
+    assert.strictEqual(properties.url, "about:blank");
+    await changeConnectionMode(fixture, "portal");
+  });
+  const cancelled = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+  assert.strictEqual(cancelled.cancelled, true);
+  assert.strictEqual(fixture.createdTabs.length, createdBefore + 1);
+  assert.strictEqual(fixture.createdTabs.at(-1).url, "about:blank");
+  assert.strictEqual(fixture.tabs.has(fixture.createdTabs.at(-1).id), false);
+});
+
+test("background restart requires a fresh helper generation and cannot verify an earlier unfinished sign-in", async () => {
+  for (const verifiedBeforeRestart of [true, false]) {
+    const launched = await launchFreshBackendForBinding();
+    const storeId = launched.fixture.tabs.get(launched.result.tabId).cookieStoreId;
+    if (verifiedBeforeRestart) {
+      await completeTabNavigation(launched.fixture, launched.result.tabId, BACKEND_CONSOLE_URL);
+      assert.strictEqual(currentSession(launched.fixture).verified, true);
+    }
+    const fixture = makeBrowser(launched.fixture.storageData);
+    fixture.identities.push(...structuredClone(launched.fixture.identities));
+    for (const [id, tab] of launched.fixture.tabs) fixture.tabs.set(id, { ...tab });
+    addLiveConsoleCookies(fixture, storeId);
+    const onMessage = await loadBackground(fixture);
+    const requests = [];
+    globalThis.fetch = authenticatedBackendFetch({
+      onRequest(url) { requests.push({ url }); },
+      responseForRequest: backendSigninResponse,
+    });
+    if (!verifiedBeforeRestart) {
+      await completeTabNavigation(fixture, launched.result.tabId, BACKEND_CONSOLE_URL);
+      assert.strictEqual(currentSession(fixture).verified, false);
+    }
+    const result = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(generationRequestCount(requests), 1);
+    assert.strictEqual(fixture.tabs.get(result.tabId).url, BACKEND_SIGNIN_URL);
+  }
+});
+
+test("a failed verification rollback cannot lose an older sign-in fence, including after restart", async (t) => {
+  for (const { restart, completedSigninPage } of [
+    { restart: false, completedSigninPage: false },
+    { restart: false, completedSigninPage: true },
+    { restart: true, completedSigninPage: false },
+    { restart: true, completedSigninPage: true },
+  ]) {
+    const label = `${restart ? "background restarted" : "same background"}: ${
+      completedSigninPage ? "loaded retryable sign-in page" : "still loading"
+    }`;
+    await t.test(label, async () => {
+      const launched = await launchFreshBackendForBinding();
+      let { fixture, onMessage, requests } = launched;
+      const oldTabId = launched.result.tabId;
+      const storeId = fixture.tabs.get(oldTabId).cookieStoreId;
+      const originalSet = fixture.browser.storage.local.set;
+      let navigationStarted = false;
+      let rollbackFailed = false;
+      fixture.browser.storage.local.set = async (values) => {
+        const changedState = values[`containerSession/${storeId}`];
+        if (changedState?.verified === true && !navigationStarted) {
+          navigationStarted = true;
+          const tab = fixture.tabs.get(oldTabId);
+          Object.assign(tab, { url: BACKEND_SIGNIN_URL, status: "loading" });
+          for (const listener of fixture.events.tabsUpdated.listeners) {
+            listener(tab.id, { url: tab.url, status: "loading" }, { ...tab });
+          }
+        } else if (navigationStarted && !rollbackFailed && changedState?.verified === false) {
+          rollbackFailed = true;
+          throw new Error("__containoodle_test_failed_corrective_write__");
+        }
+        return originalSet(values);
+      };
+      await completeTabNavigation(fixture, oldTabId, BACKEND_CONSOLE_URL);
+      await waitFor(() => rollbackFailed);
+      assert.strictEqual(currentSession(fixture).verified, true,
+        "reproduce the failed durable correction, rather than hiding it with a retry");
+      assert.deepStrictEqual(currentSession(fixture).pending, []);
+      fixture.browser.storage.local.set = originalSet;
+      if (completedSigninPage) {
+        await completeTabNavigation(fixture, oldTabId, BACKEND_SIGNIN_URL);
+        assert.strictEqual(fixture.tabs.get(oldTabId).status, "complete");
+        assert.deepStrictEqual(currentSession(fixture).pending, [],
+          "exercise runtime recovery after the persisted pending entry was lost");
+      }
+      if (restart) {
+        const previous = fixture;
+        fixture = makeBrowser(previous.storageData);
+        fixture.identities.push(...structuredClone(previous.identities));
+        for (const [id, tab] of previous.tabs) fixture.tabs.set(id, { ...tab });
+        onMessage = await loadBackground(fixture);
+        requests = [];
+        globalThis.fetch = authenticatedBackendFetch({
+          onRequest(url) { requests.push({ url }); },
+          responseForRequest: backendSigninResponse,
+        });
+      }
+      addLiveConsoleCookies(fixture, storeId);
+      const generatedBefore = generationRequestCount(requests);
+      const newer = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+      assert.strictEqual(newer.ok, true);
+      assert.strictEqual(generationRequestCount(requests), generatedBefore + 1);
+      assert.strictEqual(fixture.tabs.get(newer.tabId).url, BACKEND_SIGNIN_URL);
+      assert.strictEqual(currentSession(fixture).pending.length, 2,
+        "the older unresolved sign-in must be recovered before navigating the newer one");
+      await completeTabNavigation(fixture, newer.tabId, BACKEND_CONSOLE_URL);
+      assert.strictEqual(currentSession(fixture).verified, false);
+      await completeTabNavigation(fixture, oldTabId, BACKEND_CONSOLE_URL);
+      assert.strictEqual(currentSession(fixture).verified, false);
+      assert.deepStrictEqual(currentSession(fixture).pending, []);
+      const clean = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+      assert.strictEqual(clean.ok, true);
+      await completeTabNavigation(fixture, clean.tabId, BACKEND_CONSOLE_URL);
+      assert.strictEqual(currentSession(fixture).verified, true);
+      assert.strictEqual((await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {})).ok, true);
+      assert.strictEqual(generationRequestCount(requests), generatedBefore + 2);
+    });
+  }
+});
+
+test("malformed persisted session entries fall back to a normal helper sign-in", async (t) => {
+  for (const pending of [[null], ["__containoodle_test_bad_entry__"], [[]], {}]) {
+    await t.test(JSON.stringify(pending), async () => {
+      const fixture = makeBrowser();
+      fixture.storageData.config.mode = "backend";
+      fixture.storageData.accountsCache[0].role = TEST_HELPER_ROLE;
+      const storeId = "firefox-container-__containoodle_test_malformed__";
+      fixture.identities.push({ cookieStoreId: storeId, name: "__containoodle_test_account__", color: "red" });
+      fixture.storageData[`accountContainer/${ACCOUNT_ID}`] = storeId;
+      fixture.storageData[`containerAccount/${storeId}`] = ACCOUNT_ID;
+      fixture.storageData[`containerSession/${storeId}`] = {
+        version: 1, generation: "__containoodle_test_invalid_generation__",
+        accountId: ACCOUNT_ID, mode: "backend", identityKey: TEST_SSO_IDENTITY,
+        verified: true, pending,
+      };
+      const onMessage = await loadBackground(fixture);
+      globalThis.fetch = authenticatedBackendFetch({ responseForRequest: backendSigninResponse });
+      const result = await onMessage({ type: "launch", accountId: ACCOUNT_ID, mode: "backend" }, {});
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(fixture.tabs.get(result.tabId).url, BACKEND_SIGNIN_URL);
+      await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+      assert.strictEqual(currentSession(fixture).verified, true);
+    });
+  }
 });
 
 test("a completed federation error page preserves the old reuse marker", async () => {
@@ -1732,6 +2809,11 @@ test("a completed federation error page preserves the old reuse marker", async (
     fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
     TEST_OTHER_SSO_IDENTITY,
   );
+  assert.strictEqual(currentSession(fixture).verified, false);
+  assert.strictEqual(currentSession(fixture).pending.length, 1);
+  await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
+  assert.strictEqual(currentSession(fixture).verified, false,
+    "later manual browsing cannot retroactively verify a failed sign-in");
 
   const second = await onMessage({
     type: "launch",
@@ -1757,6 +2839,8 @@ test("removing a fresh sign-in tab preserves the old reuse marker", async () => 
     fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
     TEST_OTHER_SSO_IDENTITY,
   );
+  assert.strictEqual(currentSession(fixture).verified, false);
+  assert.deepStrictEqual(currentSession(fixture).pending, []);
 
   const second = await onMessage({
     type: "launch",
@@ -1773,20 +2857,17 @@ test("removing a fresh sign-in tab preserves the old reuse marker", async () => 
 });
 
 test("a timed-out fresh sign-in cannot bind after later console navigation", async () => {
-  const nativeSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = (callback, delay, ...args) => nativeSetTimeout(
-    callback,
-    delay === 120_000 ? 0 : delay,
-    ...args,
-  );
-  let launched;
+  const { fixture, result } = await launchFreshBackendForBinding();
+  const nativeDateNow = Date.now;
+  const expiredNow = nativeDateNow() + 120_001;
+  Date.now = () => expiredNow;
   try {
-    launched = await launchFreshBackendForBinding();
+    await completeTabNavigation(fixture, result.tabId, BACKEND_CONSOLE_URL);
   } finally {
-    globalThis.setTimeout = nativeSetTimeout;
+    Date.now = nativeDateNow;
   }
-  const { fixture, result } = launched;
-  await new Promise((resolve) => nativeSetTimeout(resolve, 10));
+  assert.strictEqual(currentSession(fixture).verified, false);
+  assert.deepStrictEqual(currentSession(fixture).pending, []);
   assert.strictEqual(
     fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
     TEST_OTHER_SSO_IDENTITY,
@@ -1820,6 +2901,7 @@ test("profile replacement after tab creation prevents verified reuse binding", a
     fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
     TEST_STALE_REUSE_IDENTITY,
   );
+  assert.strictEqual(currentSession(fixture).verified, false);
 });
 
 test("a console completion in another container preserves the old reuse marker", async () => {
@@ -1835,6 +2917,7 @@ test("a console completion in another container preserves the old reuse marker",
     fixture.storageData[`backendContainerIdentity/${ACCOUNT_ID}`],
     TEST_OTHER_SSO_IDENTITY,
   );
+  assert.strictEqual(currentSession(fixture).verified, false);
 });
 
 test("a profile replacement after identity authentication cancels before live-session reuse", async () => {
@@ -1862,11 +2945,12 @@ test("a profile replacement after identity authentication cancels before live-se
     secure: true,
   });
   const onMessage = await loadBackground(fixture);
+  await primeVerifiedHelperSession(fixture, onMessage);
   const originalGet = fixture.browser.storage.local.get;
   let replaced = false;
   fixture.browser.storage.local.get = async (keys) => {
     const stored = await originalGet(keys);
-    if (keys === `backendContainerIdentity/${ACCOUNT_ID}` && !replaced) {
+    if (keys === `containerSession/${storeId}` && !replaced) {
       replaced = true;
       fixture.storageData.backendSsoProfile =
         "__containoodle_test_replacement_profile__";
@@ -2191,6 +3275,7 @@ test("backend session reuse never overrides an explicit role choice", async () =
     expirationDate: Math.ceil(Date.now() / 1000) + 3600,
   });
   const onMessage = await loadBackground(fixture);
+  await primeVerifiedHelperSession(fixture, onMessage);
   const signinUrl = BACKEND_SIGNIN_URL;
   let backendUrl = null;
   let backendOptions = null;
@@ -2324,6 +3409,7 @@ test("legacy and narrow console grants both preserve reuse while absence falls b
         expirationDate: Math.ceil(Date.now() / 1000) + 3600,
       });
       const onMessage = await loadBackground(fixture);
+      await primeVerifiedHelperSession(fixture, onMessage);
       const requests = [];
       globalThis.fetch = authenticatedBackendFetch({
         onRequest(url, options) {
@@ -2577,6 +3663,9 @@ test("v1.0.3 storage fixtures survive install and startup cleanup", async (t) =>
 
         const expected = structuredClone(before);
         for (const key of transientKeys) delete expected[key];
+        if (lifecycle.eventName === "runtimeInstalled") {
+          expected[ONBOARDING_KEY] = ONBOARDING_STATES.COMPLETE;
+        }
 
         const fixture = makeBrowser(before);
         await loadBackground(fixture);
@@ -2592,7 +3681,7 @@ test("v1.0.3 storage fixtures survive install and startup cleanup", async (t) =>
         assert.deepStrictEqual(
           fixture.storageData,
           expected,
-          "lifecycle cleanup must remove only transient group IDs",
+          "lifecycle must initialize onboarding and remove only transient group IDs",
         );
 
         await fireBackgroundLifecycle(event, lifecycle.details);
@@ -3130,6 +4219,44 @@ test("role readiness queries only the exact regional target with legacy coverage
       (origins) => !origins.includes("https://*.amazonaws.com/*")
     ));
   }
+});
+
+test("passive portal readiness never performs remote region discovery", async () => {
+  const fixture = makeBrowser();
+  fixture.storageData.config.ssoRegion = "";
+  delete fixture.storageData.portalRegionCache;
+  delete fixture.storageData.portalRegionCacheOrigin;
+  const onMessage = await loadBackground(fixture);
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return new Response(JSON.stringify({ region: TEST_PORTAL_REGION }), {
+      status: 200,
+    });
+  };
+
+  const passive = await onMessage({
+    type: "portal-readiness",
+    allowRemoteRegionLookup: false,
+  }, {});
+  assert.strictEqual(passive.portalAccess, true);
+  assert.strictEqual(passive.session, true);
+  assert.strictEqual(passive.roleDiscoveryRegion, null);
+  assert.strictEqual(passive.roleDiscoveryPermissionOrigin, null);
+  assert.strictEqual(fetchCalls, 0);
+  assert.strictEqual(fixture.storageData.portalRegionCache, undefined);
+
+  const explicit = await onMessage({ type: "portal-readiness" }, {});
+  assert.strictEqual(fetchCalls, 1);
+  assert.strictEqual(explicit.roleDiscoveryRegion, TEST_PORTAL_REGION);
+  assert.strictEqual(
+    explicit.roleDiscoveryPermissionOrigin,
+    TEST_ROLE_DISCOVERY_ORIGIN,
+  );
+  assert.strictEqual(
+    fixture.storageData.portalRegionCacheOrigin,
+    new URL(START).origin,
+  );
 });
 
 test("portal role discovery calls only the authorized synthetic regional API", async () => {

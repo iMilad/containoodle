@@ -2,28 +2,34 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  automaticAccountName,
   automaticGroupTitle,
   validateGroupNameRule,
 } from "../firefox-extension/shared/group-naming.js";
 
-test("automaticGroupTitle applies captures and preserves all documented fallbacks", () => {
+test("automaticAccountName applies captures and preserves all documented fallbacks", () => {
   assert.equal(
-    automaticGroupTitle("corp-dev-payments", "^corp-(?:dev|prod)-(.+)$", "$1"),
+    automaticAccountName("corp-dev-payments", "^corp-(?:dev|prod)-(.+)$", "$1"),
     "payments"
   );
-  assert.equal(automaticGroupTitle("corp-dev-payments", "", "$1"), "corp-dev-payments");
+  assert.equal(automaticAccountName("corp-dev-payments", "", "$1"), "corp-dev-payments");
   assert.equal(
-    automaticGroupTitle("corp-dev-payments", "^other-(.+)$", "$1"),
+    automaticAccountName("corp-dev-payments", "^other-(.+)$", "$1"),
     "corp-dev-payments"
   );
   assert.equal(
-    automaticGroupTitle("corp-dev-payments", "^.*$", ""),
+    automaticAccountName("corp-dev-payments", "^.*$", ""),
     "corp-dev-payments"
   );
   assert.equal(
-    automaticGroupTitle("account", "^(.+)$", "$1".repeat(100)),
+    automaticAccountName("account", "^(.+)$", "$1".repeat(100)),
     "account"
   );
+});
+
+test("automaticGroupTitle remains an alias for consistent account display naming", () => {
+  assert.equal(automaticGroupTitle, automaticAccountName);
+  assert.equal(automaticAccountName("example-dev-team", "^example-", ""), "dev-team");
 });
 
 test("name-rule validation rejects backtracking-prone regex constructs", () => {
@@ -58,7 +64,7 @@ test("name-rule validation enforces pattern, replacement, and repetition limits"
 });
 
 test("runtime naming safely ignores invalid or manually injected unsafe rules", () => {
-  assert.equal(automaticGroupTitle("account", "([", "$1"), "account");
-  assert.equal(automaticGroupTitle(`${"a".repeat(64)}!`, "^(a+)+$", "$1"), `${"a".repeat(64)}!`);
-  assert.equal(automaticGroupTitle("account", "^(.+)$", "x".repeat(257)), "account");
+  assert.equal(automaticAccountName("account", "([", "$1"), "account");
+  assert.equal(automaticAccountName(`${"a".repeat(64)}!`, "^(a+)+$", "$1"), `${"a".repeat(64)}!`);
+  assert.equal(automaticAccountName("account", "^(.+)$", "x".repeat(257)), "account");
 });

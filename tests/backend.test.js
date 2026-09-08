@@ -6,9 +6,11 @@ import {
   BACKEND_AUTH_TOKEN_KEY,
   BACKEND_SSO_IDENTITY_KEY,
   BACKEND_SSO_PROFILE_KEY,
+  BACKEND_REQUEST_TIMEOUT_MS,
   DEFAULT_BACKEND_URL,
   backendFetch,
   isBackendAuthenticationError,
+  isBackendTimeoutError,
   normalizeBackendSsoIdentityKey,
   normalizeBackendSsoProfile,
   normalizeBackendUrl,
@@ -323,7 +325,8 @@ test("mutual HMAC exchange matches the shared v1 vector without sending the toke
   const [challengeUrl, challengeOptions] = calls[0];
   assert.equal(challengeUrl, `${DEFAULT_BACKEND_URL}/auth/challenge`);
   assert.equal(challengeOptions.method, "GET");
-  assert.equal(challengeOptions.signal, controller.signal);
+  assert.ok(challengeOptions.signal instanceof AbortSignal);
+  assert.equal(challengeOptions.signal.aborted, false);
   assert.equal(challengeOptions.redirect, "error");
   assert.equal(challengeOptions.cache, "no-store");
   assert.equal(challengeOptions.credentials, "omit");
@@ -333,7 +336,7 @@ test("mutual HMAC exchange matches the shared v1 vector without sending the toke
   const [requestUrl, requestOptions] = calls[1];
   assert.equal(requestUrl, TEST_REQUEST_URL);
   assert.equal(requestOptions.method, "GET");
-  assert.equal(requestOptions.signal, controller.signal);
+  assert.equal(requestOptions.signal, challengeOptions.signal);
   assert.equal(requestOptions.redirect, "error");
   assert.equal(requestOptions.cache, "no-store");
   assert.equal(requestOptions.credentials, "omit");
@@ -545,14 +548,14 @@ test("server proof binds the challenge to expiry, port, and extension origin", a
   }
 });
 
-test("abort signal is preserved across challenge and protected requests", async () => {
+test("caller cancellation propagates and prevents a later protected request", async () => {
   const controller = new AbortController();
   const calls = [];
 
   await withBackendRuntime(async (...args) => {
     calls.push(args);
     const [, options] = args;
-    assert.equal(options.signal, controller.signal);
+    assert.ok(options.signal instanceof AbortSignal);
     if (calls.length === 1) {
       controller.abort();
       return challengeResponse();
@@ -571,7 +574,79 @@ test("abort signal is preserved across challenge and protected requests", async 
     );
   });
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 1);
+});
+
+test("already cancelled requests do not contact the helper", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await withBackendRuntime(() => assert.fail("cancelled request reached fetch"), async () => {
+    await assert.rejects(backendFetch(TEST_REQUEST_URL, TEST_TOKEN, {
+      signal: controller.signal,
+    }), { name: "AbortError" });
+  });
+});
+
+test("the deadline covers stalled challenge and protected response bodies", async t => {
+  for (const phase of ["challenge-fetch", "challenge-body", "protected-fetch", "protected-body"]) {
+    await t.test(phase, async t => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      let release;
+      const stalled = new Promise(resolve => { release = resolve; });
+      let reached;
+      const atStall = new Promise(resolve => { reached = resolve; });
+      const requests = [];
+      let requestSignal;
+      await withBackendRuntime(async (url, options) => {
+        requestSignal = options.signal;
+        requests.push(url);
+        const response = requests.length === 1 ? challengeResponse() : signedProtectedResponse();
+        const current = requests.length === 1 ? "challenge" : "protected";
+        if (phase === `${current}-fetch`) {
+          reached();
+          await stalled;
+        } else if (phase === `${current}-body`) {
+          const method = current === "challenge" ? "text" : "arrayBuffer";
+          const read = response[method].bind(response);
+          response[method] = async () => { reached(); await stalled; return read(); };
+        }
+        return response;
+      }, async () => {
+        const pending = backendFetch(TEST_REQUEST_URL, TEST_TOKEN);
+        const rejection = assert.rejects(pending, error => {
+          assert.ok(isBackendTimeoutError(error));
+          assert.equal(isBackendAuthenticationError(error), false);
+          assert.doesNotMatch(error.message, new RegExp(TEST_TOKEN));
+          return true;
+        });
+        await atStall;
+        t.mock.timers.tick(BACKEND_REQUEST_TIMEOUT_MS);
+        await rejection;
+        assert.equal(requestSignal.aborted, true);
+        const countAtDeadline = requests.length;
+        release();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(requests.length, countAtDeadline, "late work must not send another request");
+      });
+    });
+  }
+});
+
+test("a completed exchange cancels its timer and detaches caller cancellation", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const caller = new AbortController();
+  const signals = [];
+  await withBackendRuntime(async (_url, options) => {
+    signals.push(options.signal);
+    return signals.length === 1 ? challengeResponse() : signedProtectedResponse();
+  }, async () => {
+    const result = await backendFetch(TEST_REQUEST_URL, TEST_TOKEN, { signal: caller.signal });
+    assert.equal(await result.text(), TEST_BODY);
+    assert.equal(signals[0], signals[1]);
+    t.mock.timers.tick(BACKEND_REQUEST_TIMEOUT_MS);
+    caller.abort();
+    assert.equal(signals[0].aborted, false);
+  });
 });
 
 test("unsafe inputs and caller-controlled security headers reject synchronously", async () => {
