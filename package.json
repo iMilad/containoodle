@@ -27,7 +27,7 @@
     "node": ">=24.0.0"
   },
   "devDependencies": {
-    "web-ext": "10.6.0"
+    "web-ext": "10.7.0"
   },
   "overrides": {
     "brace-expansion": "1.1.18",
