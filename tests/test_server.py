@@ -1,10 +1,12 @@
 import base64
 import hashlib
+import http.client
 import io
 import json
 import os
 import runpy
 import socket
+import subprocess
 import tempfile
 import threading
 import traceback
@@ -70,9 +72,14 @@ def setUpModule():
         patch.object(server, "SSO_CACHE_DIR", safe_root / "sso-cache"),
         patch.object(server, "HELPER_TOKEN", TEST_HELPER_TOKEN),
         patch.object(
-            server.subprocess,
+            subprocess,
             "run",
             side_effect=AssertionError("unexpected AWS CLI invocation"),
+        ),
+        patch.object(
+            http.client,
+            "HTTPSConnection",
+            side_effect=AssertionError("unexpected SSO request"),
         ),
         patch.object(
             server.urllib.request,
@@ -108,6 +115,12 @@ class FakeUrlResponse:
 
     def read(self, size=-1):
         return self.payload if size < 0 else self.payload[:size]
+
+
+def make_sso_connection(payload, status=200):
+    response = io.BytesIO(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+    response.status = status
+    return Mock(sock=Mock(), getresponse=Mock(return_value=response))
 
 
 class RecordingHandler(server.ContainoodleHandler):
@@ -753,16 +766,16 @@ class SsoCacheSelectionTests(unittest.TestCase):
                         patch.object(server, "AWS_CONFIG_FILE", self.config_file),
                         patch.object(server, "SSO_CACHE_DIR", self.cache_directory),
                         patch.object(server, "datetime", FixedDateTime),
-                        patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(output), stderr="")) as run,
+                        patch.object(http.client, "HTTPSConnection", return_value=make_sso_connection(output)) as connect,
                         patch.object(server.urllib.request, "urlopen", return_value=FakeUrlResponse(b'{"SigninToken":"__CONTAINOODLE_TEST_SIGNIN_TOKEN__"}')) as federation,
                     ):
                         handler.do_GET()
                     self.assertEqual(handler.response_status, 200)
                     body = handler.json_body()
-                    command = run.call_args.args[0]
-                    self.assertEqual(command[command.index("--region") + 1], sso_region)
-                    self.assertEqual(command[command.index("--access-token") + 1], TEST_ACCESS_TOKEN_ALPHA)
-                    self.assertEqual(command[2], "list-account-roles" if route == "roles" else "get-role-credentials")
+                    self.assertEqual(connect.call_args.args, (f"portal.sso.{sso_region}.amazonaws.com",))
+                    request = connect.return_value.request.call_args
+                    self.assertEqual(request.kwargs["headers"]["x-amz-sso_bearer_token"], TEST_ACCESS_TOKEN_ALPHA)
+                    self.assertEqual(request.args[1].split("?")[0], "/assignment/roles" if route == "roles" else "/federation/credentials")
                     if route == "roles":
                         self.assertEqual(body["roles"], [TEST_ROLE_ALPHA])
                         federation.assert_not_called()
@@ -1004,204 +1017,200 @@ sso_region = eu-west-1
             server._verify_sso_identity(selection, "0" * 64)
 
 
-class AwsCliContractTests(unittest.TestCase):
-    def test_both_cli_calls_have_a_finite_timeout_and_sanitize_timeout_details(self):
-        calls = (
-            (server._get_role_credentials, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, TEST_ROLE_ALPHA, "eu-west-1")),
-            (server._list_account_roles, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1")),
-        )
-        self.assertGreater(server.AWS_CLI_TIMEOUT_SECONDS, 0)
-        self.assertLessEqual(server.AWS_CLI_TIMEOUT_SECONDS, 30)
-        for function, arguments in calls:
-            with self.subTest(operation=function.__name__):
-                failure = server.subprocess.TimeoutExpired(
-                    cmd=["aws", "--access-token", TEST_ACCESS_TOKEN_ALPHA],
-                    timeout=server.AWS_CLI_TIMEOUT_SECONDS,
-                    output="__CONTAINOODLE_TEST_SECRET_STDOUT__",
-                    stderr="__CONTAINOODLE_TEST_SECRET_STDERR__",
-                )
-                with (
-                    patch.object(server.subprocess, "run", side_effect=failure) as run,
-                    patch("builtins.print") as print_message,
-                ):
-                    try:
-                        function(*arguments)
-                    except server.AwsRequestTimeout as error:
-                        rendered = "".join(traceback.format_exception(error))
-                        self.assertEqual(str(error), "AWS CLI request timed out")
-                    else:
-                        self.fail("CLI timeout must fail closed")
-                self.assertEqual(run.call_args.kwargs["timeout"], server.AWS_CLI_TIMEOUT_SECONDS)
-                for secret in (TEST_ACCESS_TOKEN_ALPHA, "__CONTAINOODLE_TEST_SECRET_STDOUT__", "__CONTAINOODLE_TEST_SECRET_STDERR__"):
-                    self.assertNotIn(secret, rendered)
-                print_message.assert_not_called()
-
-    def test_both_cli_calls_sanitize_process_launch_failures(self):
-        for function, arguments in (
-            (server._get_role_credentials, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, TEST_ROLE_ALPHA, "eu-west-1")),
-            (server._list_account_roles, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1")),
+class SsoBearerExposureTests(unittest.TestCase):
+    def test_sso_operations_do_not_spawn_a_process_with_the_bearer(self):
+        for function, arguments, payload in (
+            (server._get_role_credentials, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, TEST_ROLE_ALPHA, "eu-west-1"), {
+                "roleCredentials": {"accessKeyId": "SYNTHETIC-ID", "secretAccessKey": "SYNTHETIC-KEY", "sessionToken": "SYNTHETIC-TOKEN"},
+            }),
+            (server._list_account_roles, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1"), {
+                "roleList": [{"roleName": TEST_ROLE_ALPHA}],
+            }),
         ):
             with (
                 self.subTest(operation=function.__name__),
-                patch.object(server.subprocess, "run", side_effect=OSError(TEST_ACCESS_TOKEN_ALPHA)),
-                self.assertRaisesRegex(RuntimeError, "^AWS CLI could not be run$"),
+                patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")) as run,
+                patch.object(http.client, "HTTPSConnection") as connect,
             ):
+                response = io.BytesIO(json.dumps(payload).encode())
+                response.status = 200
+                connect.return_value.getresponse.return_value = response
                 function(*arguments)
+                run.assert_not_called()
 
-    def test_get_role_credentials_maps_the_aws_cli_response(self):
-        completed = SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({
-                "roleCredentials": {
-                    "accessKeyId": "SYNTHETIC-ID",
-                    "secretAccessKey": "SYNTHETIC-KEY",
-                    "sessionToken": "SYNTHETIC-TOKEN",
-                },
-            }),
-            stderr="",
+
+class SsoApiContractTests(unittest.TestCase):
+    credentials = {"accessKeyId": "SYNTHETIC-ID", "secretAccessKey": "SYNTHETIC-KEY", "sessionToken": "SYNTHETIC-TOKEN"}
+
+    def operations(self):
+        return (
+            (server._get_role_credentials, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, TEST_ROLE_ALPHA, "eu-west-1"), {"roleCredentials": self.credentials}),
+            (server._list_account_roles, (TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1"), {"roleList": [{"roleName": TEST_ROLE_ALPHA}]}),
         )
 
-        with patch.object(server.subprocess, "run", return_value=completed) as run:
-            result = server._get_role_credentials(
-                "synthetic-access-token",
-                TEST_ACCOUNT_ID,
-                TEST_ROLE_ALPHA,
-                "eu-west-1",
-            )
+    def test_both_operations_use_fixed_https_and_a_private_bearer_header(self):
+        for function, arguments, payload in self.operations():
+            connection = make_sso_connection(payload)
+            with (
+                self.subTest(operation=function.__name__),
+                patch.object(http.client, "HTTPSConnection", return_value=connection) as connect,
+                patch("builtins.print") as print_message,
+            ):
+                result = function(*arguments)
+            self.assertEqual(connect.call_args.args, ("portal.sso.eu-west-1.amazonaws.com",))
+            timeout = connect.call_args.kwargs["timeout"]
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 30)
+            method, target = connection.request.call_args.args
+            self.assertEqual(method, "GET")
+            self.assertNotIn(TEST_ACCESS_TOKEN_ALPHA, target)
+            self.assertEqual(connection.request.call_args.kwargs, {
+                "headers": {"x-amz-sso_bearer_token": TEST_ACCESS_TOKEN_ALPHA, "Accept": "application/json"},
+            })
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(target).query)
+            self.assertEqual(query["account_id"], [TEST_ACCOUNT_ID])
+            if function is server._get_role_credentials:
+                self.assertEqual(target.split("?")[0], "/federation/credentials")
+                self.assertEqual(query["role_name"], [TEST_ROLE_ALPHA])
+                self.assertEqual(result, {"sessionId": "SYNTHETIC-ID", "sessionKey": "SYNTHETIC-KEY", "sessionToken": "SYNTHETIC-TOKEN"})
+            else:
+                self.assertEqual(target.split("?")[0], "/assignment/roles")
+                self.assertEqual(query["max_result"], ["100"])
+                self.assertEqual(result, [TEST_ROLE_ALPHA])
+            connection.close.assert_called_once()
+            print_message.assert_not_called()
 
-        self.assertEqual(result, {
-            "sessionId": "SYNTHETIC-ID",
-            "sessionKey": "SYNTHETIC-KEY",
-            "sessionToken": "SYNTHETIC-TOKEN",
-        })
-        run.assert_called_once_with(
-            [
-                "aws", "sso", "get-role-credentials",
-                "--access-token", "synthetic-access-token",
-                "--account-id", TEST_ACCOUNT_ID,
-                "--role-name", TEST_ROLE_ALPHA,
-                "--region", "eu-west-1",
-                "--output", "json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=server.AWS_CLI_TIMEOUT_SECONDS,
-        )
+    def test_both_operations_sanitize_connect_and_read_timeouts_and_errors(self):
+        for function, arguments, payload in self.operations():
+            for stage in ("request", "getresponse", "read1"):
+                for failure, expected_type, message in (
+                    (TimeoutError(TEST_ACCESS_TOKEN_ALPHA), server.AwsRequestTimeout, "AWS SSO request timed out"),
+                    (OSError(TEST_ACCESS_TOKEN_ALPHA), RuntimeError, "AWS SSO request failed"),
+                    (http.client.HTTPException(TEST_ACCESS_TOKEN_ALPHA), RuntimeError, "AWS SSO request failed"),
+                ):
+                    connection = make_sso_connection(payload)
+                    target = connection if stage != "read1" else connection.getresponse.return_value
+                    setattr(target, stage, Mock(side_effect=failure))
+                    with (
+                        self.subTest(operation=function.__name__, stage=stage, failure=type(failure).__name__),
+                        patch.object(http.client, "HTTPSConnection", return_value=connection),
+                        patch("builtins.print") as print_message,
+                    ):
+                        try:
+                            function(*arguments)
+                        except expected_type as error:
+                            self.assertEqual(str(error), message)
+                            self.assertNotIn(TEST_ACCESS_TOKEN_ALPHA, "".join(traceback.format_exception(error)))
+                        else:
+                            self.fail("SSO failure must fail closed")
+                    connection.close.assert_called_once()
+                    print_message.assert_not_called()
 
-    def test_get_role_credentials_never_surfaces_cli_stderr(self):
-        completed = SimpleNamespace(
-            returncode=255,
-            stdout="",
-            stderr="  synthetic CLI failure\n",
-        )
+    def test_both_operations_reject_http_errors_and_redirects_without_reading_or_retrying(self):
+        for function, arguments, _ in self.operations():
+            for status in (301, 302, 307, 308, 400, 401, 429, 500):
+                connection = make_sso_connection(TEST_ACCESS_TOKEN_ALPHA.encode(), status)
+                connection.getresponse.return_value.read1 = Mock()
+                with (
+                    self.subTest(operation=function.__name__, status=status),
+                    patch.object(http.client, "HTTPSConnection", return_value=connection) as connect,
+                    self.assertRaisesRegex(RuntimeError, "^AWS SSO request failed$"),
+                ):
+                    function(*arguments)
+                connect.assert_called_once()
+                connection.request.assert_called_once()
+                connection.getresponse.return_value.read1.assert_not_called()
+                connection.close.assert_called_once()
 
-        with (
-            patch.object(server.subprocess, "run", return_value=completed),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "^AWS CLI request failed$",
-            ),
+    def test_both_operations_reject_oversized_or_malformed_json(self):
+        for function, arguments, _ in self.operations():
+            for payload in (b"x" * (server.AWS_SSO_RESPONSE_LIMIT_BYTES + 1), b"{", b"\xff", b"[]", b"null", b'{"x":NaN}'):
+                connection = make_sso_connection(payload)
+                with (
+                    self.subTest(operation=function.__name__, payload_length=len(payload)),
+                    patch.object(http.client, "HTTPSConnection", return_value=connection),
+                    self.assertRaisesRegex(RuntimeError, "^AWS SSO (?:response is too large|returned an invalid response)$"),
+                ):
+                    function(*arguments)
+                connection.close.assert_called_once()
+
+    def test_get_role_credentials_rejects_incomplete_or_wrongly_typed_credentials(self):
+        for credentials in (None, [], {}, {**self.credentials, "sessionToken": ""}, {**self.credentials, "accessKeyId": 1}):
+            with (
+                self.subTest(credentials=credentials),
+                patch.object(http.client, "HTTPSConnection", return_value=make_sso_connection({"roleCredentials": credentials})),
+                self.assertRaisesRegex(RuntimeError, "^AWS SSO returned an invalid response$"),
+            ):
+                server._get_role_credentials(TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, TEST_ROLE_ALPHA, "eu-west-1")
+
+    def test_list_account_roles_preserves_blank_filtering_and_empty_results(self):
+        for payload, expected in (
+            ({"roleList": [{"roleName": TEST_ROLE_ALPHA}, {"roleName": ""}, {}, {"roleName": TEST_ROLE_BETA}]}, [TEST_ROLE_ALPHA, TEST_ROLE_BETA]),
+            ({}, []),
         ):
-            server._get_role_credentials(
-                "synthetic-access-token",
-                TEST_ACCOUNT_ID,
-                TEST_ROLE_ALPHA,
-                "eu-west-1",
-            )
+            with patch.object(http.client, "HTTPSConnection", return_value=make_sso_connection(payload)):
+                self.assertEqual(server._list_account_roles(TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1"), expected)
 
-    def test_get_role_credentials_rejects_malformed_cli_json(self):
-        completed = SimpleNamespace(returncode=0, stdout="{", stderr="")
+    def test_list_account_roles_follows_encoded_pagination_without_changing_destination(self):
+        first = make_sso_connection({"roleList": [{"roleName": TEST_ROLE_ALPHA}], "nextToken": "synthetic+/=&token"})
+        second = make_sso_connection({"roleList": [{"roleName": TEST_ROLE_BETA, "accountId": TEST_ACCOUNT_ID}]})
+        with patch.object(http.client, "HTTPSConnection", side_effect=[first, second]) as connect:
+            self.assertEqual(server._list_account_roles(TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1"), [TEST_ROLE_ALPHA, TEST_ROLE_BETA])
+        for call in connect.call_args_list:
+            self.assertEqual(call.args, ("portal.sso.eu-west-1.amazonaws.com",))
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(second.request.call_args.args[1]).query)
+        self.assertEqual(query["next_token"], ["synthetic+/=&token"])
 
-        with (
-            patch.object(server.subprocess, "run", return_value=completed),
-            self.assertRaisesRegex(RuntimeError, "^AWS CLI returned an invalid response$"),
+    def test_list_account_roles_rejects_malformed_pages_and_pagination(self):
+        for payload in (
+            {"roleList": {}}, {"roleList": [None]}, {"roleList": [{"roleName": 1}]},
+            {"roleList": [{"roleName": "invalid role"}]},
+            {"roleList": [{"roleName": TEST_ROLE_ALPHA, "accountId": TEST_OTHER_ACCOUNT_ID}]},
+            {"nextToken": []}, {"nextToken": "x" * 8193},
         ):
-            server._get_role_credentials(
-                "synthetic-access-token",
-                TEST_ACCOUNT_ID,
-                TEST_ROLE_ALPHA,
-                "eu-west-1",
-            )
-
-    def test_list_account_roles_filters_missing_and_blank_names(self):
-        completed = SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({
-                "roleList": [
-                    {"roleName": TEST_ROLE_ALPHA},
-                    {"roleName": ""},
-                    {},
-                    {"roleName": TEST_ROLE_BETA},
-                ],
-            }),
-            stderr="",
-        )
-
-        with patch.object(server.subprocess, "run", return_value=completed) as run:
-            roles = server._list_account_roles(
-                "synthetic-access-token",
-                TEST_ACCOUNT_ID,
-                "eu-west-1",
-            )
-
-        self.assertEqual(roles, [TEST_ROLE_ALPHA, TEST_ROLE_BETA])
-        run.assert_called_once_with(
-            [
-                "aws", "sso", "list-account-roles",
-                "--access-token", "synthetic-access-token",
-                "--account-id", TEST_ACCOUNT_ID,
-                "--region", "eu-west-1",
-                "--output", "json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=server.AWS_CLI_TIMEOUT_SECONDS,
-        )
-
-    def test_list_account_roles_defaults_to_an_empty_list(self):
-        completed = SimpleNamespace(returncode=0, stdout="{}", stderr="")
-
-        with patch.object(server.subprocess, "run", return_value=completed):
-            roles = server._list_account_roles(
-                "synthetic-access-token",
-                TEST_ACCOUNT_ID,
-                "eu-west-1",
-            )
-
-        self.assertEqual(roles, [])
-
-    def test_list_account_roles_never_surfaces_cli_stderr(self):
-        completed = SimpleNamespace(
-            returncode=1,
-            stdout="",
-            stderr=" synthetic role-list failure ",
-        )
-
+            with (
+                self.subTest(payload=payload),
+                patch.object(http.client, "HTTPSConnection", return_value=make_sso_connection(payload)),
+                self.assertRaises(RuntimeError),
+            ):
+                server._list_account_roles(TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1")
         with (
-            patch.object(server.subprocess, "run", return_value=completed),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "^AWS CLI request failed$",
-            ),
+            patch.object(http.client, "HTTPSConnection", side_effect=lambda *args, **kwargs: make_sso_connection({"nextToken": "synthetic-repeat"})) as connect,
+            self.assertRaisesRegex(RuntimeError, "invalid pagination"),
         ):
-            server._list_account_roles(
-                "synthetic-access-token",
-                TEST_ACCOUNT_ID,
-                "eu-west-1",
-            )
-
-    def test_list_account_roles_rejects_malformed_cli_json(self):
-        completed = SimpleNamespace(returncode=0, stdout="not-json", stderr="")
-
+            server._list_account_roles(TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1")
+        self.assertEqual(connect.call_count, 2)
         with (
-            patch.object(server.subprocess, "run", return_value=completed),
-            self.assertRaisesRegex(RuntimeError, "^AWS CLI returned an invalid response$"),
+            patch.object(server, "AWS_SSO_MAX_ROLE_PAGES", 2),
+            patch.object(http.client, "HTTPSConnection", side_effect=[make_sso_connection({"nextToken": "synthetic-a"}), make_sso_connection({"nextToken": "synthetic-b"})]),
+            self.assertRaisesRegex(RuntimeError, "too many role pages"),
         ):
-            server._list_account_roles(
-                "synthetic-access-token",
-                TEST_ACCOUNT_ID,
-                "eu-west-1",
-            )
+            server._list_account_roles(TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1")
+
+    def test_sso_deadline_expires_between_response_chunks(self):
+        connection = make_sso_connection(b"{")
+        with (
+            patch.object(server.time, "monotonic", side_effect=[100, 100, 100, 131]),
+            patch.object(http.client, "HTTPSConnection", return_value=connection),
+            self.assertRaisesRegex(server.AwsRequestTimeout, "AWS SSO request timed out"),
+        ):
+            server._list_account_roles(TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "eu-west-1")
+        connection.close.assert_called_once()
+
+    def test_invalid_destination_and_bearer_fail_before_connect(self):
+        for token, region in ((TEST_ACCESS_TOKEN_ALPHA, "eu-west-1.attacker.invalid"), (TEST_ACCESS_TOKEN_ALPHA, "eu-west-1/path"), ("bad\r\nheader", "eu-west-1"), ("", "eu-west-1")):
+            with (
+                self.subTest(region=region),
+                patch.object(http.client, "HTTPSConnection") as connect,
+                self.assertRaises((ValueError, RuntimeError)),
+            ):
+                server._list_account_roles(token, TEST_ACCOUNT_ID, region)
+            connect.assert_not_called()
+
+    def test_china_partition_uses_its_fixed_aws_https_suffix(self):
+        with patch.object(http.client, "HTTPSConnection", return_value=make_sso_connection({})) as connect:
+            self.assertEqual(server._list_account_roles(TEST_ACCESS_TOKEN_ALPHA, TEST_ACCOUNT_ID, "cn-north-1"), [])
+        self.assertEqual(connect.call_args.args, ("portal.sso.cn-north-1.amazonaws.com.cn",))
 
 
 class FederationUrlTests(unittest.TestCase):
@@ -2384,7 +2393,7 @@ class HandlerRouteTests(unittest.TestCase):
                     self.subTest(target=target, error=public_message),
                     patch.object(server, "ACCOUNTS_FILE", self.accounts_file),
                     patch.object(server, "_select_sso_identity") as select_identity,
-                    patch.object(server.subprocess, "run") as run,
+                    patch.object(subprocess, "run") as run,
                     patch.object(server.urllib.request, "urlopen") as urlopen,
                     patch("builtins.print") as print_message,
                 ):
@@ -2408,7 +2417,7 @@ class HandlerRouteTests(unittest.TestCase):
                     self.subTest(target=target, failure=type(failure).__name__),
                     patch.object(server, "ACCOUNTS_FILE") as accounts_file,
                     patch.object(server, "_select_sso_identity") as select_identity,
-                    patch.object(server.subprocess, "run") as run,
+                    patch.object(subprocess, "run") as run,
                     patch.object(server.urllib.request, "urlopen") as urlopen,
                 ):
                     accounts_file.read_text.side_effect = failure
@@ -2431,24 +2440,21 @@ class HandlerRouteTests(unittest.TestCase):
                 self.subTest(target=target),
                 patch.object(server, "ACCOUNTS_FILE", self.accounts_file),
                 patch.object(server, "_select_sso_identity", return_value=selection),
-                patch.object(server.subprocess, "run", side_effect=server.subprocess.TimeoutExpired(
-                    ["aws", "--access-token", TEST_ACCESS_TOKEN_ALPHA],
-                    server.AWS_CLI_TIMEOUT_SECONDS,
-                    stderr="__CONTAINOODLE_TEST_PRIVATE_STDERR__",
-                )) as run,
+                patch.object(http.client, "HTTPSConnection") as connect,
                 patch.object(server.urllib.request, "urlopen") as urlopen,
                 patch("builtins.print") as print_message,
             ):
+                connect.return_value.request.side_effect = TimeoutError(TEST_ACCESS_TOKEN_ALPHA)
                 handler.do_GET()
                 self.assert_json_response(handler, 504, {
                     "error": "AWS request timed out. Check your connection and try again.",
                 })
-            run.assert_called_once()
+            connect.assert_called_once()
             urlopen.assert_not_called()
             print_message.assert_not_called()
             self.assertNotIn(TEST_ACCESS_TOKEN_ALPHA, handler.wfile.getvalue().decode())
 
-    def test_generate_route_sanitizes_federation_timeout_after_successful_cli(self):
+    def test_generate_route_sanitizes_federation_timeout_after_successful_sso(self):
         self.accounts_file.write_text(json.dumps([{
             "accountId": TEST_ACCOUNT_ID,
             "accountName": "__CONTAINOODLE_TEST_ACCOUNT__",
@@ -2466,7 +2472,7 @@ class HandlerRouteTests(unittest.TestCase):
         with (
             patch.object(server, "ACCOUNTS_FILE", self.accounts_file),
             patch.object(server, "_select_sso_identity", return_value=selection),
-            patch.object(server.subprocess, "run", return_value=completed),
+            patch.object(http.client, "HTTPSConnection", return_value=make_sso_connection(json.loads(completed.stdout))),
             patch.object(server.urllib.request, "urlopen", side_effect=TimeoutError("__CONTAINOODLE_TEST_SESSION_TOKEN__")),
             patch("builtins.print") as print_message,
         ):
@@ -2498,7 +2504,7 @@ class HandlerRouteTests(unittest.TestCase):
         with (
             patch.object(server, "ACCOUNTS_FILE", self.accounts_file),
             patch.object(server, "_select_sso_identity", return_value=selection),
-            patch.object(server.subprocess, "run", return_value=completed) as run,
+            patch.object(http.client, "HTTPSConnection", return_value=make_sso_connection(json.loads(completed.stdout))) as connect,
             patch.object(server.urllib.request, "urlopen", return_value=FakeUrlResponse(
                 b'{"SigninToken": "__CONTAINOODLE_TEST_SIGNIN_TOKEN__"}'
             )),
@@ -2515,9 +2521,9 @@ class HandlerRouteTests(unittest.TestCase):
         self.assertEqual(login_fields["Destination"], [
             "https://eu-central-1.console.aws.amazon.com/console/home?region=eu-central-1",
         ])
-        command = run.call_args.args[0]
-        self.assertEqual(command[command.index("--role-name") + 1], TEST_ROLE_QUERY)
-        self.assertEqual(command[command.index("--region") + 1], selection["region"])
+        request_query = urllib.parse.parse_qs(urllib.parse.urlsplit(connect.return_value.request.call_args.args[1]).query)
+        self.assertEqual(request_query["role_name"], [TEST_ROLE_QUERY])
+        self.assertEqual(connect.call_args.args, (f"portal.sso.{selection['region']}.amazonaws.com",))
         self.assertEqual(json.loads(self.accounts_file.read_text(encoding="utf-8")), [account])
 
     def test_sso_identity_route_returns_only_the_opaque_identity_key(self):

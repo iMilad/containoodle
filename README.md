@@ -109,7 +109,7 @@ the reachable portal into the right container.
 The helper stays on `127.0.0.1`; the extension rejects non-loopback helper
 addresses, and every account/session request requires a fresh challenge-bound
 HMAC proof derived from the helper's local secret. The secret itself never crosses
-the HTTP connection. AWS CLI SSO/STS requests and the AWS
+the HTTP connection. AWS SSO HTTPS requests and the AWS
 federation request still go to AWS; Containoodle has no hosted backend or telemetry
 service.
 
@@ -216,9 +216,10 @@ Firefox's built-in data-consent disclosure.
 - For regular Firefox, install the reviewed version from
   [Firefox Add-ons](https://addons.mozilla.org/firefox/addon/containoodle/).
 - Every [GitHub release](../../releases/latest) also includes an unsigned
-  `containoodle-<version>.xpi` for testing. Load it temporarily through
+  `containoodle-<version>.xpi` for testing. Use an isolated test profile and
+  load it temporarily through
   `about:debugging` → **This Firefox** → **Load Temporary Add-on**. It is removed when Firefox restarts.
-- For permanent unsigned installation, use Firefox Developer Edition or Nightly, set `xpinstall.signatures.required` to `false`, and install the XPI.
+  Keep Firefox signature enforcement enabled and leave your normal profile unchanged.
 
 Open the sidebar with **View → Sidebar → Containoodle**, `Alt+Shift+A`, or
 `Ctrl+Shift+A` on macOS. The installed version appears in the header; the ⚙ button
@@ -351,8 +352,12 @@ token. Restart the updated helper; keep the token already saved in the same Fire
 profile. `--show-token` displays that persistent token and exits; it does not start
 the server. An AWS SSO login refresh does not change the helper token either.
 
-Each AWS CLI subprocess has a 30-second timeout and explicitly requests JSON
-output. Federation uses a 15-second socket-operation timeout and a 64-KiB response
+The helper calls fixed regional AWS SSO HTTPS endpoints directly. The cached bearer
+is sent only in a request header, never process arguments or environment variables;
+redirects and endpoint overrides are not accepted. SSO socket operations have a
+30-second timeout, responses are limited to 64 KiB, and role discovery follows at
+most 100 pages with deadline checks between reads and pages.
+Federation uses a 15-second socket-operation timeout and a 64-KiB response
 limit; that socket timeout is not a total end-to-end deadline. Failures return
 sanitized, authenticated errors rather than raw AWS output, credentials, or
 sign-in URLs. No automatic retry mints a second session.
@@ -398,8 +403,8 @@ For backend sidebar launches, Containoodle checks an explicit backend choice, th
 configured role, a backend-only remembered choice, and live backend discovery. If the
 extension sends no role, the helper uses the account's configured role or
 the `CONTAINOODLE_DEFAULT_ROLE` fallback. A configured or selected
-role must match a permission set you actually have; otherwise AWS CLI
-`get-role-credentials` rejects the launch.
+role must match a permission set you actually have; otherwise AWS SSO
+`GetRoleCredentials` rejects the launch.
 
 Optional **Reuse an existing console session** access makes repeated backend launches
 faster by opening a still-signed-in account container directly and suppressing the
@@ -423,12 +428,12 @@ revoke it.
 - **Options reports several cached SSO logins:** enter the same local alias used with `aws sso login --profile ...` under **AWS CLI profile**, then choose **Save & test**.
 - **The selected SSO login is missing or expired:** run `aws sso login` for the selected profile, then retry. The helper never falls back to another cached identity.
 - **The helper reports that the AWS SSO token expires within five minutes:** run `aws sso login` again. Containoodle never moves or deletes the AWS CLI cache to refresh it.
-- **AWS CLI rejects a backend role:** select a permission set available to that account, or correct the role in `~/.aws/accounts.json` / `CONTAINOODLE_DEFAULT_ROLE`.
+- **AWS SSO rejects a backend role:** select a permission set available to that account, or correct the role in `~/.aws/accounts.json` / `CONTAINOODLE_DEFAULT_ROLE`.
 - **A pinned portal shortcut has the wrong role:** allow portal role choices, then click the role chip on that pin and select the intended role.
 - **Portal readiness says sign-in is required:** sign in at the exact saved portal URL in a normal Firefox tab, then refresh readiness.
 - **The portal opens an ordinary tab or the container asks for login:** verify portal mode, the exact-origin grant, and the signed-in session; then reload the portal page and retry.
 - **A naming regex does not affect a manually renamed group:** use **Reset tab-group titles to automatic**. This removes stored manual Containoodle group-title overrides before recalculating them; custom container names are preserved.
-- **An unsigned XPI disappears after restart:** temporary add-ons are expected to do that. Use the Firefox Add-ons version on regular Firefox, or Developer Edition/Nightly for permanent unsigned testing.
+- **An unsigned XPI disappears after restart:** temporary add-ons are expected to do that. Use the signed Firefox Add-ons version for normal installation; reload test XPIs temporarily in an isolated test profile with signature enforcement enabled.
 
 ## Security notes
 

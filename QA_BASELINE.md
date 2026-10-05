@@ -238,10 +238,11 @@ upgrade-only checks are explicitly identified below.
 - [ ] Never uninstall between baseline and candidate; uninstalling removes
   extension-local storage. Use a fresh copy of the closed baseline profile for
   every retry or rollback.
-- [ ] Use a signed candidate or a permanent unsigned install in Firefox
-  Developer Edition/Nightly. Keep the manifest's Gecko ID unchanged, use a
+- [ ] Use a signed candidate in the dedicated test profile with Firefox
+  signature enforcement enabled. Keep the manifest's Gecko ID unchanged, use a
   higher version, and verify Firefox performs an update. A temporary add-on or
-  remove/reinstall cycle cannot prove restart or storage preservation.
+  remove/reinstall cycle cannot prove restart or storage preservation. If no
+  signed candidate is available, leave those acceptance checks pending.
 - [ ] Prepare one account available through both modes with different roles,
   one portal-only pinned account, and one helper-only pinned account.
 - [ ] Enable the exact portal origin, the exact regional role-discovery target,
