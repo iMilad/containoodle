@@ -37,6 +37,20 @@ also access that user's helper secret, AWS CLI cache, and Firefox profile.
 
 ## Session reuse and availability limits
 
+Portal readiness, role discovery, and cookie copying share one credential
+selector. It requires Secure/HttpOnly and valid scope/expiry metadata, and
+rejects distinct values across applicable first-party and portal partitions.
+An insecure shadow is included in the ambiguity check; API ordering cannot
+choose its authority. A rejected selection performs no cookie copy or role
+request. Copy readback also checks the protection flags and expiry.
+
+Automatic tab-event handoffs also require source provenance: an observed
+immediately prior configured portal page, or a current configured portal opener
+for a new child/its initial blank-page navigation. A shortcut destination alone,
+an unrelated previous page, or a historical opener cannot authorize cookie
+movement. Unknown provenance leaves native navigation untouched; explicit
+portal clicks still pass the content script's trusted-click and exact-page checks.
+
 Container labels are presentation, not identity. Account/cookie-store ownership
 and verified helper session generations are tracked separately. A portal launch
 invalidates the helper reuse record before mutating its cookie jar. Older pending
@@ -51,8 +65,13 @@ reuse control, not an independent proof of the AWS identity inside arbitrary coo
 changed outside Containoodle. Users should still check the console identity.
 
 The local helper limits concurrent workers to eight and accepted sockets to a
-five-second inactivity timeout. AWS CLI operations are bounded to 30 seconds and
-federation socket operations to 15 seconds with a 64-KiB response limit. The
+five-second inactivity timeout. SSO requests use fixed regional HTTPS endpoints
+with certificate verification and no redirects or endpoint overrides. The cached
+bearer stays in an HTTP header, never process arguments or environment variables.
+SSO socket operations have a 30-second timeout and 64-KiB response limit; role
+discovery also checks a deadline between reads/pages and caps pagination at 100
+pages. Federation socket operations have a 15-second timeout and 64-KiB response
+limit. These socket timeouts are not total end-to-end deadlines. The
 extension's complete helper exchange has a 60-second deadline and rejects late
 results without replacing trusted settings or account caches. These limits improve
 availability; they do not promise service under sustained local denial of service.

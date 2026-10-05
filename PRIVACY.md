@@ -44,8 +44,10 @@ local AWS CLI profile alias, and opaque SSO identity key to
 is not transmitted. It is used locally on both sides to authenticate a
 short-lived challenge, a one-time proof for the exact request, and a proof over
 the exact response. The token is never put in a URL, header, request body, or sent
-to AWS. The helper reads local AWS configuration and invokes the AWS CLI and AWS
-federation service to create the requested session. The extension rejects
+to AWS. The helper reads local AWS CLI configuration and SSO cache files, then
+calls fixed regional AWS SSO HTTPS endpoints and the AWS federation service to
+create the requested session. The cached SSO bearer is sent only in an HTTPS
+header, never process arguments or environment variables. The extension rejects
 non-loopback helper addresses and responses that do not carry a valid proof.
 
 No data is sold, used for advertising or profiling, or sent to a Containoodle-operated

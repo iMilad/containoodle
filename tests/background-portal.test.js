@@ -690,6 +690,35 @@ function portalShortcut(accountId = ACCOUNT_ID) {
   );
 }
 
+function hardenedPortalCookie(overrides = {}) {
+  return {
+    name: "x-amz-sso_authn",
+    value: "synthetic-genuine-session",
+    domain: new URL(START).hostname,
+    hostOnly: true,
+    path: "/start",
+    secure: true,
+    httpOnly: true,
+    sameSite: "lax",
+    session: true,
+    firstPartyDomain: "",
+    ...overrides,
+  };
+}
+
+async function checkPortalCookieHandoff(onMessage, fixture) {
+  const url = portalShortcut();
+  const result = await onMessage(
+    { type: "portal-shortcut-click", url, disposition: "same-tab" },
+    { tab: SOURCE_TAB }
+  );
+  if (!result.ok) {
+    // Consume the guard for native navigation so the fixture leaves no timer.
+    fixture.events.tabsUpdated.listeners[0](SOURCE_TAB.id, { url }, { ...SOURCE_TAB, url });
+  }
+  return result;
+}
+
 async function handoffPortalAccount(onMessage, accountName, accountId = ACCOUNT_ID) {
   return onMessage(
     {
@@ -4146,6 +4175,12 @@ test("portal click handoff uses no backend and opens the exact shortcut in a con
 
   // The URL-event fallback still launches if AWS redirects before async
   // storage/browser work finishes, but it never overwrites that newer page.
+  // First observe the return to the portal after the earlier native fallback.
+  fixture.events.tabsUpdated.listeners[0](
+    SOURCE_TAB.id,
+    { url: SOURCE_TAB.url },
+    { ...SOURCE_TAB }
+  );
   const redirectedUrl = "https://eu-west-1.console.aws.amazon.com/console/home";
   fixture.tabs.get(SOURCE_TAB.id).url = redirectedUrl;
   fixture.events.tabsUpdated.listeners[0](
@@ -4357,6 +4392,128 @@ test("unbound or wrong-portal region caches never become permission targets", as
   }
 });
 
+test("tab fallback ignores a shortcut created by an unrelated site", async () => {
+  for (const openerTabId of [undefined, 2]) {
+    const fixture = makeBrowser();
+    fixture.tabs.set(2, { ...SOURCE_TAB, id: 2, url: "https://unrelated.invalid/" });
+    await loadBackground(fixture);
+    const child = { ...SOURCE_TAB, id: 90, url: portalShortcut(), openerTabId };
+    fixture.tabs.set(child.id, child);
+    fixture.events.tabsCreated.listeners[0](child);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepStrictEqual(fixture.cookieWrites, []);
+    assert.deepStrictEqual(fixture.cookieRemovals, []);
+    assert.deepStrictEqual(fixture.createdTabs, []);
+    assert.strictEqual(fixture.tabs.get(child.id).url, child.url);
+  }
+});
+
+test("tab fallback ignores navigation from an unrelated page even with a historical portal opener", async () => {
+  for (const openerTabId of [undefined, SOURCE_TAB.id]) {
+    const fixture = makeBrowser();
+    const child = { ...SOURCE_TAB, id: 90, url: "https://unrelated.invalid/", openerTabId };
+    fixture.tabs.set(child.id, child);
+    await loadBackground(fixture);
+    child.url = portalShortcut();
+    fixture.events.tabsUpdated.listeners[0](child.id, { url: child.url }, child);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepStrictEqual(fixture.cookieWrites, []);
+    assert.deepStrictEqual(fixture.cookieRemovals, []);
+    assert.deepStrictEqual(fixture.createdTabs, []);
+    assert.strictEqual(fixture.tabs.get(child.id).url, child.url);
+  }
+});
+
+test("tab fallback clears portal provenance on unrelated navigation and removal", async () => {
+  for (const event of ["navigation", "removal"]) {
+    const fixture = makeBrowser();
+    await loadBackground(fixture);
+    if (event === "navigation") {
+      fixture.tabs.get(SOURCE_TAB.id).url = "https://unrelated.invalid/";
+      fixture.events.tabsUpdated.listeners[0](SOURCE_TAB.id, { url: "https://unrelated.invalid/" }, fixture.tabs.get(SOURCE_TAB.id));
+    } else {
+      fixture.events.tabsRemoved.listeners[0](SOURCE_TAB.id);
+      fixture.tabs.delete(SOURCE_TAB.id);
+    }
+    const candidate = { ...SOURCE_TAB, url: portalShortcut() };
+    fixture.tabs.set(candidate.id, candidate);
+    fixture.events.tabsUpdated.listeners[0](candidate.id, { url: candidate.url }, candidate);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepStrictEqual(fixture.cookieWrites, []);
+    assert.deepStrictEqual(fixture.cookieRemovals, []);
+    assert.deepStrictEqual(fixture.createdTabs, []);
+    assert.strictEqual(fixture.tabs.get(candidate.id).url, candidate.url);
+  }
+});
+
+test("a delayed startup snapshot cannot restore portal provenance after navigation", async () => {
+  const fixture = makeBrowser();
+  const query = fixture.browser.tabs.query;
+  let releaseSnapshot;
+  const snapshot = new Promise((resolve) => { releaseSnapshot = resolve; });
+  let firstQuery = true;
+  fixture.browser.tabs.query = (...args) => {
+    if (firstQuery) {
+      firstQuery = false;
+      return snapshot;
+    }
+    return query(...args);
+  };
+  await loadBackground(fixture);
+  const unrelated = { ...SOURCE_TAB, url: "https://unrelated.invalid/" };
+  fixture.tabs.set(unrelated.id, unrelated);
+  fixture.events.tabsUpdated.listeners[0](unrelated.id, { url: unrelated.url }, unrelated);
+  releaseSnapshot([{ ...SOURCE_TAB }]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const candidate = { ...SOURCE_TAB, url: portalShortcut() };
+  fixture.tabs.set(candidate.id, candidate);
+  fixture.events.tabsUpdated.listeners[0](candidate.id, { url: candidate.url }, candidate);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepStrictEqual(fixture.cookieWrites, []);
+  assert.deepStrictEqual(fixture.createdTabs, []);
+  assert.strictEqual(fixture.tabs.get(candidate.id).url, candidate.url);
+});
+
+test("tab fallback accepts an exact portal opener for a new child and its first blank-page navigation", async () => {
+  for (const startsBlank of [false, true]) {
+    const fixture = makeBrowser();
+    await loadBackground(fixture);
+    const child = { ...SOURCE_TAB, id: 90, openerTabId: SOURCE_TAB.id, url: startsBlank ? "about:blank" : portalShortcut() };
+    fixture.tabs.set(child.id, child);
+    fixture.events.tabsCreated.listeners[0](child);
+    if (startsBlank) {
+      child.url = portalShortcut();
+      fixture.events.tabsUpdated.listeners[0](child.id, { url: child.url }, child);
+    }
+    await waitFor(() => fixture.createdTabs.length === 1 && !fixture.tabs.has(child.id));
+    assert.strictEqual(fixture.createdTabs[0].cookieStoreId, "firefox-container-1");
+    assert.strictEqual(fixture.createdTabs[0].url, portalShortcut());
+    assert.strictEqual(fixture.cookieWrites.filter((cookie) => cookie.name === "x-amz-sso_authn").length, 1);
+    assert.strictEqual(fixture.tabs.get(SOURCE_TAB.id).url, SOURCE_TAB.url);
+  }
+});
+
+test("tab fallback refuses a wrong-path, private, missing, or non-default-store opener", async () => {
+  for (const opener of [
+    { ...SOURCE_TAB, url: "https://d-0000000000.awsapps.com/other" },
+    { ...SOURCE_TAB, incognito: true },
+    { ...SOURCE_TAB, cookieStoreId: "firefox-container-elsewhere" },
+    { ...SOURCE_TAB, url: portalShortcut() },
+    null,
+  ]) {
+    const fixture = makeBrowser();
+    if (opener) fixture.tabs.set(SOURCE_TAB.id, opener);
+    else fixture.tabs.delete(SOURCE_TAB.id);
+    await loadBackground(fixture);
+    const child = { ...SOURCE_TAB, id: 90, openerTabId: SOURCE_TAB.id, url: portalShortcut() };
+    fixture.tabs.set(child.id, child);
+    fixture.events.tabsCreated.listeners[0](child);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepStrictEqual(fixture.cookieWrites, []);
+    assert.deepStrictEqual(fixture.createdTabs, []);
+  }
+});
+
 test("tab-event fallback reuses a captured portal name for an unpinned account", async () => {
   const fixture = makeBrowser();
   fixture.storageData.portalPinnedAccounts = [];
@@ -4429,6 +4586,86 @@ test("portal handoff refuses to navigate when the copied cookie cannot be read b
     { url: shortcut },
     { ...SOURCE_TAB, url: shortcut }
   );
+});
+
+test("ambiguous portal auth cookies fail closed before copying or role discovery", async () => {
+  const genuine = hardenedPortalCookie();
+  const shadows = [
+    hardenedPortalCookie({ value: "synthetic-shadow-session", httpOnly: false, path: "/start/" }),
+    hardenedPortalCookie({ value: "synthetic-other-session", domain: ".awsapps.com", hostOnly: false }),
+    hardenedPortalCookie({ value: "synthetic-partition-session", partitionKey: { topLevelSite: new URL(START).origin, hasCrossSiteAncestor: false } }),
+  ];
+  for (const shadow of shadows) {
+    for (const cookies of [[genuine, shadow], [shadow, genuine]]) {
+      const fixture = makeBrowser();
+      fixture.setPortalCookie(cookies);
+      const onMessage = await loadBackground(fixture);
+      let fetchCalls = 0;
+      globalThis.fetch = async () => {
+        fetchCalls += 1;
+        return { ok: true, async json() { return {}; } };
+      };
+      assert.strictEqual((await onMessage({ type: "portal-readiness" }, {})).session, false);
+      assert.strictEqual((await checkPortalCookieHandoff(onMessage, fixture)).ok, false);
+      const roles = await onMessage({ type: "discover-roles", accountId: ACCOUNT_ID, mode: "portal" }, {});
+      assert.strictEqual(roles.ok, false);
+      assert.strictEqual(roles.needsLogin, true);
+      assert.strictEqual(fetchCalls, 0);
+      assert.deepStrictEqual(fixture.cookieWrites, []);
+      assert.deepStrictEqual(fixture.cookieRemovals, []);
+      assert.deepStrictEqual(fixture.createdTabs, []);
+    }
+  }
+});
+
+test("portal auth rejects insecure, expired, or inconsistent credential metadata", async () => {
+  for (const overrides of [
+    { secure: false }, { httpOnly: false }, { value: "" },
+    { session: false, expirationDate: Date.now() / 1000 - 1 },
+    { session: false, expirationDate: NaN },
+    { session: false }, { session: true, expirationDate: 2000000000 },
+  ]) {
+    const fixture = makeBrowser();
+    fixture.setPortalCookie(hardenedPortalCookie(overrides));
+    const onMessage = await loadBackground(fixture);
+    assert.strictEqual((await onMessage({ type: "portal-readiness" }, {})).session, false);
+    assert.strictEqual((await checkPortalCookieHandoff(onMessage, fixture)).ok, false);
+    assert.deepStrictEqual(fixture.cookieWrites, []);
+    assert.deepStrictEqual(fixture.createdTabs, []);
+  }
+});
+
+test("cookie enumeration fallback retains ambiguity detection", async () => {
+  const fixture = makeBrowser();
+  fixture.setPortalCookie([
+    hardenedPortalCookie(),
+    hardenedPortalCookie({ value: "synthetic-shadow-session", httpOnly: false, path: "/start/" }),
+  ]);
+  const getAll = fixture.browser.cookies.getAll;
+  fixture.browser.cookies.getAll = async (details) => {
+    if (Object.hasOwn(details, "partitionKey")) throw new Error("unsupported wildcard");
+    return getAll(details);
+  };
+  const onMessage = await loadBackground(fixture);
+  assert.strictEqual((await onMessage({ type: "portal-readiness" }, {})).session, false);
+  assert.strictEqual((await checkPortalCookieHandoff(onMessage, fixture)).ok, false);
+  assert.deepStrictEqual(fixture.cookieWrites, []);
+  assert.deepStrictEqual(fixture.createdTabs, []);
+});
+
+test("unique hardened portal cookie preserves scope and expiration", async () => {
+  const fixture = makeBrowser();
+  const cookie = hardenedPortalCookie({ session: false, expirationDate: 2000000000 });
+  fixture.setPortalCookie(cookie);
+  const onMessage = await loadBackground(fixture);
+  assert.deepStrictEqual(await handoffPortalAccount(onMessage, "synthetic-account"), { ok: true });
+  const copied = fixture.cookieWrites.find((entry) => entry.name === cookie.name);
+  assert.strictEqual(copied.value, cookie.value);
+  assert.strictEqual(copied.secure, true);
+  assert.strictEqual(copied.httpOnly, true);
+  assert.strictEqual(copied.path, cookie.path);
+  assert.strictEqual(copied.expirationDate, cookie.expirationDate);
+  assert.strictEqual(Object.hasOwn(copied, "domain"), false);
 });
 
 test("domain-cookie handoff rejects a host-only readback", async () => {

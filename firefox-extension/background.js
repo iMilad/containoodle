@@ -670,12 +670,13 @@ async function listPortalAuthCookies(url, storeId) {
     // Compatibility fallback for Firefox versions/profiles that reject one
     // of the wildcard fields. The extension's minimum version supports the
     // explicit store selector.
-    const cookie = await browser.cookies.get({
+    // Keep enumerating every available candidate: get() silently chooses
+    // one cookie and would hide conflicting credential values.
+    return await browser.cookies.getAll({
       url,
       name: PORTAL_AUTH_COOKIE,
       storeId,
     });
-    return cookie ? [cookie] : [];
   }
 }
 
@@ -686,20 +687,13 @@ function selectPortalAuthCookie(cookies, portalUrl) {
     const host = String(rawHost || "").toLowerCase().replace(/^\./, "");
     return !host || portal.hostname === host || portal.hostname.endsWith(`.${host}`);
   };
-  const firstPartyCandidates = cookies.filter(
-    (cookie) => appliesToPortalHost(cookie.firstPartyDomain)
-  );
-  if (firstPartyCandidates.length === 0) return null;
-
-  // A top-level portal normally uses unpartitioned storage. If Firefox did
-  // partition it, accept only a partition whose schemeful site applies to
-  // this portal rather than falling back to another site's cookie jar.
-  const unpartitioned = firstPartyCandidates.find(
-    (cookie) => !(cookie.partitionKey && cookie.partitionKey.topLevelSite)
-  );
-  if (unpartitioned) return unpartitioned;
-  return firstPartyCandidates.find((cookie) => {
+  // Include every applicable first-party/partition candidate before checking
+  // authenticity. Filtering out an insecure shadow first would hide ambiguity.
+  const candidates = cookies.filter((cookie) => {
+    if (!cookie || !appliesToPortalHost(cookie.firstPartyDomain)) return false;
+    if (!cookie.partitionKey) return true;
     if (cookie.partitionKey.hasCrossSiteAncestor === true) return false;
+    if (!cookie.partitionKey.topLevelSite) return true;
     try {
       const topLevelSite = new URL(cookie.partitionKey.topLevelSite);
       return (
@@ -709,7 +703,35 @@ function selectPortalAuthCookie(cookies, portalUrl) {
     } catch {
       return false;
     }
-  }) || null;
+  });
+  if (candidates.length === 0 || new Set(candidates.map((cookie) => cookie.value)).size !== 1) {
+    return null;
+  }
+  const now = Date.now() / 1000;
+  if (candidates.some((cookie) => {
+    if (
+      cookie.name !== PORTAL_AUTH_COOKIE ||
+      typeof cookie.value !== "string" || !cookie.value ||
+      cookie.secure !== true || cookie.httpOnly !== true ||
+      typeof cookie.domain !== "string" || typeof cookie.hostOnly !== "boolean" ||
+      typeof cookie.path !== "string" || !cookie.path.startsWith("/") ||
+      typeof cookie.session !== "boolean"
+    ) return true;
+    const domain = cookie.domain.toLowerCase().replace(/^\./, "");
+    if (
+      !domain ||
+      (cookie.hostOnly ? portal.hostname !== domain : !appliesToPortalHost(domain)) ||
+      !(portal.pathname === cookie.path || (
+        portal.pathname.startsWith(cookie.path) &&
+        (cookie.path.endsWith("/") || portal.pathname[cookie.path.length] === "/")
+      ))
+    ) return true;
+    return cookie.session
+      ? cookie.expirationDate !== undefined
+      : !Number.isFinite(cookie.expirationDate) || cookie.expirationDate <= now;
+  })) return null;
+  // All eligible cookies now represent the same hardened credential value.
+  return candidates.find((cookie) => !cookie.partitionKey?.topLevelSite) || candidates[0];
 }
 
 function cookieIsolationDetails(cookie) {
@@ -740,6 +762,10 @@ function portalCookieRemovalUrl(portalUrl, cookie) {
 
 function copiedPortalCookieMatches(candidate, source) {
   if (!candidate || candidate.value !== source.value) return false;
+  if (
+    candidate.secure !== true || candidate.httpOnly !== true ||
+    candidate.session !== source.session || candidate.expirationDate !== source.expirationDate
+  ) return false;
   if (typeof source.path === "string" && candidate.path !== source.path) return false;
   if (source.hostOnly === true && candidate.hostOnly !== true) return false;
   if (
@@ -997,8 +1023,8 @@ async function portalDiscoverRoles(config, account) {
   return profiles.map((p) => p && p.name).filter(Boolean);
 }
 
-/* Backend variant — GET /roles (server runs aws sso
-   list-account-roles). Old servers 404 here; caller falls back. */
+/* Backend variant — GET /roles (the helper calls AWS SSO ListAccountRoles
+   over HTTPS). Old servers 404 here; caller falls back. */
 async function backendDiscoverRoles(config, account, backendIdentity) {
   const query = backendIdentityQuery(backendIdentity);
   query.set("account", account.accountId);
@@ -2423,6 +2449,40 @@ void seedKnownGroupTitles();
 const portalHandoffPending = new Set();
 const portalNativeFallbacks = new Map();
 const portalNewTabFallbacks = new Map();
+const portalObservedTabs = new Map();
+const portalTabsChangedDuringSnapshot = new Set();
+let portalTabSnapshotPending = true;
+
+// Seed only previous tab state, never authority from a destination shortcut.
+// Events delivered during this asynchronous snapshot take precedence over it.
+void (async () => {
+  try {
+    for (const tab of await browser.tabs.query({})) {
+      if (Number.isInteger(tab.id) && !portalTabsChangedDuringSnapshot.has(tab.id)) {
+        portalObservedTabs.set(tab.id, { ...tab });
+      }
+    }
+  } catch {
+    // Without a known previous page, retain native navigation.
+  } finally {
+    portalTabSnapshotPending = false;
+    portalTabsChangedDuringSnapshot.clear();
+  }
+})();
+
+function rememberPortalTab(tab, url) {
+  if (!Number.isInteger(tab.id)) return;
+  if (portalTabSnapshotPending) portalTabsChangedDuringSnapshot.add(tab.id);
+  portalObservedTabs.set(tab.id, { ...tab, url });
+}
+
+function isPortalInteractionTab(tab, portalStartUrl) {
+  return Boolean(
+    tab && !tab.incognito && tab.cookieStoreId === "firefox-default" &&
+    isConfiguredPortalPage(tab.url, portalStartUrl) &&
+    !parsePortalConsoleDeepLink(tab.url, portalStartUrl)
+  );
+}
 
 function sameUrl(left, right) {
   try {
@@ -2438,13 +2498,13 @@ function isMatchingPortalSource(tab, plan, portalStartUrl) {
   return Boolean(parsed && parsed.url === plan.sourceUrl);
 }
 
-async function isDisposablePortalChild(tab, portalStartUrl) {
-  if (!Number.isInteger(tab.openerTabId) || tab.openerTabId === tab.id) return false;
+async function getPortalOpener(tab, portalStartUrl) {
+  if (!Number.isInteger(tab.openerTabId) || tab.openerTabId === tab.id) return null;
   try {
     const opener = await browser.tabs.get(tab.openerTabId);
-    return canRemovePortalShortcutTab(tab, opener, portalStartUrl);
+    return isPortalInteractionTab(opener, portalStartUrl) ? opener : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -2536,7 +2596,7 @@ const launchPortalShortcut = synchronize(async (_key, plan, windowId) => {
   });
 });
 
-async function maybeHandoffPortalTab(tab, candidateUrl) {
+async function maybeHandoffPortalTab(tab, candidateUrl, previousTab = null, created = false) {
   if (!tab || !Number.isInteger(tab.id) || !candidateUrl) return;
   if (portalHandoffPending.has(tab.id)) return;
 
@@ -2544,6 +2604,17 @@ async function maybeHandoffPortalTab(tab, candidateUrl) {
     await ensureStorageMigration();
     const config = await getConfig();
     if (config.mode !== "portal") return;
+    if (!parsePortalConsoleDeepLink(candidateUrl, config.portalStartUrl)) return;
+    const opener = await getPortalOpener(tab, config.portalStartUrl);
+    // An opener proves creation/initial blank-page navigation, not a later
+    // navigation from an unrelated page in a tab with a historical opener.
+    const initialChildNavigation = created || Boolean(
+      previousTab && (!previousTab.url || previousTab.url === "about:blank")
+    );
+    if (
+      !isPortalInteractionTab(previousTab, config.portalStartUrl) &&
+      !(initialChildNavigation && opener)
+    ) return;
     const plan = planPortalTabHandoff({
       mode: config.mode,
       portalStartUrl: config.portalStartUrl,
@@ -2556,7 +2627,7 @@ async function maybeHandoffPortalTab(tab, candidateUrl) {
 
     portalHandoffPending.add(tab.id);
     try {
-      const disposeSource = await isDisposablePortalChild(tab, config.portalStartUrl);
+      const disposeSource = canRemovePortalShortcutTab(tab, opener, config.portalStartUrl);
       const launchKey = `${plan.windowId}:${plan.sourceUrl}`;
       const result = await launchPortalShortcut(launchKey, plan, plan.windowId);
       if (!result.ok) return;
@@ -2684,11 +2755,14 @@ const handoffPortalClick = synchronize(async (
 });
 
 browser.tabs.onCreated.addListener((tab) => {
+  rememberPortalTab(tab, tab.url);
   if (tab.url && consumeNewTabFallback(tab, tab.url)) return;
-  if (tab.url) void maybeHandoffPortalTab(tab, tab.url);
+  if (tab.url) void maybeHandoffPortalTab(tab, tab.url, null, true);
 });
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const previousTab = portalObservedTabs.get(tabId);
+  if (changeInfo.url) rememberPortalTab({ ...tab, id: tabId }, changeInfo.url);
   if (changeInfo.url || changeInfo.status === "loading") noteSessionNavigation(tabId);
   if (changeInfo.status === "complete" || changeInfo.url) void settleSessionLaunch(tabId);
   if (!changeInfo.url) return;
@@ -2701,10 +2775,12 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (nativeFallback) {
     clearNativeFallback(tabId);
   }
-  void maybeHandoffPortalTab({ ...tab, id: tabId }, changeInfo.url);
+  void maybeHandoffPortalTab({ ...tab, id: tabId }, changeInfo.url, previousTab);
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {
+  if (portalTabSnapshotPending) portalTabsChangedDuringSnapshot.add(tabId);
+  portalObservedTabs.delete(tabId);
   noteSessionNavigation(tabId);
   void settleSessionLaunch(tabId, true);
   portalHandoffPending.delete(tabId);

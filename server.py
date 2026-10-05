@@ -11,13 +11,13 @@ import base64
 import configparser
 import hashlib
 import hmac
+import http.client
 import http.server
 import json
 import os
 import secrets
 import socketserver
 import stat
-import subprocess
 import sys
 import tempfile
 import threading
@@ -46,9 +46,10 @@ HELPER_TOKEN_FILE = Path(
 ).expanduser()
 HELPER_TOKEN = None
 
-# A stalled CLI process is killed and reaped by subprocess.run. Federation
-# applies a socket-operation timeout to both connecting and reading the reply.
-AWS_CLI_TIMEOUT_SECONDS = 30
+# SSO and federation use verified HTTPS with bounded socket operations/replies.
+AWS_SSO_TIMEOUT_SECONDS = 30
+AWS_SSO_RESPONSE_LIMIT_BYTES = 64 * 1024
+AWS_SSO_MAX_ROLE_PAGES = 100
 FEDERATION_TIMEOUT_SECONDS = 15
 FEDERATION_RESPONSE_LIMIT_BYTES = 64 * 1024
 # A browser can preopen a connection before sending HTTP headers. Keep those
@@ -771,18 +772,20 @@ def _verify_sso_identity(selection: dict, expected_identity: str | None) -> None
 
 
 def _get_role_credentials(access_token: str, account_id: str, role: str, region: str) -> dict:
-    """Call aws sso get-role-credentials and return the credentials dict."""
-    data = _run_aws_cli(
-        [
-            "aws", "sso", "get-role-credentials",
-            "--access-token", access_token,
-            "--account-id", account_id,
-            "--role-name", role,
-            "--region", region,
-            "--output", "json",
-        ],
+    """Request credentials without exposing the cached bearer to a process."""
+    if not _ACCOUNT_ID_RE.fullmatch(account_id) or not _ROLE_RE.fullmatch(role):
+        raise ValueError("Invalid AWS SSO account or role")
+    data = _request_sso(
+        access_token, region, "/federation/credentials",
+        {"account_id": account_id, "role_name": role},
+        time.monotonic() + AWS_SSO_TIMEOUT_SECONDS,
     )
-    creds = data["roleCredentials"]
+    creds = data.get("roleCredentials")
+    if not isinstance(creds, dict) or any(
+        not isinstance(creds.get(field), str) or not creds[field]
+        for field in ("accessKeyId", "secretAccessKey", "sessionToken")
+    ):
+        raise RuntimeError("AWS SSO returned an invalid response")
     return {
         "sessionId": creds["accessKeyId"],
         "sessionKey": creds["secretAccessKey"],
@@ -791,38 +794,88 @@ def _get_role_credentials(access_token: str, account_id: str, role: str, region:
 
 
 def _list_account_roles(access_token: str, account_id: str, region: str) -> list[str]:
-    """Call aws sso list-account-roles and return the role names."""
-    data = _run_aws_cli(
-        [
-            "aws", "sso", "list-account-roles",
-            "--access-token", access_token,
-            "--account-id", account_id,
-            "--region", region,
-            "--output", "json",
-        ],
-    )
-    return [r["roleName"] for r in data.get("roleList", []) if r.get("roleName")]
+    """Follow bounded SSO pages using a bearer header, never argv or env."""
+    if not _ACCOUNT_ID_RE.fullmatch(account_id):
+        raise ValueError("Invalid AWS SSO account")
+    query = {"account_id": account_id, "max_result": "100"}
+    deadline = time.monotonic() + AWS_SSO_TIMEOUT_SECONDS
+    roles = []
+    seen_tokens = set()
+    for _ in range(AWS_SSO_MAX_ROLE_PAGES):
+        data = _request_sso(access_token, region, "/assignment/roles", query, deadline)
+        page = data.get("roleList", [])
+        if not isinstance(page, list):
+            raise RuntimeError("AWS SSO returned an invalid response")
+        for row in page:
+            if not isinstance(row, dict):
+                raise RuntimeError("AWS SSO returned an invalid response")
+            name = row.get("roleName")
+            if name is None or name == "":
+                continue
+            if not isinstance(name, str) or not _ROLE_RE.fullmatch(name):
+                raise RuntimeError("AWS SSO returned an invalid response")
+            if "accountId" in row and row["accountId"] != account_id:
+                raise RuntimeError("AWS SSO returned an invalid response")
+            roles.append(name)
+        next_token = data.get("nextToken")
+        if next_token is None or next_token == "":
+            return roles
+        if not isinstance(next_token, str) or len(next_token) > 8192 or next_token in seen_tokens:
+            raise RuntimeError("AWS SSO returned invalid pagination")
+        seen_tokens.add(next_token)
+        query["next_token"] = next_token
+    raise RuntimeError("AWS SSO returned too many role pages")
 
 
-def _run_aws_cli(command: list[str]) -> dict:
-    """Bound both CLI calls and discard credential-bearing failure details."""
+def _request_sso(access_token: str, region: str, path: str, query: dict, deadline: float) -> dict:
+    """Fixed TLS destination; no redirects, proxies, process or error-body output."""
+    if not isinstance(region, str) or not _REGION_RE.fullmatch(region):
+        raise ValueError("Invalid AWS SSO region")
+    if (
+        not isinstance(access_token, str) or not access_token or len(access_token) > 16384
+        or any(ord(char) < 33 or ord(char) > 126 for char in access_token)
+    ):
+        raise RuntimeError("Invalid AWS SSO access token")
+    if path not in ("/federation/credentials", "/assignment/roles"):
+        raise ValueError("Invalid AWS SSO operation")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise AwsRequestTimeout("AWS SSO request timed out")
+    suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+    connection = http.client.HTTPSConnection(f"portal.sso.{region}.{suffix}", timeout=remaining)
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=AWS_CLI_TIMEOUT_SECONDS,
+        connection.request(
+            "GET", f"{path}?{urllib.parse.urlencode(query)}",
+            headers={"x-amz-sso_bearer_token": access_token, "Accept": "application/json"},
         )
-    except subprocess.TimeoutExpired:
-        raise AwsRequestTimeout("AWS CLI request timed out") from None
-    except (OSError, UnicodeError):
-        raise RuntimeError("AWS CLI could not be run") from None
-    if result.returncode != 0:
-        raise RuntimeError("AWS CLI request failed")
-    try:
-        return json.loads(result.stdout)
-    except (ValueError, RecursionError):
-        raise RuntimeError("AWS CLI returned an invalid response") from None
+        response = connection.getresponse()
+        if response.status != 200:
+            raise RuntimeError("AWS SSO request failed")
+        payload = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AwsRequestTimeout("AWS SSO request timed out")
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining)
+            chunk = response.read1(min(8192, AWS_SSO_RESPONSE_LIMIT_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > AWS_SSO_RESPONSE_LIMIT_BYTES:
+                raise RuntimeError("AWS SSO response is too large")
+        data = json.loads(payload.decode("utf-8"), parse_constant=_reject_non_json_constant)
+        if not isinstance(data, dict):
+            raise ValueError("Invalid response object")
+        return data
+    except TimeoutError:
+        raise AwsRequestTimeout("AWS SSO request timed out") from None
+    except (OSError, http.client.HTTPException):
+        raise RuntimeError("AWS SSO request failed") from None
+    except (ValueError, UnicodeError, RecursionError):
+        raise RuntimeError("AWS SSO returned an invalid response") from None
+    finally:
+        connection.close()
 
 
 def _build_signin_url(session_creds: dict, region: str) -> str:
